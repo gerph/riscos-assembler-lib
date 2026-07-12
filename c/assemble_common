@@ -86,6 +86,34 @@ _kernel_oserror *assemble_emit_dword(assemble_context_t *context,
     return assemble_emit_byte(context, cpu_class, (uint8_t) ((value >> 24) & 0xFFu));
 }
 
+_kernel_oserror *assemble_emit_word_be(assemble_context_t *context,
+                                        assemble_cpu_class_t cpu_class,
+                                        uint16_t word)
+{
+    _kernel_oserror *error;
+
+    error = assemble_emit_byte(context, cpu_class, (uint8_t) ((word >> 8) & 0xFFu));
+    if (error != NULL)
+    {
+        return error;
+    }
+    return assemble_emit_byte(context, cpu_class, (uint8_t) (word & 0xFFu));
+}
+
+_kernel_oserror *assemble_emit_dword_be(assemble_context_t *context,
+                                         assemble_cpu_class_t cpu_class,
+                                         uint32_t value)
+{
+    _kernel_oserror *error;
+
+    error = assemble_emit_word_be(context, cpu_class, (uint16_t) ((value >> 16) & 0xFFFFu));
+    if (error != NULL)
+    {
+        return error;
+    }
+    return assemble_emit_word_be(context, cpu_class, (uint16_t) (value & 0xFFFFu));
+}
+
 _kernel_oserror *assemble_set_error(assemble_cpu_class_t cpu_class,
                                      assemble_error_type_t type,
                                      uint32_t variant,

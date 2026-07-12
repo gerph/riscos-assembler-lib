@@ -18,6 +18,7 @@ int main(int argc, char *argv[])
     printf("Syntax: *Assemble\n");
 
     failed = run_tests();
+    failed += run_tests_6809();
 
     exit(failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE);
 }

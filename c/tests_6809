@@ -1,0 +1,558 @@
+/*******************************************************************
+ * File:        tests_6809
+ * Purpose:     Self-tests for the assemble_6809 library. Provides a
+ *              minimal stand-in for BASIC's expression evaluator and
+ *              variable table so lines can be assembled and checked
+ *              against expected byte sequences.
+ * Author:      Charles Ferguson (Gerph)
+ ******************************************************************/
+
+#include <stdio.h>
+#include <string.h>
+#include <ctype.h>
+
+#include "tests.h"
+#include "assemble_6809.h"
+
+#define MAX_SYMBOLS 32
+#define MAX_OUTPUT  64
+
+typedef struct symbol
+{
+    char             name[32];
+    assemble_value_t value;
+} symbol_t;
+
+typedef struct test_state
+{
+    symbol_t symbols[MAX_SYMBOLS];
+    size_t   symbol_count;
+} test_state_t;
+
+static _kernel_oserror test_error_block;
+
+static _kernel_oserror *test_error(const char *message)
+{
+    test_error_block.errnum = 0;
+    strncpy(test_error_block.errmess, message, sizeof(test_error_block.errmess) - 1);
+    test_error_block.errmess[sizeof(test_error_block.errmess) - 1] = '\0';
+    return &test_error_block;
+}
+
+static int hex_digit_value(uint8_t ch)
+{
+    if (ch >= '0' && ch <= '9')
+    {
+        return ch - '0';
+    }
+    return toupper((int) ch) - 'A' + 10;
+}
+
+static assemble_result_t test_parse_primary(test_state_t *state, const uint8_t *text, size_t length,
+                                             size_t *pos_inout, int32_t *out_value, _kernel_oserror **error)
+{
+    size_t pos = *pos_inout;
+
+    while (pos < length && text[pos] == ' ')
+    {
+        pos += 1;
+    }
+
+    if (pos < length && text[pos] == '&')
+    {
+        int32_t v = 0;
+
+        pos += 1;
+        while (pos < length && isxdigit((int) text[pos]))
+        {
+            v = v * 16 + hex_digit_value(text[pos]);
+            pos += 1;
+        }
+        *out_value = v;
+        *pos_inout = pos;
+        return ASSEMBLE_RESULT_OK;
+    }
+
+    if (pos < length && text[pos] >= '0' && text[pos] <= '9')
+    {
+        int32_t v = 0;
+
+        while (pos < length && text[pos] >= '0' && text[pos] <= '9')
+        {
+            v = v * 10 + (text[pos] - '0');
+            pos += 1;
+        }
+        *out_value = v;
+        *pos_inout = pos;
+        return ASSEMBLE_RESULT_OK;
+    }
+
+    if (pos < length && (isalpha((int) text[pos]) || text[pos] == '_' || text[pos] == '`'))
+    {
+        size_t start = pos;
+        size_t namelen;
+        char name[32];
+        size_t i;
+
+        while (pos < length &&
+               (isalnum((int) text[pos]) || text[pos] == '_' || text[pos] == '`' ||
+                text[pos] == '%' || text[pos] == '$'))
+        {
+            pos += 1;
+        }
+        namelen = pos - start;
+        if (namelen >= sizeof(name))
+        {
+            namelen = sizeof(name) - 1;
+        }
+        memcpy(name, text + start, namelen);
+        name[namelen] = '\0';
+
+        for (i = 0; i < state->symbol_count; i++)
+        {
+            if (strcmp(state->symbols[i].name, name) == 0)
+            {
+                *out_value = state->symbols[i].value.value.as_integer;
+                *pos_inout = pos;
+                return ASSEMBLE_RESULT_OK;
+            }
+        }
+        *error = test_error("Undefined test symbol");
+        return ASSEMBLE_RESULT_ERROR;
+    }
+
+    *error = test_error("Expected a value");
+    return ASSEMBLE_RESULT_ERROR;
+}
+
+static assemble_result_t test_resolve_expr(void *user_data, const uint8_t *text, size_t length,
+                                            assemble_value_t *value, size_t *consumed, _kernel_oserror **error)
+{
+    test_state_t *state = (test_state_t *) user_data;
+    size_t pos = 0;
+    int32_t result;
+    int negate = 0;
+
+    while (pos < length && text[pos] == ' ')
+    {
+        pos += 1;
+    }
+    if (pos < length && text[pos] == '-')
+    {
+        negate = 1;
+        pos += 1;
+    }
+
+    if (test_parse_primary(state, text, length, &pos, &result, error) != ASSEMBLE_RESULT_OK)
+    {
+        return ASSEMBLE_RESULT_ERROR;
+    }
+    if (negate)
+    {
+        result = -result;
+    }
+
+    for (;;)
+    {
+        size_t save = pos;
+        int op;
+        int32_t rhs;
+
+        while (pos < length && text[pos] == ' ')
+        {
+            pos += 1;
+        }
+        if (!(pos < length && (text[pos] == '+' || text[pos] == '-')))
+        {
+            pos = save;
+            break;
+        }
+        op = text[pos];
+        pos += 1;
+        while (pos < length && text[pos] == ' ')
+        {
+            pos += 1;
+        }
+        if (test_parse_primary(state, text, length, &pos, &rhs, error) != ASSEMBLE_RESULT_OK)
+        {
+            return ASSEMBLE_RESULT_ERROR;
+        }
+        result = (op == '+') ? (result + rhs) : (result - rhs);
+    }
+
+    value->type = ASSEMBLE_VALUE_INTEGER;
+    value->value.as_integer = result;
+    *consumed = pos;
+    return ASSEMBLE_RESULT_OK;
+}
+
+static assemble_result_t test_assign_var(void *user_data, const char *name, size_t name_length,
+                                          const assemble_value_t *value, _kernel_oserror **error)
+{
+    test_state_t *state = (test_state_t *) user_data;
+    char namebuf[32];
+    size_t len = name_length;
+    size_t i;
+
+    if (len >= sizeof(namebuf))
+    {
+        len = sizeof(namebuf) - 1;
+    }
+    memcpy(namebuf, name, len);
+    namebuf[len] = '\0';
+
+    for (i = 0; i < state->symbol_count; i++)
+    {
+        if (strcmp(state->symbols[i].name, namebuf) == 0)
+        {
+            state->symbols[i].value = *value;
+            return ASSEMBLE_RESULT_OK;
+        }
+    }
+    if (state->symbol_count >= MAX_SYMBOLS)
+    {
+        *error = test_error("Test symbol table is full");
+        return ASSEMBLE_RESULT_ERROR;
+    }
+    strcpy(state->symbols[state->symbol_count].name, namebuf);
+    state->symbols[state->symbol_count].value = *value;
+    state->symbol_count += 1;
+    return ASSEMBLE_RESULT_OK;
+}
+
+typedef struct test_case
+{
+    const char        *description;
+    const char *const *lines;      /* NULL-terminated */
+    const uint8_t      *expected;  /* concatenated bytes across all lines */
+    size_t              expected_length;
+    int                 expect_error;
+} test_case_t;
+
+static int run_case(const test_case_t *test)
+{
+    test_state_t state;
+    assemble_context_t context;
+    uint8_t output[MAX_OUTPUT];
+    uint32_t offset = 0;
+    size_t i;
+    _kernel_oserror *error = NULL;
+    int saw_error = 0;
+
+    state.symbol_count = 0;
+
+    context.buffer = output;
+    context.buffer_length = (int32_t) sizeof(output);
+    context.address = 0x8000;
+    context.opt = 0;
+    context.resolve_expr = test_resolve_expr;
+    context.assign_var = test_assign_var;
+    context.user_data = &state;
+    context.bytes_used = 0;
+
+    for (i = 0; test->lines[i] != NULL; i++)
+    {
+        const uint8_t *line = (const uint8_t *) test->lines[i];
+        size_t line_length = strlen(test->lines[i]);
+
+        error = assemble_6809_line(&context, line, line_length);
+        if (error != NULL)
+        {
+            saw_error = 1;
+            break;
+        }
+
+        if (offset + context.bytes_used > sizeof(output))
+        {
+            printf("FAIL: %s (test output buffer too small)\n", test->description);
+            return 0;
+        }
+        offset += context.bytes_used;
+        context.address += context.bytes_used;
+        context.buffer = output + offset;
+        context.buffer_length = (int32_t) (sizeof(output) - offset);
+    }
+
+    if (test->expect_error)
+    {
+        if (!saw_error)
+        {
+            printf("FAIL: %s (expected an error, none was raised)\n", test->description);
+            return 0;
+        }
+        return 1;
+    }
+
+    if (saw_error)
+    {
+        printf("FAIL: %s (unexpected error: %s)\n", test->description, error->errmess);
+        return 0;
+    }
+
+    if (offset != test->expected_length || memcmp(output, test->expected, offset) != 0)
+    {
+        size_t j;
+
+        printf("FAIL: %s (byte mismatch, got:", test->description);
+        for (j = 0; j < offset; j++)
+        {
+            printf(" %02X", output[j]);
+        }
+        printf(" expected:");
+        for (j = 0; j < test->expected_length; j++)
+        {
+            printf(" %02X", test->expected[j]);
+        }
+        printf(")\n");
+        return 0;
+    }
+
+    return 1;
+}
+
+/* ---- Test case data ---------------------------------------------- */
+
+static const char *const lines_implied[] = { "NOP", NULL };
+static const uint8_t     bytes_implied[] = { 0x12 };
+
+static const char *const lines_rts[] = { "RTS", NULL };
+static const uint8_t     bytes_rts[] = { 0x39 };
+
+static const char *const lines_sync[] = { "SYNC", NULL };
+static const uint8_t     bytes_sync[] = { 0x13 };
+
+static const char *const lines_asla[] = { "ASLA", NULL };
+static const uint8_t     bytes_asla[] = { 0x48 };
+
+static const char *const lines_clrb[] = { "CLRB", NULL };
+static const uint8_t     bytes_clrb[] = { 0x5F };
+
+static const char *const lines_imm8[] = { "LDA #&41", NULL };
+static const uint8_t     bytes_imm8[] = { 0x86, 0x41 };
+
+static const char *const lines_imm16[] = { "LDX #&1234", NULL };
+static const uint8_t     bytes_imm16[] = { 0x8E, 0x12, 0x34 };
+
+static const char *const lines_direct[] = { "LDA <&10", NULL };
+static const uint8_t     bytes_direct[] = { 0x96, 0x10 };
+
+static const char *const lines_extended_default[] = { "LDA &10", NULL };
+static const uint8_t     bytes_extended_default[] = { 0xB6, 0x00, 0x10 };
+
+static const char *const lines_extended_forced[] = { "LDA >&10", NULL };
+static const uint8_t     bytes_extended_forced[] = { 0xB6, 0x00, 0x10 };
+
+static const char *const lines_store_prefixed[] = { "STY &1234", NULL };
+static const uint8_t     bytes_store_prefixed[] = { 0x10, 0xBF, 0x12, 0x34 };
+
+static const char *const lines_idx_plain[]   = { "LDA ,X", NULL };
+static const uint8_t     bytes_idx_plain[]   = { 0xA6, 0x84 };
+
+static const char *const lines_idx_postinc[] = { "LDA ,X+", NULL };
+static const uint8_t     bytes_idx_postinc[] = { 0xA6, 0x80 };
+
+static const char *const lines_idx_postinc2[] = { "LDA ,X++", NULL };
+static const uint8_t     bytes_idx_postinc2[] = { 0xA6, 0x81 };
+
+static const char *const lines_idx_predec[]  = { "LDA ,-X", NULL };
+static const uint8_t     bytes_idx_predec[]  = { 0xA6, 0x82 };
+
+static const char *const lines_idx_predec2[] = { "LDA ,--X", NULL };
+static const uint8_t     bytes_idx_predec2[] = { 0xA6, 0x83 };
+
+static const char *const lines_idx_5bit[]    = { "LDA 5,X", NULL };
+static const uint8_t     bytes_idx_5bit[]    = { 0xA6, 0x05 };
+
+static const char *const lines_idx_5bit_neg[] = { "LDA -5,X", NULL };
+static const uint8_t     bytes_idx_5bit_neg[] = { 0xA6, 0x1B };
+
+static const char *const lines_idx_8bit[]    = { "LDA 100,X", NULL };
+static const uint8_t     bytes_idx_8bit[]    = { 0xA6, 0x88, 0x64 };
+
+static const char *const lines_idx_16bit[]   = { "LDA 1000,X", NULL };
+static const uint8_t     bytes_idx_16bit[]   = { 0xA6, 0x89, 0x03, 0xE8 };
+
+static const char *const lines_idx_forced8[] = { "LDA <0,Y", NULL };
+static const uint8_t     bytes_idx_forced8[] = { 0xA6, 0xA8, 0x00 };
+
+static const char *const lines_idx_a[]       = { "LDA A,X", NULL };
+static const uint8_t     bytes_idx_a[]       = { 0xA6, 0x86 };
+
+static const char *const lines_idx_b[]       = { "LDA B,Y", NULL };
+static const uint8_t     bytes_idx_b[]       = { 0xA6, 0xA5 };
+
+static const char *const lines_idx_d[]       = { "LDA D,U", NULL };
+static const uint8_t     bytes_idx_d[]       = { 0xA6, 0xCB };
+
+static const char *const lines_idx_indirect[] = { "LDA [,X]", NULL };
+static const uint8_t     bytes_idx_indirect[] = { 0xA6, 0x94 };
+
+static const char *const lines_idx_indirect_off[] = { "LDA [100,X]", NULL };
+static const uint8_t     bytes_idx_indirect_off[] = { 0xA6, 0x98, 0x64 };
+
+static const char *const lines_ext_indirect[] = { "LDA [&1234]", NULL };
+static const uint8_t     bytes_ext_indirect[] = { 0xA6, 0x9F, 0x12, 0x34 };
+
+/* pcr: target=0x8010, instruction is LDA n,PCR indexed (1 opcode + 1 postbyte + offset bytes)
+   8-bit form: next_addr = 0x8000+1+1+1=0x8003, offset=0x8010-0x8003=0x0D */
+static const char *const lines_idx_pcr8[] = { "LDA <&8010,PCR", NULL };
+static const uint8_t     bytes_idx_pcr8[] = { 0xA6, 0x8C, 0x0D };
+
+/* leax indexed only */
+static const char *const lines_leax[] = { "LEAX 4,X", NULL };
+static const uint8_t     bytes_leax[] = { 0x30, 0x04 };
+
+/* branches: address 0x8000 -> loop, NOP (1 byte), BEQ loop -> offset = 0x8000-(0x8001+2)=-3 */
+static const char *const lines_branch_back[] = { ".loop", "NOP", "BEQ loop", NULL };
+static const uint8_t     bytes_branch_back[] = { 0x12, 0x27, 0xFD };
+
+static const char *const lines_lbranch[] = { ".loop", "NOP", "LBEQ loop", NULL };
+static const uint8_t     bytes_lbranch[] = { 0x12, 0x10, 0x27, 0xFF, 0xFB };
+
+static const char *const lines_bra_special[] = { ".loop", "NOP", "LBRA loop", NULL };
+static const uint8_t     bytes_bra_special[] = { 0x12, 0x16, 0xFF, 0xFC };
+
+static const char *const lines_pshs[] = { "PSHS A,B,X,PC", NULL };
+static const uint8_t     bytes_pshs[] = { 0x34, 0x96 };
+
+static const char *const lines_pshs_d[] = { "PSHS D", NULL };
+static const uint8_t     bytes_pshs_d[] = { 0x34, 0x06 };
+
+static const char *const lines_exg[] = { "EXG A,B", NULL };
+static const uint8_t     bytes_exg[] = { 0x1E, 0x89 };
+
+static const char *const lines_tfr[] = { "TFR X,Y", NULL };
+static const uint8_t     bytes_tfr[] = { 0x1F, 0x12 };
+
+static const char *const lines_swi2[] = { "SWI2", NULL };
+static const uint8_t     bytes_swi2[] = { 0x10, 0x3F };
+
+static const char *const lines_swi3[] = { "SWI3", NULL };
+static const uint8_t     bytes_swi3[] = { 0x11, 0x3F };
+
+static const char *const lines_label_addr[] = { ".here", "LDA <here", NULL };
+static const uint8_t     bytes_label_addr[] = { 0x96, 0x00 };
+
+static const char *const lines_equ[] = { ".const EQU &2A", "LDA #const", NULL };
+static const uint8_t     bytes_equ[] = { 0x86, 0x2A };
+
+static const char *const lines_dcb[] = { "DCB 1,2,3", NULL };
+static const uint8_t     bytes_dcb[] = { 0x01, 0x02, 0x03 };
+
+static const char *const lines_dcw[] = { "DCW &1234,&5678", NULL };
+static const uint8_t     bytes_dcw[] = { 0x12, 0x34, 0x56, 0x78 };
+
+static const char *const lines_dcd[] = { "DCD &12345678", NULL };
+static const uint8_t     bytes_dcd[] = { 0x12, 0x34, 0x56, 0x78 };
+
+static const char *const lines_opt[] = { "OPT 3", "NOP", NULL };
+static const uint8_t     bytes_opt[] = { 0x12 };
+
+static const char lines_ora_token_raw[] = { (char) 0x84, 'A', ' ', '#', '1', '\0' };
+static const char *const lines_ora_token[] = { lines_ora_token_raw, NULL };
+static const uint8_t     bytes_ora_token[] = { 0x8A, 0x01 };
+
+static const char lines_andcc_token_raw[] = { (char) 0x80, 'C', 'C', ' ', '#', '1', '\0' };
+static const char *const lines_andcc_token[] = { lines_andcc_token_raw, NULL };
+static const uint8_t     bytes_andcc_token[] = { 0x1C, 0x01 };
+
+static const char lines_eorb_token_raw[] = { (char) 0x82, 'B', ' ', '#', '1', '\0' };
+static const char *const lines_eorb_token[] = { lines_eorb_token_raw, NULL };
+static const uint8_t     bytes_eorb_token[] = { 0xC8, 0x01 };
+
+/* ---- Error cases --------------------------------------------------- */
+
+static const char *const lines_err_bad_mnemonic[]  = { "FOO &10", NULL };
+static const char *const lines_err_no_immediate[]  = { "STA #&10", NULL };
+static const char *const lines_err_branch_range[]  = { "BEQ &9000", NULL };
+static const char *const lines_err_missing_op[]    = { "LDA", NULL };
+static const char *const lines_err_pushpull[]      = { "PSHS S", NULL };
+static const char *const lines_err_transfer_size[] = { "TFR A,X", NULL };
+static const char *const lines_err_equ_no_label[]  = { "EQU &10", NULL };
+static const char *const lines_err_indexed_reg[]   = { "LDA ,Q", NULL };
+static const char *const lines_err_imm_overflow[]  = { "LDA #&1FF", NULL };
+static const char *const lines_err_autostep[]      = { "LDA [,X+]", NULL };
+
+static const test_case_t tests[] = {
+    { "implied NOP",                    lines_implied,          bytes_implied,          sizeof(bytes_implied),          0 },
+    { "implied RTS",                    lines_rts,              bytes_rts,              sizeof(bytes_rts),              0 },
+    { "implied SYNC (4-letter)",        lines_sync,              bytes_sync,             sizeof(bytes_sync),             0 },
+    { "accumulator-implied ASLA",       lines_asla,             bytes_asla,             sizeof(bytes_asla),             0 },
+    { "accumulator-implied CLRB",       lines_clrb,             bytes_clrb,             sizeof(bytes_clrb),             0 },
+    { "8-bit immediate",                lines_imm8,             bytes_imm8,             sizeof(bytes_imm8),             0 },
+    { "16-bit immediate",               lines_imm16,            bytes_imm16,            sizeof(bytes_imm16),            0 },
+    { "direct forced by '<'",           lines_direct,           bytes_direct,           sizeof(bytes_direct),           0 },
+    { "extended default",               lines_extended_default, bytes_extended_default, sizeof(bytes_extended_default), 0 },
+    { "extended forced by '>'",         lines_extended_forced,  bytes_extended_forced,  sizeof(bytes_extended_forced),  0 },
+    { "page-2 prefixed store (STY)",    lines_store_prefixed,   bytes_store_prefixed,   sizeof(bytes_store_prefixed),   0 },
+    { "indexed ,R",                     lines_idx_plain,        bytes_idx_plain,        sizeof(bytes_idx_plain),        0 },
+    { "indexed ,R+",                    lines_idx_postinc,      bytes_idx_postinc,      sizeof(bytes_idx_postinc),      0 },
+    { "indexed ,R++",                   lines_idx_postinc2,     bytes_idx_postinc2,     sizeof(bytes_idx_postinc2),     0 },
+    { "indexed ,-R",                    lines_idx_predec,       bytes_idx_predec,       sizeof(bytes_idx_predec),       0 },
+    { "indexed ,--R",                   lines_idx_predec2,      bytes_idx_predec2,      sizeof(bytes_idx_predec2),      0 },
+    { "indexed 5-bit offset",           lines_idx_5bit,         bytes_idx_5bit,         sizeof(bytes_idx_5bit),         0 },
+    { "indexed 5-bit negative offset",  lines_idx_5bit_neg,     bytes_idx_5bit_neg,     sizeof(bytes_idx_5bit_neg),     0 },
+    { "indexed 8-bit offset",           lines_idx_8bit,         bytes_idx_8bit,         sizeof(bytes_idx_8bit),         0 },
+    { "indexed 16-bit offset",          lines_idx_16bit,        bytes_idx_16bit,        sizeof(bytes_idx_16bit),        0 },
+    { "indexed offset forced 8-bit",    lines_idx_forced8,      bytes_idx_forced8,      sizeof(bytes_idx_forced8),      0 },
+    { "indexed A,R",                    lines_idx_a,            bytes_idx_a,            sizeof(bytes_idx_a),            0 },
+    { "indexed B,R",                    lines_idx_b,            bytes_idx_b,            sizeof(bytes_idx_b),            0 },
+    { "indexed D,R",                    lines_idx_d,            bytes_idx_d,            sizeof(bytes_idx_d),            0 },
+    { "indexed indirect [,R]",          lines_idx_indirect,     bytes_idx_indirect,     sizeof(bytes_idx_indirect),     0 },
+    { "indexed indirect [n,R]",         lines_idx_indirect_off, bytes_idx_indirect_off, sizeof(bytes_idx_indirect_off), 0 },
+    { "extended indirect [nnnn]",       lines_ext_indirect,     bytes_ext_indirect,     sizeof(bytes_ext_indirect),     0 },
+    { "indexed n,PCR (8-bit)",          lines_idx_pcr8,         bytes_idx_pcr8,         sizeof(bytes_idx_pcr8),         0 },
+    { "LEAX indexed-only",              lines_leax,             bytes_leax,             sizeof(bytes_leax),             0 },
+    { "short backward branch",          lines_branch_back,      bytes_branch_back,      sizeof(bytes_branch_back),      0 },
+    { "long backward branch (LBEQ)",    lines_lbranch,          bytes_lbranch,          sizeof(bytes_lbranch),          0 },
+    { "LBRA special unprefixed opcode", lines_bra_special,      bytes_bra_special,      sizeof(bytes_bra_special),      0 },
+    { "PSHS register list",             lines_pshs,             bytes_pshs,             sizeof(bytes_pshs),             0 },
+    { "PSHS D (both A and B)",          lines_pshs_d,            bytes_pshs_d,           sizeof(bytes_pshs_d),           0 },
+    { "EXG A,B",                        lines_exg,              bytes_exg,              sizeof(bytes_exg),              0 },
+    { "TFR X,Y",                        lines_tfr,              bytes_tfr,              sizeof(bytes_tfr),              0 },
+    { "SWI2 (page-2 prefix)",           lines_swi2,             bytes_swi2,             sizeof(bytes_swi2),             0 },
+    { "SWI3 (page-3 prefix)",           lines_swi3,             bytes_swi3,             sizeof(bytes_swi3),             0 },
+    { "label address reference",       lines_label_addr,       bytes_label_addr,       sizeof(bytes_label_addr),       0 },
+    { "EQU pseudo-op",                  lines_equ,              bytes_equ,              sizeof(bytes_equ),              0 },
+    { "DCB pseudo-op",                  lines_dcb,              bytes_dcb,              sizeof(bytes_dcb),              0 },
+    { "DCW pseudo-op (big-endian)",     lines_dcw,              bytes_dcw,              sizeof(bytes_dcw),              0 },
+    { "DCD pseudo-op (big-endian)",     lines_dcd,              bytes_dcd,              sizeof(bytes_dcd),              0 },
+    { "OPT pseudo-op is a no-op",       lines_opt,              bytes_opt,              sizeof(bytes_opt),              0 },
+    { "tokenised OR -> ORA",            lines_ora_token,        bytes_ora_token,        sizeof(bytes_ora_token),        0 },
+    { "tokenised AND -> ANDCC",         lines_andcc_token,      bytes_andcc_token,      sizeof(bytes_andcc_token),      0 },
+    { "tokenised EOR -> EORB",          lines_eorb_token,       bytes_eorb_token,       sizeof(bytes_eorb_token),       0 },
+
+    { "error: bad mnemonic",            lines_err_bad_mnemonic,  NULL, 0, 1 },
+    { "error: STA has no immediate",    lines_err_no_immediate,  NULL, 0, 1 },
+    { "error: branch out of range",     lines_err_branch_range,  NULL, 0, 1 },
+    { "error: missing operand",         lines_err_missing_op,    NULL, 0, 1 },
+    { "error: PSHS S cannot be stacked",lines_err_pushpull,      NULL, 0, 1 },
+    { "error: TFR size mismatch",       lines_err_transfer_size, NULL, 0, 1 },
+    { "error: EQU without a label",     lines_err_equ_no_label,  NULL, 0, 1 },
+    { "error: bad indexed register",    lines_err_indexed_reg,   NULL, 0, 1 },
+    { "error: immediate overflow",      lines_err_imm_overflow,  NULL, 0, 1 },
+    { "error: indirect single autostep",lines_err_autostep,      NULL, 0, 1 }
+};
+
+int run_tests_6809(void)
+{
+    size_t i;
+    int passed = 0;
+    int failed = 0;
+
+    for (i = 0; i < sizeof(tests) / sizeof(tests[0]); i++)
+    {
+        if (run_case(&tests[i]))
+        {
+            passed += 1;
+        }
+        else
+        {
+            failed += 1;
+        }
+    }
+
+    printf("assemble_6809: %d passed, %d failed (of %d)\n", passed, failed, passed + failed);
+
+    return failed;
+}

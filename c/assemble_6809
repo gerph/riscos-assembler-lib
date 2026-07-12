@@ -1,0 +1,1657 @@
+/*******************************************************************
+ * File:        assemble_6809
+ * Purpose:     Assembler backend for the 6809 instruction set.
+ *              Parses one tokenised BASIC source line at a time into
+ *              machine code, using the callbacks in the assembly
+ *              context to evaluate expressions and to assign labels.
+ *              All multi-byte values are big-endian, matching the
+ *              6809 itself.
+ * Author:      Charles Ferguson (Gerph)
+ ******************************************************************/
+
+#include <string.h>
+#include <ctype.h>
+
+#include "assemble_6809.h"
+
+/* BASIC tokenises OR/AND/EOR as single bytes; since ORA/ORB/ORCC,
+   ANDA/ANDB/ANDCC and EORA/EORB are also 6809 mnemonics, these
+   tokens must be recognised and expanded back to their mnemonic
+   spelling before normal mnemonic lookup. */
+#define TOKEN_AND 0x80
+#define TOKEN_EOR 0x82
+#define TOKEN_OR  0x84
+
+typedef enum addr_mode
+{
+    MODE_IMPLIED,        /* no operand, eg NOP, RTS, ASLA, CLRB */
+    MODE_IMMEDIATE,      /* #n or #nnnn, size given by immediate_size */
+    MODE_DIRECT,         /* n -- 1 byte offset from the Direct Page register, forced by leading '<' */
+    MODE_EXTENDED,       /* nnnn -- 2 byte absolute address; the default when no '<'/'>' is given */
+    MODE_INDEXED,        /* rich postbyte-based addressing; encoded dynamically, not via this table */
+    MODE_RELATIVE8,      /* short branch -- 1 byte signed offset */
+    MODE_RELATIVE16,     /* long branch ('L' prefix on the mnemonic) -- 2 byte signed offset */
+    MODE_REGISTER_LIST,  /* PSH/PUL -- 1 byte register bitmask */
+    MODE_REGISTER_PAIR   /* EXG/TFR -- 1 byte packed register-pair nibbles */
+} addr_mode_t;
+
+typedef struct opcode_entry
+{
+    const char *mnemonic;      /* upper case, full word, eg "ADCA", "LDX", "LBSR" */
+    addr_mode_t mode;
+    uint16_t    opcode;        /* if > 0xFF, the high byte is a page-2/3 prefix (0x10/0x11)
+                                   emitted first, then the low byte */
+    uint8_t     immediate_size; /* only meaningful when mode == MODE_IMMEDIATE: 1 or 2 */
+} opcode_entry_t;
+
+static const opcode_entry_t opcode_table[] = {
+    /* ADC */
+    { "ADCA", MODE_DIRECT,   0x99, 0 },
+    { "ADCA", MODE_EXTENDED, 0xB9, 0 },
+    { "ADCA", MODE_IMMEDIATE,0x89, 1 },
+    { "ADCA", MODE_INDEXED,  0xA9, 0 },
+    { "ADCB", MODE_DIRECT,   0xD9, 0 },
+    { "ADCB", MODE_EXTENDED, 0xF9, 0 },
+    { "ADCB", MODE_IMMEDIATE,0xC9, 1 },
+    { "ADCB", MODE_INDEXED,  0xE9, 0 },
+
+    /* ADD */
+    { "ADDA", MODE_DIRECT,   0x9B, 0 },
+    { "ADDA", MODE_EXTENDED, 0xBB, 0 },
+    { "ADDA", MODE_IMMEDIATE,0x8B, 1 },
+    { "ADDA", MODE_INDEXED,  0xAB, 0 },
+    { "ADDB", MODE_DIRECT,   0xDB, 0 },
+    { "ADDB", MODE_EXTENDED, 0xFB, 0 },
+    { "ADDB", MODE_IMMEDIATE,0xCB, 1 },
+    { "ADDB", MODE_INDEXED,  0xEB, 0 },
+    { "ADDD", MODE_DIRECT,   0xD3, 0 },
+    { "ADDD", MODE_EXTENDED, 0xF3, 0 },
+    { "ADDD", MODE_IMMEDIATE,0xC3, 2 },
+    { "ADDD", MODE_INDEXED,  0xE3, 0 },
+
+    /* AND */
+    { "ANDA",  MODE_DIRECT,   0x94, 0 },
+    { "ANDA",  MODE_EXTENDED, 0xB4, 0 },
+    { "ANDA",  MODE_IMMEDIATE,0x84, 1 },
+    { "ANDA",  MODE_INDEXED,  0xA4, 0 },
+    { "ANDB",  MODE_DIRECT,   0xD4, 0 },
+    { "ANDB",  MODE_EXTENDED, 0xF4, 0 },
+    { "ANDB",  MODE_IMMEDIATE,0xC4, 1 },
+    { "ANDB",  MODE_INDEXED,  0xE4, 0 },
+    { "ANDCC", MODE_IMMEDIATE,0x1C, 1 },
+
+    /* BIT */
+    { "BITA", MODE_DIRECT,   0x95, 0 },
+    { "BITA", MODE_EXTENDED, 0xB5, 0 },
+    { "BITA", MODE_IMMEDIATE,0x85, 1 },
+    { "BITA", MODE_INDEXED,  0xA5, 0 },
+    { "BITB", MODE_DIRECT,   0xD5, 0 },
+    { "BITB", MODE_EXTENDED, 0xF5, 0 },
+    { "BITB", MODE_IMMEDIATE,0xC5, 1 },
+    { "BITB", MODE_INDEXED,  0xE5, 0 },
+
+    /* CMP */
+    { "CMPA", MODE_DIRECT,   0x91,   0 },
+    { "CMPA", MODE_EXTENDED, 0xB1,   0 },
+    { "CMPA", MODE_IMMEDIATE,0x81,   1 },
+    { "CMPA", MODE_INDEXED,  0xA1,   0 },
+    { "CMPB", MODE_DIRECT,   0xD1,   0 },
+    { "CMPB", MODE_EXTENDED, 0xF1,   0 },
+    { "CMPB", MODE_IMMEDIATE,0xC1,   1 },
+    { "CMPB", MODE_INDEXED,  0xE1,   0 },
+    { "CMPD", MODE_DIRECT,   0x1093, 0 },
+    { "CMPD", MODE_EXTENDED, 0x10B3, 0 },
+    { "CMPD", MODE_IMMEDIATE,0x1083, 2 },
+    { "CMPD", MODE_INDEXED,  0x10A3, 0 },
+    { "CMPS", MODE_DIRECT,   0x119C, 0 },
+    { "CMPS", MODE_EXTENDED, 0x11BC, 0 },
+    { "CMPS", MODE_IMMEDIATE,0x118C, 2 },
+    { "CMPS", MODE_INDEXED,  0x11AC, 0 },
+    { "CMPU", MODE_DIRECT,   0x1193, 0 },
+    { "CMPU", MODE_EXTENDED, 0x11B3, 0 },
+    { "CMPU", MODE_IMMEDIATE,0x1183, 2 },
+    { "CMPU", MODE_INDEXED,  0x11A3, 0 },
+    { "CMPX", MODE_DIRECT,   0x9C,   0 },
+    { "CMPX", MODE_EXTENDED, 0xBC,   0 },
+    { "CMPX", MODE_IMMEDIATE,0x8C,   2 },
+    { "CMPX", MODE_INDEXED,  0xAC,   0 },
+    { "CMPY", MODE_DIRECT,   0x109C, 0 },
+    { "CMPY", MODE_EXTENDED, 0x10BC, 0 },
+    { "CMPY", MODE_IMMEDIATE,0x108C, 2 },
+    { "CMPY", MODE_INDEXED,  0x10AC, 0 },
+
+    /* EOR */
+    { "EORA", MODE_DIRECT,   0x98, 0 },
+    { "EORA", MODE_EXTENDED, 0xB8, 0 },
+    { "EORA", MODE_IMMEDIATE,0x88, 1 },
+    { "EORA", MODE_INDEXED,  0xA8, 0 },
+    { "EORB", MODE_DIRECT,   0xD8, 0 },
+    { "EORB", MODE_EXTENDED, 0xF8, 0 },
+    { "EORB", MODE_IMMEDIATE,0xC8, 1 },
+    { "EORB", MODE_INDEXED,  0xE8, 0 },
+
+    /* OR */
+    { "ORA",  MODE_DIRECT,   0x9A, 0 },
+    { "ORA",  MODE_EXTENDED, 0xBA, 0 },
+    { "ORA",  MODE_IMMEDIATE,0x8A, 1 },
+    { "ORA",  MODE_INDEXED,  0xAA, 0 },
+    { "ORB",  MODE_DIRECT,   0xDA, 0 },
+    { "ORB",  MODE_EXTENDED, 0xFA, 0 },
+    { "ORB",  MODE_IMMEDIATE,0xCA, 1 },
+    { "ORB",  MODE_INDEXED,  0xEA, 0 },
+    { "ORCC", MODE_IMMEDIATE,0x1A, 1 },
+
+    /* SBC */
+    { "SBCA", MODE_DIRECT,   0x92, 0 },
+    { "SBCA", MODE_EXTENDED, 0xB2, 0 },
+    { "SBCA", MODE_IMMEDIATE,0x82, 1 },
+    { "SBCA", MODE_INDEXED,  0xA2, 0 },
+    { "SBCB", MODE_DIRECT,   0xD2, 0 },
+    { "SBCB", MODE_EXTENDED, 0xF2, 0 },
+    { "SBCB", MODE_IMMEDIATE,0xC2, 1 },
+    { "SBCB", MODE_INDEXED,  0xE2, 0 },
+
+    /* SUB */
+    { "SUBA", MODE_DIRECT,   0x90, 0 },
+    { "SUBA", MODE_EXTENDED, 0xB0, 0 },
+    { "SUBA", MODE_IMMEDIATE,0x80, 1 },
+    { "SUBA", MODE_INDEXED,  0xA0, 0 },
+    { "SUBB", MODE_DIRECT,   0xD0, 0 },
+    { "SUBB", MODE_EXTENDED, 0xF0, 0 },
+    { "SUBB", MODE_IMMEDIATE,0xC0, 1 },
+    { "SUBB", MODE_INDEXED,  0xE0, 0 },
+    { "SUBD", MODE_DIRECT,   0x93, 0 },
+    { "SUBD", MODE_EXTENDED, 0xB3, 0 },
+    { "SUBD", MODE_IMMEDIATE,0x83, 2 },
+    { "SUBD", MODE_INDEXED,  0xA3, 0 },
+
+    /* JMP / JSR (no immediate) */
+    { "JMP", MODE_DIRECT,   0x0E, 0 },
+    { "JMP", MODE_EXTENDED, 0x7E, 0 },
+    { "JMP", MODE_INDEXED,  0x6E, 0 },
+    { "JSR", MODE_DIRECT,   0x9D, 0 },
+    { "JSR", MODE_EXTENDED, 0xBD, 0 },
+    { "JSR", MODE_INDEXED,  0xAD, 0 },
+
+    /* LEA (indexed only) */
+    { "LEAS", MODE_INDEXED, 0x32, 0 },
+    { "LEAU", MODE_INDEXED, 0x33, 0 },
+    { "LEAX", MODE_INDEXED, 0x30, 0 },
+    { "LEAY", MODE_INDEXED, 0x31, 0 },
+
+    /* CWAI (immediate only) */
+    { "CWAI", MODE_IMMEDIATE, 0x3C, 1 },
+
+    /* LD */
+    { "LDA", MODE_DIRECT,   0x96,   0 },
+    { "LDA", MODE_EXTENDED, 0xB6,   0 },
+    { "LDA", MODE_IMMEDIATE,0x86,   1 },
+    { "LDA", MODE_INDEXED,  0xA6,   0 },
+    { "LDB", MODE_DIRECT,   0xD6,   0 },
+    { "LDB", MODE_EXTENDED, 0xF6,   0 },
+    { "LDB", MODE_IMMEDIATE,0xC6,   1 },
+    { "LDB", MODE_INDEXED,  0xE6,   0 },
+    { "LDD", MODE_DIRECT,   0xDC,   0 },
+    { "LDD", MODE_EXTENDED, 0xFC,   0 },
+    { "LDD", MODE_IMMEDIATE,0xCC,   2 },
+    { "LDD", MODE_INDEXED,  0xEC,   0 },
+    { "LDS", MODE_DIRECT,   0x10DE, 0 },
+    { "LDS", MODE_EXTENDED, 0x10FE, 0 },
+    { "LDS", MODE_IMMEDIATE,0x10CE, 2 },
+    { "LDS", MODE_INDEXED,  0x10EE, 0 },
+    { "LDU", MODE_DIRECT,   0xDE,   0 },
+    { "LDU", MODE_EXTENDED, 0xFE,   0 },
+    { "LDU", MODE_IMMEDIATE,0xCE,   2 },
+    { "LDU", MODE_INDEXED,  0xEE,   0 },
+    { "LDX", MODE_DIRECT,   0x9E,   0 },
+    { "LDX", MODE_EXTENDED, 0xBE,   0 },
+    { "LDX", MODE_IMMEDIATE,0x8E,   2 },
+    { "LDX", MODE_INDEXED,  0xAE,   0 },
+    { "LDY", MODE_DIRECT,   0x109E, 0 },
+    { "LDY", MODE_EXTENDED, 0x10BE, 0 },
+    { "LDY", MODE_IMMEDIATE,0x108E, 2 },
+    { "LDY", MODE_INDEXED,  0x10AE, 0 },
+
+    /* ST (no immediate) */
+    { "STA", MODE_DIRECT,   0x97,   0 },
+    { "STA", MODE_EXTENDED, 0xB7,   0 },
+    { "STA", MODE_INDEXED,  0xA7,   0 },
+    { "STB", MODE_DIRECT,   0xD7,   0 },
+    { "STB", MODE_EXTENDED, 0xF7,   0 },
+    { "STB", MODE_INDEXED,  0xE7,   0 },
+    { "STD", MODE_DIRECT,   0xDD,   0 },
+    { "STD", MODE_EXTENDED, 0xFD,   0 },
+    { "STD", MODE_INDEXED,  0xED,   0 },
+    { "STS", MODE_DIRECT,   0x10DF, 0 },
+    { "STS", MODE_EXTENDED, 0x10FF, 0 },
+    { "STS", MODE_INDEXED,  0x10EF, 0 },
+    { "STU", MODE_DIRECT,   0xDF,   0 },
+    { "STU", MODE_EXTENDED, 0xFF,   0 },
+    { "STU", MODE_INDEXED,  0xEF,   0 },
+    { "STX", MODE_DIRECT,   0x9F,   0 },
+    { "STX", MODE_EXTENDED, 0xBF,   0 },
+    { "STX", MODE_INDEXED,  0xAF,   0 },
+    { "STY", MODE_DIRECT,   0x109F, 0 },
+    { "STY", MODE_EXTENDED, 0x10BF, 0 },
+    { "STY", MODE_INDEXED,  0x10AF, 0 },
+
+    /* Single-operand read-modify-write family: memory (direct/extended/indexed)
+       plus accumulator-implied A/B forms. LSL is an alias of ASL. */
+    { "ASL",  MODE_DIRECT,   0x08, 0 },
+    { "ASL",  MODE_EXTENDED, 0x78, 0 },
+    { "ASL",  MODE_INDEXED,  0x68, 0 },
+    { "ASLA", MODE_IMPLIED,  0x48, 0 },
+    { "ASLB", MODE_IMPLIED,  0x58, 0 },
+    { "LSL",  MODE_DIRECT,   0x08, 0 },
+    { "LSL",  MODE_EXTENDED, 0x78, 0 },
+    { "LSL",  MODE_INDEXED,  0x68, 0 },
+    { "LSLA", MODE_IMPLIED,  0x48, 0 },
+    { "LSLB", MODE_IMPLIED,  0x58, 0 },
+
+    { "ASR",  MODE_DIRECT,   0x07, 0 },
+    { "ASR",  MODE_EXTENDED, 0x77, 0 },
+    { "ASR",  MODE_INDEXED,  0x67, 0 },
+    { "ASRA", MODE_IMPLIED,  0x47, 0 },
+    { "ASRB", MODE_IMPLIED,  0x57, 0 },
+
+    { "CLR",  MODE_DIRECT,   0x0F, 0 },
+    { "CLR",  MODE_EXTENDED, 0x7F, 0 },
+    { "CLR",  MODE_INDEXED,  0x6F, 0 },
+    { "CLRA", MODE_IMPLIED,  0x4F, 0 },
+    { "CLRB", MODE_IMPLIED,  0x5F, 0 },
+
+    { "COM",  MODE_DIRECT,   0x03, 0 },
+    { "COM",  MODE_EXTENDED, 0x73, 0 },
+    { "COM",  MODE_INDEXED,  0x63, 0 },
+    { "COMA", MODE_IMPLIED,  0x43, 0 },
+    { "COMB", MODE_IMPLIED,  0x53, 0 },
+
+    { "DEC",  MODE_DIRECT,   0x0A, 0 },
+    { "DEC",  MODE_EXTENDED, 0x7A, 0 },
+    { "DEC",  MODE_INDEXED,  0x6A, 0 },
+    { "DECA", MODE_IMPLIED,  0x4A, 0 },
+    { "DECB", MODE_IMPLIED,  0x5A, 0 },
+
+    { "INC",  MODE_DIRECT,   0x0C, 0 },
+    { "INC",  MODE_EXTENDED, 0x7C, 0 },
+    { "INC",  MODE_INDEXED,  0x6C, 0 },
+    { "INCA", MODE_IMPLIED,  0x4C, 0 },
+    { "INCB", MODE_IMPLIED,  0x5C, 0 },
+
+    { "LSR",  MODE_DIRECT,   0x04, 0 },
+    { "LSR",  MODE_EXTENDED, 0x74, 0 },
+    { "LSR",  MODE_INDEXED,  0x64, 0 },
+    { "LSRA", MODE_IMPLIED,  0x44, 0 },
+    { "LSRB", MODE_IMPLIED,  0x54, 0 },
+
+    { "NEG",  MODE_DIRECT,   0x00, 0 },
+    { "NEG",  MODE_EXTENDED, 0x70, 0 },
+    { "NEG",  MODE_INDEXED,  0x60, 0 },
+    { "NEGA", MODE_IMPLIED,  0x40, 0 },
+    { "NEGB", MODE_IMPLIED,  0x50, 0 },
+
+    { "ROL",  MODE_DIRECT,   0x09, 0 },
+    { "ROL",  MODE_EXTENDED, 0x79, 0 },
+    { "ROL",  MODE_INDEXED,  0x69, 0 },
+    { "ROLA", MODE_IMPLIED,  0x49, 0 },
+    { "ROLB", MODE_IMPLIED,  0x59, 0 },
+
+    { "ROR",  MODE_DIRECT,   0x06, 0 },
+    { "ROR",  MODE_EXTENDED, 0x76, 0 },
+    { "ROR",  MODE_INDEXED,  0x66, 0 },
+    { "RORA", MODE_IMPLIED,  0x46, 0 },
+    { "RORB", MODE_IMPLIED,  0x56, 0 },
+
+    { "TST",  MODE_DIRECT,   0x0D, 0 },
+    { "TST",  MODE_EXTENDED, 0x7D, 0 },
+    { "TST",  MODE_INDEXED,  0x6D, 0 },
+    { "TSTA", MODE_IMPLIED,  0x4D, 0 },
+    { "TSTB", MODE_IMPLIED,  0x5D, 0 },
+
+    /* Branches: short (8-bit) and long ('L' prefix, 16-bit) forms */
+    { "BCC",  MODE_RELATIVE8,  0x24,   0 },
+    { "LBCC", MODE_RELATIVE16, 0x1024, 0 },
+    { "BCS",  MODE_RELATIVE8,  0x25,   0 },
+    { "LBCS", MODE_RELATIVE16, 0x1025, 0 },
+    { "BEQ",  MODE_RELATIVE8,  0x27,   0 },
+    { "LBEQ", MODE_RELATIVE16, 0x1027, 0 },
+    { "BGE",  MODE_RELATIVE8,  0x2C,   0 },
+    { "LBGE", MODE_RELATIVE16, 0x102C, 0 },
+    { "BGT",  MODE_RELATIVE8,  0x2E,   0 },
+    { "LBGT", MODE_RELATIVE16, 0x102E, 0 },
+    { "BHI",  MODE_RELATIVE8,  0x22,   0 },
+    { "LBHI", MODE_RELATIVE16, 0x1022, 0 },
+    { "BHS",  MODE_RELATIVE8,  0x24,   0 },
+    { "LBHS", MODE_RELATIVE16, 0x1024, 0 },
+    { "BLE",  MODE_RELATIVE8,  0x2F,   0 },
+    { "LBLE", MODE_RELATIVE16, 0x102F, 0 },
+    { "BLO",  MODE_RELATIVE8,  0x25,   0 },
+    { "LBLO", MODE_RELATIVE16, 0x1025, 0 },
+    { "BLS",  MODE_RELATIVE8,  0x23,   0 },
+    { "LBLS", MODE_RELATIVE16, 0x1023, 0 },
+    { "BLT",  MODE_RELATIVE8,  0x2D,   0 },
+    { "LBLT", MODE_RELATIVE16, 0x102D, 0 },
+    { "BMI",  MODE_RELATIVE8,  0x2B,   0 },
+    { "LBMI", MODE_RELATIVE16, 0x102B, 0 },
+    { "BNE",  MODE_RELATIVE8,  0x26,   0 },
+    { "LBNE", MODE_RELATIVE16, 0x1026, 0 },
+    { "BPL",  MODE_RELATIVE8,  0x2A,   0 },
+    { "LBPL", MODE_RELATIVE16, 0x102A, 0 },
+    { "BRA",  MODE_RELATIVE8,  0x20,   0 },
+    { "LBRA", MODE_RELATIVE16, 0x16,   0 },
+    { "BRN",  MODE_RELATIVE8,  0x21,   0 },
+    { "LBRN", MODE_RELATIVE16, 0x1021, 0 },
+    { "BSR",  MODE_RELATIVE8,  0x8D,   0 },
+    { "LBSR", MODE_RELATIVE16, 0x17,   0 },
+    { "BVC",  MODE_RELATIVE8,  0x28,   0 },
+    { "LBVC", MODE_RELATIVE16, 0x1028, 0 },
+    { "BVS",  MODE_RELATIVE8,  0x29,   0 },
+    { "LBVS", MODE_RELATIVE16, 0x1029, 0 },
+
+    /* Register list (PSH/PUL) and register pair (EXG/TFR) */
+    { "PSHS", MODE_REGISTER_LIST, 0x34, 0 },
+    { "PSHU", MODE_REGISTER_LIST, 0x36, 0 },
+    { "PULS", MODE_REGISTER_LIST, 0x35, 0 },
+    { "PULU", MODE_REGISTER_LIST, 0x37, 0 },
+    { "EXG",  MODE_REGISTER_PAIR, 0x1E, 0 },
+    { "TFR",  MODE_REGISTER_PAIR, 0x1F, 0 },
+
+    /* Implied (no operand) */
+    { "ABX",  MODE_IMPLIED, 0x3A,   0 },
+    { "DAA",  MODE_IMPLIED, 0x19,   0 },
+    { "MUL",  MODE_IMPLIED, 0x3D,   0 },
+    { "NOP",  MODE_IMPLIED, 0x12,   0 },
+    { "RTI",  MODE_IMPLIED, 0x3B,   0 },
+    { "RTS",  MODE_IMPLIED, 0x39,   0 },
+    { "SEX",  MODE_IMPLIED, 0x1D,   0 },
+    { "SYNC", MODE_IMPLIED, 0x13,   0 },
+    { "SWI",  MODE_IMPLIED, 0x3F,   0 },
+    { "SWI2", MODE_IMPLIED, 0x103F, 0 },
+    { "SWI3", MODE_IMPLIED, 0x113F, 0 }
+};
+
+#define NUM_OPCODES (sizeof(opcode_table) / sizeof(opcode_table[0]))
+
+static int is_char_ci(uint8_t byte, char ch)
+{
+    return toupper((int) byte) == toupper((int) ch);
+}
+
+static int mnemonic_has_mode(const char *mnemonic, addr_mode_t mode)
+{
+    size_t i;
+
+    for (i = 0; i < NUM_OPCODES; i++)
+    {
+        if (strcmp(opcode_table[i].mnemonic, mnemonic) == 0 && opcode_table[i].mode == mode)
+        {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static const opcode_entry_t *find_opcode(const char *mnemonic, addr_mode_t mode)
+{
+    size_t i;
+
+    for (i = 0; i < NUM_OPCODES; i++)
+    {
+        if (strcmp(opcode_table[i].mnemonic, mnemonic) == 0 && opcode_table[i].mode == mode)
+        {
+            return &opcode_table[i];
+        }
+    }
+    return NULL;
+}
+
+/* Indexed-mode instructions use a single opcode (1 or 2 bytes,
+   depending on a page-2/3 prefix) regardless of which specific
+   indexed form is used; PCR offset arithmetic needs to know how
+   many opcode bytes precede the postbyte. */
+static int indexed_opcode_length(const char *mnemonic)
+{
+    const opcode_entry_t *entry = find_opcode(mnemonic, MODE_INDEXED);
+
+    if (entry == NULL)
+    {
+        return 1;
+    }
+    return (entry->opcode > 0xFF) ? 2 : 1;
+}
+
+static int32_t value_to_integer(const assemble_value_t *value)
+{
+    switch (value->type)
+    {
+        case ASSEMBLE_VALUE_FLOAT:
+            return (int32_t) value->value.as_float;
+        case ASSEMBLE_VALUE_INTEGER:
+        default:
+            return value->value.as_integer;
+    }
+}
+
+static _kernel_oserror *eval_expr(assemble_context_t *context,
+                                   const uint8_t *text, size_t length,
+                                   assemble_value_t *value, size_t *consumed)
+{
+    _kernel_oserror *error = NULL;
+
+    if (context->resolve_expr(context->user_data, text, length, value, consumed, &error) != ASSEMBLE_RESULT_OK)
+    {
+        if (error != NULL)
+        {
+            return error;
+        }
+        return assemble_set_error(ASSEMBLE_CPU_6809, ASSEMBLE_ERROR_TYPE_EXPRESSION, ASSEMBLE_6809_ERR_NONE,
+                                   "Expression could not be evaluated");
+    }
+    if (value->type == ASSEMBLE_VALUE_STRING)
+    {
+        return assemble_set_error(ASSEMBLE_CPU_6809, ASSEMBLE_ERROR_TYPE_EXPRESSION, ASSEMBLE_6809_ERR_NONE,
+                                   "Expected a numeric value");
+    }
+    return NULL;
+}
+
+static _kernel_oserror *eval_numeric(assemble_context_t *context,
+                                      const uint8_t *text, size_t length,
+                                      size_t *pos_inout, int32_t *out_value)
+{
+    assemble_value_t value;
+    size_t consumed;
+    _kernel_oserror *error;
+
+    error = eval_expr(context, text + *pos_inout, length - *pos_inout, &value, &consumed);
+    if (error != NULL)
+    {
+        return error;
+    }
+    *pos_inout += consumed;
+    *out_value = value_to_integer(&value);
+    return NULL;
+}
+
+static _kernel_oserror *check_trailing(const uint8_t *text, size_t length, size_t pos)
+{
+    pos += assemble_skip_spaces(text + pos, length - pos);
+    if (pos != length)
+    {
+        return assemble_set_error(ASSEMBLE_CPU_6809, ASSEMBLE_ERROR_TYPE_SYNTAX, ASSEMBLE_6809_ERR_NONE,
+                                   "Unexpected text after operand");
+    }
+    return NULL;
+}
+
+/* X/Y/U/S -> 2-bit indexed register code */
+static int parse_indexed_register(uint8_t ch, int *out_code)
+{
+    switch (toupper((int) ch))
+    {
+        case 'X': *out_code = 0; return 1;
+        case 'Y': *out_code = 1; return 1;
+        case 'U': *out_code = 2; return 1;
+        case 'S': *out_code = 3; return 1;
+        default:  return 0;
+    }
+}
+
+/* A, B, D, X, Y, U, S, CC, DP or PC -> 4-bit TFR/EXG register code.
+   Codes 0-5 are the 16-bit registers, 8-11 the 8-bit registers. */
+static _kernel_oserror *parse_transfer_register(const uint8_t *text, size_t length,
+                                                  size_t *pos_inout, int *out_code)
+{
+    size_t pos = *pos_inout;
+    uint8_t c1, c2;
+
+    if (pos >= length)
+    {
+        return assemble_set_error(ASSEMBLE_CPU_6809, ASSEMBLE_ERROR_TYPE_BAD_OPERAND,
+                                   ASSEMBLE_6809_ERR_EXPECT_ALL_REGISTER,
+                                   "Expected A, B, D, X, Y, U, S, CC, DP or PC");
+    }
+    c1 = (uint8_t) toupper((int) text[pos]);
+    c2 = (pos + 1 < length) ? (uint8_t) toupper((int) text[pos + 1]) : 0;
+
+    if (c1 == 'A') { *out_code = 8;  *pos_inout = pos + 1; return NULL; }
+    if (c1 == 'B') { *out_code = 9;  *pos_inout = pos + 1; return NULL; }
+    if (c1 == 'D' && c2 == 'P') { *out_code = 11; *pos_inout = pos + 2; return NULL; }
+    if (c1 == 'D') { *out_code = 0;  *pos_inout = pos + 1; return NULL; }
+    if (c1 == 'X') { *out_code = 1;  *pos_inout = pos + 1; return NULL; }
+    if (c1 == 'Y') { *out_code = 2;  *pos_inout = pos + 1; return NULL; }
+    if (c1 == 'U') { *out_code = 3;  *pos_inout = pos + 1; return NULL; }
+    if (c1 == 'S') { *out_code = 4;  *pos_inout = pos + 1; return NULL; }
+    if (c1 == 'P' && c2 == 'C') { *out_code = 5;  *pos_inout = pos + 2; return NULL; }
+    if (c1 == 'C' && c2 == 'C') { *out_code = 10; *pos_inout = pos + 2; return NULL; }
+
+    return assemble_set_error(ASSEMBLE_CPU_6809, ASSEMBLE_ERROR_TYPE_BAD_OPERAND,
+                               ASSEMBLE_6809_ERR_EXPECT_ALL_REGISTER,
+                               "Expected A, B, D, X, Y, U, S, CC, DP or PC");
+}
+
+static _kernel_oserror *error_expect_register(void)
+{
+    return assemble_set_error(ASSEMBLE_CPU_6809, ASSEMBLE_ERROR_TYPE_BAD_OPERAND,
+                               ASSEMBLE_6809_ERR_EXPECT_REGISTER,
+                               "Indexed addressing: expected X, Y, U or S");
+}
+
+static _kernel_oserror *error_expect_rbracket(void)
+{
+    return assemble_set_error(ASSEMBLE_CPU_6809, ASSEMBLE_ERROR_TYPE_SYNTAX,
+                               ASSEMBLE_6809_ERR_EXPECT_RBRACKET,
+                               "Indirect indexed addressing: expected ]");
+}
+
+static _kernel_oserror *finish_indexed_close(const uint8_t *text, size_t length, size_t *pos_inout, int indirect)
+{
+    size_t pos = *pos_inout;
+
+    if (indirect)
+    {
+        if (!(pos < length && text[pos] == ']'))
+        {
+            return error_expect_rbracket();
+        }
+        pos += 1;
+    }
+    *pos_inout = pos;
+    return NULL;
+}
+
+/*******************************************************************
+ Function:      finish_indexed_no_value
+ Description:   Parses the ',R', ',R+', ',R++', ',-R' and ',--R'
+                indexed forms (the ',' has already been consumed).
+ Parameters:    text/length = the operand text
+                pos_inout = current position, just after the ','
+                indirect = whether '[' was seen before this operand
+                out_postbyte, out_extra = results (no extra bytes)
+ Returns:       NULL if successful, otherwise a static error block
+ ******************************************************************/
+static _kernel_oserror *finish_indexed_no_value(const uint8_t *text, size_t length, size_t *pos_inout,
+                                                 int indirect, uint8_t *out_postbyte, int *out_extra)
+{
+    size_t pos = *pos_inout;
+    int reg;
+    int predec = 0;
+    int postinc = 0;
+    uint8_t postbyte;
+    _kernel_oserror *error;
+
+    pos += assemble_skip_spaces(text + pos, length - pos);
+
+    if (pos < length && text[pos] == '-')
+    {
+        predec = 1;
+        pos += 1;
+        if (pos < length && text[pos] == '-')
+        {
+            predec = 2;
+            pos += 1;
+        }
+    }
+
+    if (!(pos < length && parse_indexed_register(text[pos], &reg)))
+    {
+        return error_expect_register();
+    }
+    pos += 1;
+
+    if (predec == 0 && pos < length && text[pos] == '+')
+    {
+        postinc = 1;
+        pos += 1;
+        if (pos < length && text[pos] == '+')
+        {
+            postinc = 2;
+            pos += 1;
+        }
+    }
+
+    if (predec == 1)      { postbyte = 0x82; }
+    else if (predec == 2) { postbyte = 0x83; }
+    else if (postinc == 1) { postbyte = 0x80; }
+    else if (postinc == 2) { postbyte = 0x81; }
+    else                   { postbyte = 0x84; }
+
+    postbyte = (uint8_t) (postbyte | (reg << 5));
+
+    if (indirect)
+    {
+        if (predec == 1 || postinc == 1)
+        {
+            return assemble_set_error(ASSEMBLE_CPU_6809, ASSEMBLE_ERROR_TYPE_BAD_OPERAND,
+                                       ASSEMBLE_6809_ERR_BAD_AUTOSTEP,
+                                       "Indirect indexed addressing: auto-increment/decrement must be by 2");
+        }
+        postbyte = (uint8_t) (postbyte | 0x10);
+    }
+
+    error = finish_indexed_close(text, length, &pos, indirect);
+    if (error != NULL)
+    {
+        return error;
+    }
+
+    *pos_inout = pos;
+    *out_postbyte = postbyte;
+    *out_extra = 0;
+    return NULL;
+}
+
+/*******************************************************************
+ Function:      finish_indexed_accumulator
+ Description:   Parses the 'A,R', 'B,R' and 'D,R' accumulator-offset
+                indexed forms.
+ Parameters:    text/length = the operand text
+                pos_inout = current position, at the register (R)
+                indirect = whether '[' was seen before this operand
+                accreg = 'A', 'B' or 'D'
+                out_postbyte, out_extra = results (no extra bytes)
+ Returns:       NULL if successful, otherwise a static error block
+ ******************************************************************/
+static _kernel_oserror *finish_indexed_accumulator(const uint8_t *text, size_t length, size_t *pos_inout,
+                                                     int indirect, uint8_t accreg,
+                                                     uint8_t *out_postbyte, int *out_extra)
+{
+    size_t pos = *pos_inout;
+    int reg;
+    uint8_t postbyte;
+    _kernel_oserror *error;
+
+    if (!(pos < length && parse_indexed_register(text[pos], &reg)))
+    {
+        return error_expect_register();
+    }
+    pos += 1;
+
+    if (accreg == 'A')      { postbyte = 0x86; }
+    else if (accreg == 'B') { postbyte = 0x85; }
+    else                    { postbyte = 0x8B; }
+
+    postbyte = (uint8_t) (postbyte | (reg << 5));
+    if (indirect)
+    {
+        postbyte = (uint8_t) (postbyte | 0x10);
+    }
+
+    error = finish_indexed_close(text, length, &pos, indirect);
+    if (error != NULL)
+    {
+        return error;
+    }
+
+    *pos_inout = pos;
+    *out_postbyte = postbyte;
+    *out_extra = 0;
+    return NULL;
+}
+
+/*******************************************************************
+ Function:      finish_indexed_with_offset
+ Description:   Parses the 'n,R' and 'n,PCR' indexed forms, given the
+                offset/target value has already been evaluated.
+ Parameters:    context = the assembly context (for context->address)
+                text/length = the operand text
+                pos_inout = current position, at 'R'/'PCR'
+                indirect = whether '[' was seen before this operand
+                value = the already-evaluated offset (for R) or
+                        target address (for PCR)
+                forced_width = 0 (auto), 1 ('<', force 8-bit) or
+                               2 ('>', force 16-bit)
+                opcode_bytes = number of opcode bytes preceding the
+                               postbyte (1, or 2 for a page-2/3
+                               prefixed instruction), needed for PCR
+                               offset arithmetic
+                out_postbyte, out_extra, out_value = results
+ Returns:       NULL if successful, otherwise a static error block
+ ******************************************************************/
+static _kernel_oserror *finish_indexed_with_offset(assemble_context_t *context,
+                                                     const uint8_t *text, size_t length, size_t *pos_inout,
+                                                     int indirect, int32_t value, int forced_width,
+                                                     int opcode_bytes,
+                                                     uint8_t *out_postbyte, int *out_extra, int32_t *out_value)
+{
+    size_t pos = *pos_inout;
+    int reg;
+    uint8_t postbyte;
+    int extra;
+    int32_t extra_value;
+    _kernel_oserror *error;
+
+    if (pos + 2 < length && is_char_ci(text[pos], 'P') && is_char_ci(text[pos + 1], 'C') &&
+        is_char_ci(text[pos + 2], 'R'))
+    {
+        int32_t offset8  = value - ((int32_t) context->address + opcode_bytes + 1 + 1);
+        int32_t offset16 = value - ((int32_t) context->address + opcode_bytes + 1 + 2);
+        int use16 = (forced_width == 2);
+
+        pos += 3;
+
+        if (forced_width == 0)
+        {
+            use16 = (offset8 < -128 || offset8 > 127);
+        }
+
+        if (use16)
+        {
+            if (offset16 < -32768 || offset16 > 32767)
+            {
+                return assemble_set_error(ASSEMBLE_CPU_6809, ASSEMBLE_ERROR_TYPE_RANGE,
+                                           ASSEMBLE_6809_ERR_OFFSET_OUT_OF_RANGE,
+                                           "Offset target out of range");
+            }
+            postbyte = 0x8D;
+            extra = 2;
+            extra_value = offset16;
+        }
+        else
+        {
+            if (offset8 < -128 || offset8 > 127)
+            {
+                return assemble_set_error(ASSEMBLE_CPU_6809, ASSEMBLE_ERROR_TYPE_RANGE,
+                                           ASSEMBLE_6809_ERR_OFFSET_OUT_OF_RANGE,
+                                           "Offset target out of range");
+            }
+            postbyte = 0x8C;
+            extra = 1;
+            extra_value = offset8;
+        }
+
+        if (indirect)
+        {
+            postbyte = (uint8_t) (postbyte | 0x10);
+        }
+    }
+    else if (pos < length && parse_indexed_register(text[pos], &reg))
+    {
+        pos += 1;
+
+        if (!indirect && forced_width == 0 && value >= -16 && value <= 15)
+        {
+            if (value == 0)
+            {
+                postbyte = 0x84;
+                extra = 0;
+                extra_value = 0;
+            }
+            else
+            {
+                postbyte = (uint8_t) (value & 0x1F);
+                extra = 0;
+                extra_value = 0;
+            }
+        }
+        else if (forced_width == 1 || (forced_width == 0 && value >= -128 && value <= 127))
+        {
+            if (value < -128 || value > 127)
+            {
+                return assemble_set_error(ASSEMBLE_CPU_6809, ASSEMBLE_ERROR_TYPE_RANGE,
+                                           ASSEMBLE_6809_ERR_OFFSET_OUT_OF_RANGE,
+                                           "Offset out of range for an 8-bit indexed offset");
+            }
+            postbyte = 0x88;
+            extra = 1;
+            extra_value = value;
+        }
+        else
+        {
+            if (value < -32768 || value > 32767)
+            {
+                return assemble_set_error(ASSEMBLE_CPU_6809, ASSEMBLE_ERROR_TYPE_RANGE,
+                                           ASSEMBLE_6809_ERR_OFFSET_OUT_OF_RANGE,
+                                           "Offset out of range for a 16-bit indexed offset");
+            }
+            postbyte = 0x89;
+            extra = 2;
+            extra_value = value;
+        }
+
+        postbyte = (uint8_t) (postbyte | (reg << 5));
+        if (indirect && postbyte < 0x88)
+        {
+            /* The 5-bit direct-offset form has no indirect variant;
+               widen to the 8-bit form before flagging indirection. */
+            postbyte = (uint8_t) (0x88 | (reg << 5));
+            extra = 1;
+            extra_value = value;
+            if (value < -128 || value > 127)
+            {
+                return assemble_set_error(ASSEMBLE_CPU_6809, ASSEMBLE_ERROR_TYPE_RANGE,
+                                           ASSEMBLE_6809_ERR_OFFSET_OUT_OF_RANGE,
+                                           "Offset out of range for an 8-bit indexed offset");
+            }
+        }
+        if (indirect)
+        {
+            postbyte = (uint8_t) (postbyte | 0x10);
+        }
+    }
+    else
+    {
+        return assemble_set_error(ASSEMBLE_CPU_6809, ASSEMBLE_ERROR_TYPE_BAD_OPERAND,
+                                   ASSEMBLE_6809_ERR_EXPECT_REGISTER_OR_PCR,
+                                   "Indexed addressing: expected X, Y, U, S or PCR");
+    }
+
+    error = finish_indexed_close(text, length, &pos, indirect);
+    if (error != NULL)
+    {
+        return error;
+    }
+
+    *pos_inout = pos;
+    *out_postbyte = postbyte;
+    *out_extra = extra;
+    *out_value = extra_value;
+    return NULL;
+}
+
+static _kernel_oserror *error_bad_pushpull(void)
+{
+    return assemble_set_error(ASSEMBLE_CPU_6809, ASSEMBLE_ERROR_TYPE_BAD_OPERAND,
+                               ASSEMBLE_6809_ERR_BAD_PUSHPULL,
+                               "PSH/PUL: register cannot be stacked");
+}
+
+/*******************************************************************
+ Function:      parse_register_list
+ Description:   Parses the comma-separated register list operand of
+                PSHS/PSHU/PULS/PULU into a postbyte bitmask. 'D'
+                stands for both A and B; a mnemonic may not list the
+                stack register it itself pushes/pulls from (eg PSHS
+                cannot list S).
+ Parameters:    mnemonic = "PSHS", "PSHU", "PULS" or "PULU"
+                text/length = the operand text
+                out_mode, out_value1 = results
+ Returns:       NULL if successful, otherwise a static error block
+ ******************************************************************/
+static _kernel_oserror *parse_register_list(const char *mnemonic, const uint8_t *text, size_t length,
+                                             addr_mode_t *out_mode, int32_t *out_value1)
+{
+    size_t pos = 0;
+    char forbidden = mnemonic[3];
+    uint8_t mask = 0;
+    _kernel_oserror *error;
+
+    pos += assemble_skip_spaces(text + pos, length - pos);
+    if (pos >= length)
+    {
+        return assemble_set_error_f(ASSEMBLE_CPU_6809, ASSEMBLE_ERROR_TYPE_BAD_OPERAND, ASSEMBLE_6809_ERR_NONE,
+                                     "%s requires an operand", mnemonic);
+    }
+
+    for (;;)
+    {
+        int code;
+
+        error = parse_transfer_register(text, length, &pos, &code);
+        if (error != NULL)
+        {
+            return error;
+        }
+
+        switch (code)
+        {
+            case 0:  mask = (uint8_t) (mask | 0x02 | 0x04); break; /* D -> A and B */
+            case 1:  mask = (uint8_t) (mask | 0x10); break;        /* X */
+            case 2:  mask = (uint8_t) (mask | 0x20); break;        /* Y */
+            case 3:  if (forbidden == 'U') { return error_bad_pushpull(); }
+                     mask = (uint8_t) (mask | 0x40); break;        /* U */
+            case 4:  if (forbidden == 'S') { return error_bad_pushpull(); }
+                     mask = (uint8_t) (mask | 0x40); break;        /* S */
+            case 5:  mask = (uint8_t) (mask | 0x80); break;        /* PC */
+            case 8:  mask = (uint8_t) (mask | 0x02); break;        /* A */
+            case 9:  mask = (uint8_t) (mask | 0x04); break;        /* B */
+            case 10: mask = (uint8_t) (mask | 0x01); break;        /* CC */
+            case 11: mask = (uint8_t) (mask | 0x08); break;        /* DP */
+            default: break;
+        }
+
+        pos += assemble_skip_spaces(text + pos, length - pos);
+        if (pos < length && text[pos] == ',')
+        {
+            pos += 1;
+            pos += assemble_skip_spaces(text + pos, length - pos);
+            continue;
+        }
+        break;
+    }
+
+    error = check_trailing(text, length, pos);
+    if (error != NULL)
+    {
+        return error;
+    }
+
+    *out_mode = MODE_REGISTER_LIST;
+    *out_value1 = mask;
+    return NULL;
+}
+
+/*******************************************************************
+ Function:      parse_register_pair
+ Description:   Parses the 'reg,reg' operand of EXG/TFR into a packed
+                postbyte (source register in the high nibble,
+                destination in the low). Mixing an 8-bit and a
+                16-bit register is rejected.
+ Parameters:    text/length = the operand text
+                out_mode, out_value1 = results
+ Returns:       NULL if successful, otherwise a static error block
+ ******************************************************************/
+static _kernel_oserror *parse_register_pair(const uint8_t *text, size_t length,
+                                             addr_mode_t *out_mode, int32_t *out_value1)
+{
+    size_t pos = 0;
+    int src, dst;
+    _kernel_oserror *error;
+
+    pos += assemble_skip_spaces(text + pos, length - pos);
+    error = parse_transfer_register(text, length, &pos, &src);
+    if (error != NULL)
+    {
+        return error;
+    }
+
+    pos += assemble_skip_spaces(text + pos, length - pos);
+    if (!(pos < length && text[pos] == ','))
+    {
+        return assemble_set_error(ASSEMBLE_CPU_6809, ASSEMBLE_ERROR_TYPE_SYNTAX,
+                                   ASSEMBLE_6809_ERR_TRANSFER_EXPECT_COMMA, "TFR/EXG: expected ,");
+    }
+    pos += 1;
+    pos += assemble_skip_spaces(text + pos, length - pos);
+
+    error = parse_transfer_register(text, length, &pos, &dst);
+    if (error != NULL)
+    {
+        return error;
+    }
+
+    if ((src >= 8) != (dst >= 8))
+    {
+        return assemble_set_error(ASSEMBLE_CPU_6809, ASSEMBLE_ERROR_TYPE_BAD_OPERAND,
+                                   ASSEMBLE_6809_ERR_TRANSFER_SIZE_MISMATCH,
+                                   "TFR/EXG: registers are different size");
+    }
+
+    error = check_trailing(text, length, pos);
+    if (error != NULL)
+    {
+        return error;
+    }
+
+    *out_mode = MODE_REGISTER_PAIR;
+    *out_value1 = (src << 4) | dst;
+    return NULL;
+}
+
+/*******************************************************************
+ Function:      parse_branch
+ Description:   Parses the target-address operand of a short or long
+                branch mnemonic and computes the signed relative
+                offset.
+ Parameters:    context = the assembly context (for context->address)
+                mnemonic = the branch mnemonic (eg "BCC", "LBCC")
+                text/length = the operand text
+                out_mode, out_value1 = results
+ Returns:       NULL if successful, otherwise a static error block
+ ******************************************************************/
+static _kernel_oserror *parse_branch(assemble_context_t *context, const char *mnemonic,
+                                      const uint8_t *text, size_t length,
+                                      addr_mode_t *out_mode, int32_t *out_value1)
+{
+    size_t pos = 0;
+    int32_t target;
+    int32_t offset;
+    int is_long = mnemonic_has_mode(mnemonic, MODE_RELATIVE16);
+    const opcode_entry_t *entry;
+    int instruction_length;
+    _kernel_oserror *error;
+
+    pos += assemble_skip_spaces(text + pos, length - pos);
+    error = eval_numeric(context, text, length, &pos, &target);
+    if (error != NULL)
+    {
+        return error;
+    }
+    error = check_trailing(text, length, pos);
+    if (error != NULL)
+    {
+        return error;
+    }
+
+    *out_mode = is_long ? MODE_RELATIVE16 : MODE_RELATIVE8;
+    entry = find_opcode(mnemonic, *out_mode);
+    instruction_length = (entry->opcode > 0xFF ? 2 : 1) + (is_long ? 2 : 1);
+
+    offset = target - ((int32_t) context->address + instruction_length);
+
+    if (is_long)
+    {
+        if (offset < -32768 || offset > 32767)
+        {
+            return assemble_set_error(ASSEMBLE_CPU_6809, ASSEMBLE_ERROR_TYPE_RANGE,
+                                       ASSEMBLE_6809_ERR_BRANCH_RANGE, "Branch target out of range");
+        }
+    }
+    else
+    {
+        if (offset < -128 || offset > 127)
+        {
+            return assemble_set_error(ASSEMBLE_CPU_6809, ASSEMBLE_ERROR_TYPE_RANGE,
+                                       ASSEMBLE_6809_ERR_BRANCH_RANGE, "Branch target out of range");
+        }
+    }
+
+    *out_value1 = offset;
+    return NULL;
+}
+
+/*******************************************************************
+ Function:      parse_operand
+ Description:   Parses the operand text following a mnemonic and
+                determines the addressing mode and its value(s).
+ Parameters:    context = the assembly context
+                mnemonic = the mnemonic as read from the source line
+                text/length = the operand text following the mnemonic
+                out_mode, out_value1, out_value2 = results
+                out_indexed_extra = for MODE_INDEXED, how many extra
+                                     bytes (0, 1 or 2) follow the
+                                     postbyte in out_value1
+ Returns:       NULL if successful, otherwise a static error block
+ ******************************************************************/
+static _kernel_oserror *parse_operand(assemble_context_t *context, const char *mnemonic,
+                                       const uint8_t *text, size_t length,
+                                       addr_mode_t *out_mode, int32_t *out_value1, int32_t *out_value2,
+                                       int *out_indexed_extra)
+{
+    size_t pos = 0;
+    int forced_width = 0;
+    _kernel_oserror *error;
+
+    if (strcmp(mnemonic, "PSHS") == 0 || strcmp(mnemonic, "PSHU") == 0 ||
+        strcmp(mnemonic, "PULS") == 0 || strcmp(mnemonic, "PULU") == 0)
+    {
+        return parse_register_list(mnemonic, text, length, out_mode, out_value1);
+    }
+
+    if (strcmp(mnemonic, "EXG") == 0 || strcmp(mnemonic, "TFR") == 0)
+    {
+        return parse_register_pair(text, length, out_mode, out_value1);
+    }
+
+    if (mnemonic_has_mode(mnemonic, MODE_RELATIVE8) || mnemonic_has_mode(mnemonic, MODE_RELATIVE16))
+    {
+        return parse_branch(context, mnemonic, text, length, out_mode, out_value1);
+    }
+
+    pos += assemble_skip_spaces(text + pos, length - pos);
+
+    if (pos >= length)
+    {
+        if (mnemonic_has_mode(mnemonic, MODE_IMPLIED))
+        {
+            *out_mode = MODE_IMPLIED;
+            return NULL;
+        }
+        return assemble_set_error_f(ASSEMBLE_CPU_6809, ASSEMBLE_ERROR_TYPE_BAD_OPERAND, ASSEMBLE_6809_ERR_NONE,
+                                     "%s requires an operand", mnemonic);
+    }
+
+    if (text[pos] == '<')
+    {
+        forced_width = 1;
+        pos += 1;
+        pos += assemble_skip_spaces(text + pos, length - pos);
+    }
+    else if (text[pos] == '>')
+    {
+        forced_width = 2;
+        pos += 1;
+        pos += assemble_skip_spaces(text + pos, length - pos);
+    }
+
+    if (pos < length && text[pos] == '#')
+    {
+        int32_t value;
+
+        pos += 1;
+        error = eval_numeric(context, text, length, &pos, &value);
+        if (error != NULL)
+        {
+            return error;
+        }
+        error = check_trailing(text, length, pos);
+        if (error != NULL)
+        {
+            return error;
+        }
+        *out_mode = MODE_IMMEDIATE;
+        *out_value1 = value;
+        return NULL;
+    }
+
+    {
+        int indirect = 0;
+        size_t save;
+        uint8_t postbyte = 0;
+        int extra = 0;
+        int32_t extra_value = 0;
+        int32_t value;
+
+        if (pos < length && text[pos] == '[')
+        {
+            indirect = 1;
+            pos += 1;
+            pos += assemble_skip_spaces(text + pos, length - pos);
+        }
+
+        if (pos < length && text[pos] == ',')
+        {
+            pos += 1;
+            error = finish_indexed_no_value(text, length, &pos, indirect, &postbyte, &extra);
+            if (error != NULL)
+            {
+                return error;
+            }
+            error = check_trailing(text, length, pos);
+            if (error != NULL)
+            {
+                return error;
+            }
+            *out_mode = MODE_INDEXED;
+            *out_value1 = postbyte;
+            *out_indexed_extra = extra;
+            *out_value2 = 0;
+            return NULL;
+        }
+
+        save = pos;
+        if (pos < length &&
+            (is_char_ci(text[pos], 'A') || is_char_ci(text[pos], 'B') || is_char_ci(text[pos], 'D')) &&
+            !(pos + 1 < length && assemble_is_ident_char(text[pos + 1])))
+        {
+            uint8_t accreg = (uint8_t) toupper((int) text[pos]);
+            size_t p2 = pos + 1;
+
+            p2 += assemble_skip_spaces(text + p2, length - p2);
+            if (p2 < length && text[p2] == ',')
+            {
+                pos = p2 + 1;
+                pos += assemble_skip_spaces(text + pos, length - pos);
+                error = finish_indexed_accumulator(text, length, &pos, indirect, accreg, &postbyte, &extra);
+                if (error != NULL)
+                {
+                    return error;
+                }
+                error = check_trailing(text, length, pos);
+                if (error != NULL)
+                {
+                    return error;
+                }
+                *out_mode = MODE_INDEXED;
+                *out_value1 = postbyte;
+                *out_indexed_extra = extra;
+                *out_value2 = 0;
+                return NULL;
+            }
+            pos = save;
+        }
+
+        error = eval_numeric(context, text, length, &pos, &value);
+        if (error != NULL)
+        {
+            return error;
+        }
+        pos += assemble_skip_spaces(text + pos, length - pos);
+
+        if (pos < length && text[pos] == ',')
+        {
+            pos += 1;
+            pos += assemble_skip_spaces(text + pos, length - pos);
+            error = finish_indexed_with_offset(context, text, length, &pos, indirect, value, forced_width,
+                                                indexed_opcode_length(mnemonic), &postbyte, &extra, &extra_value);
+            if (error != NULL)
+            {
+                return error;
+            }
+            error = check_trailing(text, length, pos);
+            if (error != NULL)
+            {
+                return error;
+            }
+            *out_mode = MODE_INDEXED;
+            *out_value1 = postbyte;
+            *out_indexed_extra = extra;
+            *out_value2 = extra_value;
+            return NULL;
+        }
+
+        if (indirect)
+        {
+            error = finish_indexed_close(text, length, &pos, 1);
+            if (error != NULL)
+            {
+                return error;
+            }
+            error = check_trailing(text, length, pos);
+            if (error != NULL)
+            {
+                return error;
+            }
+            *out_mode = MODE_INDEXED;
+            *out_value1 = 0x9F;
+            *out_indexed_extra = 2;
+            *out_value2 = value;
+            return NULL;
+        }
+
+        error = check_trailing(text, length, pos);
+        if (error != NULL)
+        {
+            return error;
+        }
+        *out_mode = (forced_width == 1) ? MODE_DIRECT : MODE_EXTENDED;
+        *out_value1 = value;
+        return NULL;
+    }
+}
+
+static int mnemonic_exists(const char *mnemonic)
+{
+    size_t i;
+
+    for (i = 0; i < NUM_OPCODES; i++)
+    {
+        if (strcmp(opcode_table[i].mnemonic, mnemonic) == 0)
+        {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static size_t read_mnemonic(const uint8_t *text, size_t length, char *out)
+{
+    size_t pos = 0;
+    size_t count = 0;
+
+    if (length == 0)
+    {
+        out[0] = '\0';
+        return 0;
+    }
+
+    if (text[0] == TOKEN_OR)
+    {
+        out[count++] = 'O';
+        out[count++] = 'R';
+        pos = 1;
+    }
+    else if (text[0] == TOKEN_AND)
+    {
+        out[count++] = 'A';
+        out[count++] = 'N';
+        out[count++] = 'D';
+        pos = 1;
+    }
+    else if (text[0] == TOKEN_EOR)
+    {
+        out[count++] = 'E';
+        out[count++] = 'O';
+        out[count++] = 'R';
+        pos = 1;
+    }
+
+    while (pos < length && count < 7 &&
+           ((text[pos] >= 'A' && text[pos] <= 'Z') || (text[pos] >= 'a' && text[pos] <= 'z')))
+    {
+        out[count] = (char) toupper((int) text[pos]);
+        count += 1;
+        pos += 1;
+    }
+
+    if (count == 3 && memcmp(out, "SWI", 3) == 0 && pos < length && (text[pos] == '2' || text[pos] == '3'))
+    {
+        out[count++] = text[pos];
+        pos += 1;
+    }
+
+    out[count] = '\0';
+    return pos;
+}
+
+/*******************************************************************
+ Function:      assemble_instruction
+ Description:   Parses the operand for a real 6809 mnemonic and
+                emits its opcode (1 or 2 bytes, for page-2/3
+                prefixed instructions) and operand bytes.
+ Parameters:    context = the assembly context
+                mnemonic = the mnemonic as read from the source line
+                text/length = the operand text following the mnemonic
+ Returns:       NULL if successful, otherwise a static error block
+ ******************************************************************/
+static _kernel_oserror *assemble_instruction(assemble_context_t *context, const char *mnemonic,
+                                              const uint8_t *text, size_t length)
+{
+    addr_mode_t mode = MODE_IMPLIED;
+    int32_t value1 = 0;
+    int32_t value2 = 0;
+    int indexed_extra = 0;
+    _kernel_oserror *error;
+    const opcode_entry_t *entry;
+
+    error = parse_operand(context, mnemonic, text, length, &mode, &value1, &value2, &indexed_extra);
+    if (error != NULL)
+    {
+        return error;
+    }
+
+    entry = find_opcode(mnemonic, mode);
+    if (entry == NULL)
+    {
+        return assemble_set_error_f(ASSEMBLE_CPU_6809, ASSEMBLE_ERROR_TYPE_BAD_OPERAND,
+                                     ASSEMBLE_6809_ERR_BAD_ADDRESSING,
+                                     "%s does not support this addressing mode", mnemonic);
+    }
+
+    if (entry->opcode > 0xFF)
+    {
+        error = assemble_emit_byte(context, ASSEMBLE_CPU_6809, (uint8_t) (entry->opcode >> 8));
+        if (error != NULL)
+        {
+            return error;
+        }
+    }
+    error = assemble_emit_byte(context, ASSEMBLE_CPU_6809, (uint8_t) (entry->opcode & 0xFF));
+    if (error != NULL)
+    {
+        return error;
+    }
+
+    switch (mode)
+    {
+        case MODE_IMPLIED:
+            break;
+
+        case MODE_REGISTER_LIST:
+        case MODE_REGISTER_PAIR:
+            error = assemble_emit_byte(context, ASSEMBLE_CPU_6809, (uint8_t) (value1 & 0xFF));
+            break;
+
+        case MODE_IMMEDIATE:
+            if (entry->immediate_size == 2)
+            {
+                if (value1 < 0 || value1 > 65535)
+                {
+                    return assemble_set_error(ASSEMBLE_CPU_6809, ASSEMBLE_ERROR_TYPE_RANGE,
+                                               ASSEMBLE_6809_ERR_CONST_OVERFLOW_WORD,
+                                               "Immediate value out of range [0..65535]");
+                }
+                error = assemble_emit_word_be(context, ASSEMBLE_CPU_6809, (uint16_t) (value1 & 0xFFFF));
+            }
+            else
+            {
+                if (value1 < 0 || value1 > 255)
+                {
+                    return assemble_set_error(ASSEMBLE_CPU_6809, ASSEMBLE_ERROR_TYPE_RANGE,
+                                               ASSEMBLE_6809_ERR_CONST_OVERFLOW_BYTE,
+                                               "Immediate value out of range [0..255]");
+                }
+                error = assemble_emit_byte(context, ASSEMBLE_CPU_6809, (uint8_t) (value1 & 0xFF));
+            }
+            break;
+
+        case MODE_DIRECT:
+            error = assemble_emit_byte(context, ASSEMBLE_CPU_6809, (uint8_t) (value1 & 0xFF));
+            break;
+
+        case MODE_EXTENDED:
+            error = assemble_emit_word_be(context, ASSEMBLE_CPU_6809, (uint16_t) (value1 & 0xFFFF));
+            break;
+
+        case MODE_RELATIVE8:
+            error = assemble_emit_byte(context, ASSEMBLE_CPU_6809, (uint8_t) (value1 & 0xFF));
+            break;
+
+        case MODE_RELATIVE16:
+            error = assemble_emit_word_be(context, ASSEMBLE_CPU_6809, (uint16_t) (value1 & 0xFFFF));
+            break;
+
+        case MODE_INDEXED:
+            error = assemble_emit_byte(context, ASSEMBLE_CPU_6809, (uint8_t) (value1 & 0xFF));
+            if (error == NULL && indexed_extra == 1)
+            {
+                error = assemble_emit_byte(context, ASSEMBLE_CPU_6809, (uint8_t) (value2 & 0xFF));
+            }
+            else if (error == NULL && indexed_extra == 2)
+            {
+                error = assemble_emit_word_be(context, ASSEMBLE_CPU_6809, (uint16_t) (value2 & 0xFFFF));
+            }
+            break;
+
+        default:
+            error = assemble_set_error(ASSEMBLE_CPU_6809, ASSEMBLE_ERROR_TYPE_INTERNAL, ASSEMBLE_6809_ERR_NONE,
+                                        "Unhandled addressing mode");
+            break;
+    }
+
+    return error;
+}
+
+/*******************************************************************
+ Function:      assemble_dc
+ Description:   Assembles a DCB/DCW/DCD pseudo-op: a comma-separated
+                list of expressions, each emitted as a byte, 16-bit
+                word or 32-bit doubleword respectively, big-endian.
+ Parameters:    context = the assembly context
+                mnemonic = "DCB", "DCW" or "DCD"
+                text/length = the operand text following the mnemonic
+ Returns:       NULL if successful, otherwise a static error block
+ ******************************************************************/
+static _kernel_oserror *assemble_dc(assemble_context_t *context, const char *mnemonic,
+                                     const uint8_t *text, size_t length)
+{
+    size_t pos = 0;
+    _kernel_oserror *error;
+
+    for (;;)
+    {
+        int32_t number;
+
+        pos += assemble_skip_spaces(text + pos, length - pos);
+        error = eval_numeric(context, text, length, &pos, &number);
+        if (error != NULL)
+        {
+            return error;
+        }
+
+        if (strcmp(mnemonic, "DCB") == 0)
+        {
+            error = assemble_emit_byte(context, ASSEMBLE_CPU_6809, (uint8_t) (number & 0xFF));
+        }
+        else if (strcmp(mnemonic, "DCW") == 0)
+        {
+            error = assemble_emit_word_be(context, ASSEMBLE_CPU_6809, (uint16_t) (number & 0xFFFF));
+        }
+        else
+        {
+            error = assemble_emit_dword_be(context, ASSEMBLE_CPU_6809, (uint32_t) number);
+        }
+        if (error != NULL)
+        {
+            return error;
+        }
+
+        pos += assemble_skip_spaces(text + pos, length - pos);
+        if (pos < length && text[pos] == ',')
+        {
+            pos += 1;
+            continue;
+        }
+        break;
+    }
+
+    return check_trailing(text, length, pos);
+}
+
+/*******************************************************************
+ Function:      assign_label
+ Description:   Assigns a value to a label via the context's
+                assign_var callback.
+ Parameters:    context = the assembly context
+                label/label_length = the label name
+                value = the value to assign
+ Returns:       NULL if successful, otherwise a static error block
+ ******************************************************************/
+static _kernel_oserror *assign_label(assemble_context_t *context,
+                                      const char *label, size_t label_length,
+                                      const assemble_value_t *value)
+{
+    _kernel_oserror *error = NULL;
+
+    if (context->assign_var(context->user_data, label, label_length, value, &error) != ASSEMBLE_RESULT_OK)
+    {
+        if (error != NULL)
+        {
+            return error;
+        }
+        return assemble_set_error(ASSEMBLE_CPU_6809, ASSEMBLE_ERROR_TYPE_BAD_LABEL, ASSEMBLE_6809_ERR_NONE,
+                                   "Label could not be assigned");
+    }
+    return NULL;
+}
+
+_kernel_oserror *assemble_6809_line(assemble_context_t *context,
+                                     const uint8_t *line, size_t line_length)
+{
+    size_t pos;
+    char label[64];
+    size_t label_length = 0;
+    int have_label = 0;
+    char mnemonic[8];
+    size_t consumed;
+    _kernel_oserror *error;
+
+    context->bytes_used = 0;
+    pos = 0;
+
+    pos += assemble_skip_spaces(line + pos, line_length - pos);
+
+    if (pos < line_length && line[pos] == '.')
+    {
+        size_t start;
+
+        pos += 1;
+        start = pos;
+        if (!(pos < line_length && assemble_is_ident_start(line[pos])))
+        {
+            return assemble_set_error(ASSEMBLE_CPU_6809, ASSEMBLE_ERROR_TYPE_BAD_LABEL, ASSEMBLE_6809_ERR_NONE,
+                                       "Expected a label name after '.'");
+        }
+        while (pos < line_length && assemble_is_ident_char(line[pos]))
+        {
+            pos += 1;
+        }
+        label_length = pos - start;
+        if (label_length >= sizeof(label))
+        {
+            label_length = sizeof(label) - 1;
+        }
+        memcpy(label, line + start, label_length);
+        label[label_length] = '\0';
+        have_label = 1;
+
+        pos += assemble_skip_spaces(line + pos, line_length - pos);
+    }
+
+    if (pos >= line_length)
+    {
+        if (have_label)
+        {
+            assemble_value_t value;
+
+            value.type = ASSEMBLE_VALUE_INTEGER;
+            value.value.as_integer = (int32_t) context->address;
+            return assign_label(context, label, label_length, &value);
+        }
+        return NULL;
+    }
+
+    consumed = read_mnemonic(line + pos, line_length - pos, mnemonic);
+    if (consumed == 0 || mnemonic[0] == '\0')
+    {
+        return assemble_set_error(ASSEMBLE_CPU_6809, ASSEMBLE_ERROR_TYPE_BAD_MNEMONIC, ASSEMBLE_6809_ERR_NONE,
+                                   "Mnemonic not recognised");
+    }
+    pos += consumed;
+    pos += assemble_skip_spaces(line + pos, line_length - pos);
+
+    if (strcmp(mnemonic, "EQU") == 0)
+    {
+        assemble_value_t value;
+
+        if (!have_label)
+        {
+            return assemble_set_error(ASSEMBLE_CPU_6809, ASSEMBLE_ERROR_TYPE_BAD_LABEL, ASSEMBLE_6809_ERR_NONE,
+                                       "EQU used without a preceding label");
+        }
+        error = eval_expr(context, line + pos, line_length - pos, &value, &consumed);
+        if (error != NULL)
+        {
+            return error;
+        }
+        pos += consumed;
+        error = check_trailing(line, line_length, pos);
+        if (error != NULL)
+        {
+            return error;
+        }
+        return assign_label(context, label, label_length, &value);
+    }
+
+    if (have_label)
+    {
+        assemble_value_t value;
+
+        value.type = ASSEMBLE_VALUE_INTEGER;
+        value.value.as_integer = (int32_t) context->address;
+        error = assign_label(context, label, label_length, &value);
+        if (error != NULL)
+        {
+            return error;
+        }
+    }
+
+    if (strcmp(mnemonic, "OPT") == 0)
+    {
+        if (pos < line_length)
+        {
+            assemble_value_t value;
+
+            error = eval_expr(context, line + pos, line_length - pos, &value, &consumed);
+            if (error != NULL)
+            {
+                return error;
+            }
+            pos += consumed;
+        }
+        return check_trailing(line, line_length, pos);
+    }
+
+    if (strcmp(mnemonic, "DCB") == 0 || strcmp(mnemonic, "DCW") == 0 || strcmp(mnemonic, "DCD") == 0)
+    {
+        return assemble_dc(context, mnemonic, line + pos, line_length - pos);
+    }
+
+    if (!mnemonic_exists(mnemonic))
+    {
+        return assemble_set_error(ASSEMBLE_CPU_6809, ASSEMBLE_ERROR_TYPE_BAD_MNEMONIC, ASSEMBLE_6809_ERR_NONE,
+                                   "Mnemonic not recognised");
+    }
+
+    return assemble_instruction(context, mnemonic, line + pos, line_length - pos);
+}

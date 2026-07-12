@@ -36,7 +36,8 @@
 typedef enum assemble_cpu_class
 {
     ASSEMBLE_CPU_GENERIC = 0,   /* Not specific to any instruction set (eg bad label) */
-    ASSEMBLE_CPU_6502    = 1
+    ASSEMBLE_CPU_6502    = 1,
+    ASSEMBLE_CPU_6809    = 2
 } assemble_cpu_class_t;
 
 typedef enum assemble_error_type
@@ -200,6 +201,34 @@ _kernel_oserror *assemble_emit_tribyte(assemble_context_t *context,
 _kernel_oserror *assemble_emit_dword(assemble_context_t *context,
                                       assemble_cpu_class_t cpu_class,
                                       uint32_t value);
+
+/*******************************************************************
+ Function:      assemble_emit_word_be
+ Description:   Emits a 16-bit big-endian word to the context's
+                buffer (used by big-endian backends such as 6809).
+ Parameters:    context = the assembly context being written to
+                cpu_class = the CPU backend calling this
+                word = the value to emit
+ Returns:       NULL if successful, otherwise a pointer to a static
+                error block
+ ******************************************************************/
+_kernel_oserror *assemble_emit_word_be(assemble_context_t *context,
+                                        assemble_cpu_class_t cpu_class,
+                                        uint16_t word);
+
+/*******************************************************************
+ Function:      assemble_emit_dword_be
+ Description:   Emits a 32-bit big-endian value to the context's
+                buffer.
+ Parameters:    context = the assembly context being written to
+                cpu_class = the CPU backend calling this
+                value = the value to emit
+ Returns:       NULL if successful, otherwise a pointer to a static
+                error block
+ ******************************************************************/
+_kernel_oserror *assemble_emit_dword_be(assemble_context_t *context,
+                                         assemble_cpu_class_t cpu_class,
+                                         uint32_t value);
 
 /*******************************************************************
  Function:      assemble_set_error

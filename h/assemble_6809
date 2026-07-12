@@ -1,0 +1,62 @@
+/*******************************************************************
+ * File:        assemble_6809
+ * Purpose:     Assembler backend for the 6809 instruction set.
+ * Author:      Charles Ferguson (Gerph)
+ ******************************************************************/
+
+#ifndef ASSEMBLE_6809_H
+#define ASSEMBLE_6809_H
+
+#include <stdint.h>
+#include <stddef.h>
+
+#include "kernel.h"
+#include "assemble_common.h"
+
+/* CPU-specific detail for errors raised by this backend; see
+   ASSEMBLE_ERRNUM_VARIANT(). The 6809 has a single dialect, so
+   (unlike assemble_6502) context->opt carries no CPU-specific bits;
+   only the standard ASSEMBLE_OPT_* bits apply. */
+typedef enum assemble_6809_error_variant
+{
+    ASSEMBLE_6809_ERR_NONE = 0,
+    ASSEMBLE_6809_ERR_EXPECT_REGISTER,          /* Indexed addressing: expected X, Y, U or S */
+    ASSEMBLE_6809_ERR_EXPECT_REGISTER_OR_PCR,   /* Indexed addressing: expected X, Y, U, S or PCR */
+    ASSEMBLE_6809_ERR_EXPECT_ALL_REGISTER,      /* Expected A, B, D, X, Y, U, S, CC, DP or PC */
+    ASSEMBLE_6809_ERR_BAD_ADDRESSING,           /* Addressing mode not allowed for this instruction */
+    ASSEMBLE_6809_ERR_EXPECT_COMMA,             /* Indexed addressing: expected , */
+    ASSEMBLE_6809_ERR_EXPECT_RBRACKET,          /* Indirect indexed addressing: expected ] */
+    ASSEMBLE_6809_ERR_TRANSFER_EXPECT_COMMA,    /* TFR/EXG: expected , */
+    ASSEMBLE_6809_ERR_TRANSFER_SIZE_MISMATCH,   /* TFR/EXG: registers are different size */
+    ASSEMBLE_6809_ERR_BAD_PUSHPULL,             /* PSH/PUL: register cannot be stacked */
+    ASSEMBLE_6809_ERR_BAD_AUTOSTEP,             /* Indirect auto-increment/decrement must be by 2 */
+    ASSEMBLE_6809_ERR_CONST_OVERFLOW_BYTE,      /* Immediate value out of range [0..255] */
+    ASSEMBLE_6809_ERR_CONST_OVERFLOW_WORD,      /* Immediate value out of range [0..65535] */
+    ASSEMBLE_6809_ERR_OFFSET_OUT_OF_RANGE,      /* Indexed n,PCR offset out of range */
+    ASSEMBLE_6809_ERR_BRANCH_RANGE,             /* Branch target out of range */
+    ASSEMBLE_6809_ERR_BAD_MNEMONIC_SUFFIX       /* SYNC/CWAI/SWI2/SWI3 missing/wrong trailing letter(s) */
+} assemble_6809_error_variant_t;
+
+/*******************************************************************
+ Function:      assemble_6809_line
+ Description:   Assembles one line of tokenised BASIC source as a
+                6809 instruction, label definition or data pseudo-op
+                (EQU, DCB, DCW, DCD, OPT), writing the result to
+                context->buffer (or just measuring it, if
+                context->buffer_length is -1). context->bytes_used is
+                set to the number of bytes written or that would have
+                been written. DCB/DCW/DCD encode big-endian values,
+                matching the 6809's own big-endian operand encoding.
+ Parameters:    context = the assembly context; address, buffer,
+                          buffer_length and opt must be filled in
+                line = tokenised BASIC source for the line, not
+                       including the terminating CR/LF
+                line_length = number of bytes at 'line'
+ Returns:       NULL if successful, otherwise a pointer to a static
+                error block (see assemble_common.h)
+ ******************************************************************/
+_kernel_oserror *assemble_6809_line(assemble_context_t *context,
+                                     const uint8_t *line,
+                                     size_t line_length);
+
+#endif

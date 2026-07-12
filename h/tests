@@ -1,6 +1,7 @@
 /*******************************************************************
  * File:        tests
- * Purpose:     Self-tests for the assemble_6502 library.
+ * Purpose:     Self-tests for the assemble_6502 and assemble_6809
+ *              libraries.
  * Author:      Charles Ferguson (Gerph)
  ******************************************************************/
 
@@ -9,11 +10,20 @@
 
 /*******************************************************************
  Function:      run_tests
- Description:   Runs all self-tests, printing a line per failure and
-                a summary at the end.
+ Description:   Runs all assemble_6502 self-tests, printing a line
+                per failure and a summary at the end.
  Parameters:    none
  Returns:       the number of failing tests (0 if all passed)
  ******************************************************************/
 int run_tests(void);
+
+/*******************************************************************
+ Function:      run_tests_6809
+ Description:   Runs all assemble_6809 self-tests, printing a line
+                per failure and a summary at the end.
+ Parameters:    none
+ Returns:       the number of failing tests (0 if all passed)
+ ******************************************************************/
+int run_tests_6809(void);
 
 #endif

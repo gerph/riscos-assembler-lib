@@ -36,7 +36,9 @@ LIBS       = ${CLIB}
 OBJS       = o.main \
              o.assemble_common \
              o.assemble_6502 \
-             o.tests
+             o.assemble_6809 \
+             o.tests \
+             o.tests_6809
 
 # Space separated list of XML files for building documentation.
 #DOCSRC = <prm-in-xml-sources>
