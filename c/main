@@ -1,0 +1,23 @@
+/*******************************************************************
+ * File:        main
+ * Purpose:     Assemble command line tool
+ * Author:      YOUR NAME
+ ******************************************************************/
+
+#include <stdlib.h>
+#include <stdio.h>
+
+#include "VersionNum"
+#include "tests.h"
+
+int main(int argc, char *argv[])
+{
+    int failed;
+
+    printf("Assemble " Module_FullVersionAndDate "\n");
+    printf("Syntax: *Assemble\n");
+
+    failed = run_tests();
+
+    exit(failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE);
+}

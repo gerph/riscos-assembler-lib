@@ -1,0 +1,90 @@
+/*******************************************************************
+ * File:        assemble_6502
+ * Purpose:     Assembler backend for the 6502, 65C02 and 65C816
+ *              instruction sets.
+ * Author:      Charles Ferguson (Gerph)
+ ******************************************************************/
+
+#ifndef ASSEMBLE_6502_H
+#define ASSEMBLE_6502_H
+
+#include <stdint.h>
+#include <stddef.h>
+
+#include "kernel.h"
+#include "assemble_common.h"
+
+/* Dialect selection lives in the top bits of assemble_context_t's
+   'opt' field, following the convention used by the historical
+   Basic6502 patch: bit 5 selects 65C816 (which implies 65C02 too),
+   bit 4 alone selects 65C02, neither selects plain 6502. */
+#define ASSEMBLE_6502_OPT_65C02  (1u << 4)  /* 0x10 */
+#define ASSEMBLE_6502_OPT_65C816 (1u << 5)  /* 0x20 */
+
+typedef enum assemble_6502_variant
+{
+    ASSEMBLE_6502_VARIANT_6502   = 0,
+    ASSEMBLE_6502_VARIANT_65C02  = 1,
+    ASSEMBLE_6502_VARIANT_65C816 = 2
+} assemble_6502_variant_t;
+
+/* CPU-specific detail for errors of type ASSEMBLE_ERROR_TYPE_BAD_OPERAND,
+   ASSEMBLE_ERROR_TYPE_UNSUPPORTED_ON_VARIANT and ASSEMBLE_ERROR_TYPE_RANGE
+   raised by this backend; see ASSEMBLE_ERRNUM_VARIANT(). */
+typedef enum assemble_6502_error_variant
+{
+    ASSEMBLE_6502_ERR_NONE = 0,
+    ASSEMBLE_6502_ERR_UNSUPPORTED_6502,        /* Instruction not supported by 6502 */
+    ASSEMBLE_6502_ERR_UNSUPPORTED_65C02,       /* Instruction not supported by 65C02 */
+    ASSEMBLE_6502_ERR_UNSUPPORTED_65C816,      /* Instruction not supported by 65C816 */
+    ASSEMBLE_6502_ERR_BIT_NUMBER,              /* Expected bit number (0-7) attached to mnemonic */
+    ASSEMBLE_6502_ERR_EXPECT_HASH,             /* Immediate addressing: expected # */
+    ASSEMBLE_6502_ERR_EXPECT_X_ZP,             /* Zero-page,X addressing: expected X */
+    ASSEMBLE_6502_ERR_EXPECT_Y_ZP,             /* Zero-page,Y addressing: expected Y */
+    ASSEMBLE_6502_ERR_EXPECT_X_ABS,            /* Absolute,X addressing: expected X */
+    ASSEMBLE_6502_ERR_EXPECT_Y_ABS,            /* Absolute,Y addressing: expected Y */
+    ASSEMBLE_6502_ERR_EXPECT_XY_ABS,           /* Absolute,X/Y addressing: expected X or Y */
+    ASSEMBLE_6502_ERR_EXPECT_X_LONG,           /* Absolute Long,X addressing: expected X */
+    ASSEMBLE_6502_ERR_EXPECT_LBRACKET,         /* Indirect addressing: expected ( or [ */
+    ASSEMBLE_6502_ERR_EXPECT_COMMA_OR_RBRACKET,/* Indirect addressing: expected , or ) / ] */
+    ASSEMBLE_6502_ERR_EXPECT_RBRACKET,         /* Indirect addressing: expected ) / ] */
+    ASSEMBLE_6502_ERR_EXPECT_COMMA,            /* Indirect,X addressing: expected , */
+    ASSEMBLE_6502_ERR_EXPECT_X,                /* Indirect,X addressing: expected X */
+    ASSEMBLE_6502_ERR_EXPECT_Y,                /* Indirect,Y addressing: expected Y */
+    ASSEMBLE_6502_ERR_EXPECT_X_OR_S,           /* Indirect addressing: expected X or S */
+    ASSEMBLE_6502_ERR_EXPECT_S,                /* Stack relative addressing: expected S */
+    ASSEMBLE_6502_ERR_BRANCH_RANGE,            /* Branch target out of range */
+    ASSEMBLE_6502_ERR_NEED_LABEL_FOR_EQU       /* EQU used without a preceding '.label' */
+} assemble_6502_error_variant_t;
+
+/*******************************************************************
+ Function:      assemble_6502_variant_from_opt
+ Description:   Determines which dialect a context's OPT setting
+                selects.
+ Parameters:    opt = the OPT value (usually context->opt)
+ Returns:       the selected variant
+ ******************************************************************/
+assemble_6502_variant_t assemble_6502_variant_from_opt(uint32_t opt);
+
+/*******************************************************************
+ Function:      assemble_6502_line
+ Description:   Assembles one line of tokenised BASIC source as a
+                6502/65C02/65C816 instruction, label definition or
+                data pseudo-op (EQU, DCB, DCW, DCD, OPT), writing the
+                result to context->buffer (or just measuring it, if
+                context->buffer_length is -1). context->bytes_used is
+                set to the number of bytes written or that would have
+                been written.
+ Parameters:    context = the assembly context; address, buffer,
+                          buffer_length and opt must be filled in
+                line = tokenised BASIC source for the line, not
+                       including the terminating CR/LF
+                line_length = number of bytes at 'line'
+ Returns:       NULL if successful, otherwise a pointer to a static
+                error block (see assemble_common.h)
+ ******************************************************************/
+_kernel_oserror *assemble_6502_line(assemble_context_t *context,
+                                     const uint8_t *line,
+                                     size_t line_length);
+
+#endif

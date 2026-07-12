@@ -1,0 +1,150 @@
+/*******************************************************************
+ * File:        assemble_common
+ * Purpose:     Shared helpers used by all instruction-set assemblers:
+ *              buffer emission, error reporting and simple tokenised
+ *              source classification.
+ * Author:      Charles Ferguson (Gerph)
+ ******************************************************************/
+
+#include <stdarg.h>
+#include <stdio.h>
+#include <string.h>
+
+#include "assemble_common.h"
+
+/* Errors are returned by pointer to this single static block, in
+   keeping with RISC OS convention (eg _kernel_last_oserror). The
+   system is single-threaded, so only one error can be live at once. */
+static _kernel_oserror assemble_error_block;
+
+_kernel_oserror *assemble_emit_byte(assemble_context_t *context,
+                                     assemble_cpu_class_t cpu_class,
+                                     uint8_t byte)
+{
+    if (context->buffer_length >= 0 &&
+        context->bytes_used >= (uint32_t) context->buffer_length)
+    {
+        return assemble_set_error(cpu_class,
+                                   ASSEMBLE_ERROR_TYPE_BUFFER_OVERFLOW,
+                                   0,
+                                   "Assembled code does not fit in the buffer");
+    }
+
+    if (context->buffer != NULL)
+    {
+        context->buffer[context->bytes_used] = byte;
+    }
+    context->bytes_used += 1;
+
+    return NULL;
+}
+
+_kernel_oserror *assemble_emit_word(assemble_context_t *context,
+                                     assemble_cpu_class_t cpu_class,
+                                     uint16_t word)
+{
+    _kernel_oserror *error;
+
+    error = assemble_emit_byte(context, cpu_class, (uint8_t) (word & 0xFFu));
+    if (error != NULL)
+    {
+        return error;
+    }
+    return assemble_emit_byte(context, cpu_class, (uint8_t) ((word >> 8) & 0xFFu));
+}
+
+_kernel_oserror *assemble_emit_tribyte(assemble_context_t *context,
+                                        assemble_cpu_class_t cpu_class,
+                                        uint32_t value)
+{
+    _kernel_oserror *error;
+
+    error = assemble_emit_byte(context, cpu_class, (uint8_t) (value & 0xFFu));
+    if (error != NULL)
+    {
+        return error;
+    }
+    error = assemble_emit_byte(context, cpu_class, (uint8_t) ((value >> 8) & 0xFFu));
+    if (error != NULL)
+    {
+        return error;
+    }
+    return assemble_emit_byte(context, cpu_class, (uint8_t) ((value >> 16) & 0xFFu));
+}
+
+_kernel_oserror *assemble_emit_dword(assemble_context_t *context,
+                                      assemble_cpu_class_t cpu_class,
+                                      uint32_t value)
+{
+    _kernel_oserror *error;
+
+    error = assemble_emit_tribyte(context, cpu_class, value);
+    if (error != NULL)
+    {
+        return error;
+    }
+    return assemble_emit_byte(context, cpu_class, (uint8_t) ((value >> 24) & 0xFFu));
+}
+
+_kernel_oserror *assemble_set_error(assemble_cpu_class_t cpu_class,
+                                     assemble_error_type_t type,
+                                     uint32_t variant,
+                                     const char *message)
+{
+    assemble_error_block.errnum = ASSEMBLE_ERRNUM(cpu_class, type, variant);
+    strncpy(assemble_error_block.errmess, message, sizeof(assemble_error_block.errmess) - 1);
+    assemble_error_block.errmess[sizeof(assemble_error_block.errmess) - 1] = '\0';
+
+    return &assemble_error_block;
+}
+
+_kernel_oserror *assemble_set_error_f(assemble_cpu_class_t cpu_class,
+                                       assemble_error_type_t type,
+                                       uint32_t variant,
+                                       const char *format, ...)
+{
+    va_list args;
+
+    assemble_error_block.errnum = ASSEMBLE_ERRNUM(cpu_class, type, variant);
+
+    /* vsnprintf is declared by CLib but not present in the linked stub
+       library here; vsprintf is safe because every caller in this
+       library passes a fixed format string with short, bounded
+       arguments (CPU names, short mnemonics) that can never approach
+       the 252-byte errmess buffer. */
+    va_start(args, format);
+    vsprintf(assemble_error_block.errmess, format, args);
+    va_end(args);
+
+    return &assemble_error_block;
+}
+
+int assemble_is_space(uint8_t ch)
+{
+    return ch == ' ' || ch == '\t';
+}
+
+int assemble_is_ident_start(uint8_t ch)
+{
+    return (ch >= 'A' && ch <= 'Z') ||
+           (ch >= 'a' && ch <= 'z') ||
+           ch == '_' || ch == '`';
+}
+
+int assemble_is_ident_char(uint8_t ch)
+{
+    return assemble_is_ident_start(ch) ||
+           (ch >= '0' && ch <= '9') ||
+           ch == '$' || ch == '%';
+}
+
+size_t assemble_skip_spaces(const uint8_t *text, size_t length)
+{
+    size_t offset = 0;
+
+    while (offset < length && assemble_is_space(text[offset]))
+    {
+        offset += 1;
+    }
+    return offset;
+}

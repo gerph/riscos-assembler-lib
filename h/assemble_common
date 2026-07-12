@@ -1,0 +1,271 @@
+/*******************************************************************
+ * File:        assemble_common
+ * Purpose:     Shared types used by all instruction-set assemblers
+ *              (assembly context, values, error reporting). CPU
+ *              specific backends (eg assemble_6502) build on this.
+ * Author:      Charles Ferguson (Gerph)
+ ******************************************************************/
+
+#ifndef ASSEMBLE_COMMON_H
+#define ASSEMBLE_COMMON_H
+
+#include <stdint.h>
+#include <stddef.h>
+
+#include "kernel.h"
+
+/* Bits 0-1 of an assembly_context_t's 'opt' field carry the standard
+   BASIC OPT meaning; the remaining bits are free for each CPU backend
+   to assign its own dialect/feature flags (eg see assemble_6502.h). */
+#define ASSEMBLE_OPT_LIST  (1u << 0)  /* Produce an assembly listing */
+#define ASSEMBLE_OPT_ERROR (1u << 1)  /* Raise errors (rather than ignoring undefined labels) */
+
+/*
+ * Error reporting.
+ *
+ * Errors are returned as a pointer to a statically-held _kernel_oserror,
+ * so callers can pass them directly to _kernel_raise_error or similar.
+ * The 'errnum' field is packed as four bytes so a caller can handle an
+ * error as generically or as specifically as it wants to:
+ *
+ *   byte 3 (MS)  assemble_cpu_class_t   which backend raised the error
+ *   byte 2       assemble_error_type_t  generalised error category
+ *   byte 1       reserved, always 0
+ *   byte 0 (LS)  CPU-specific variant, or 0 if type alone is sufficient
+ */
+typedef enum assemble_cpu_class
+{
+    ASSEMBLE_CPU_GENERIC = 0,   /* Not specific to any instruction set (eg bad label) */
+    ASSEMBLE_CPU_6502    = 1
+} assemble_cpu_class_t;
+
+typedef enum assemble_error_type
+{
+    ASSEMBLE_ERROR_TYPE_NONE = 0,
+    ASSEMBLE_ERROR_TYPE_BAD_MNEMONIC,          /* Mnemonic not recognised */
+    ASSEMBLE_ERROR_TYPE_BAD_OPERAND,           /* Operand syntax not valid for the mnemonic */
+    ASSEMBLE_ERROR_TYPE_UNSUPPORTED_ON_VARIANT,/* Valid mnemonic/mode, not on the selected CPU variant */
+    ASSEMBLE_ERROR_TYPE_EXPRESSION,            /* The expression resolver reported an error */
+    ASSEMBLE_ERROR_TYPE_BAD_LABEL,             /* Label definition or reference was invalid */
+    ASSEMBLE_ERROR_TYPE_BUFFER_OVERFLOW,       /* Assembled code did not fit in the buffer */
+    ASSEMBLE_ERROR_TYPE_RANGE,                 /* A value was out of range for its field (eg branch) */
+    ASSEMBLE_ERROR_TYPE_SYNTAX,                /* General syntax error */
+    ASSEMBLE_ERROR_TYPE_INTERNAL               /* Internal consistency error in the assembler itself */
+} assemble_error_type_t;
+
+#define ASSEMBLE_ERRNUM(cpu_class, type, variant) \
+    ((int) ((((uint32_t) (cpu_class)) << 24) | \
+            (((uint32_t) (type))      << 16) | \
+             ((uint32_t) (variant)    &  0xFFu)))
+
+#define ASSEMBLE_ERRNUM_CPU_CLASS(errnum) \
+    ((assemble_cpu_class_t) (((uint32_t) (errnum) >> 24) & 0xFFu))
+
+#define ASSEMBLE_ERRNUM_TYPE(errnum) \
+    ((assemble_error_type_t) (((uint32_t) (errnum) >> 16) & 0xFFu))
+
+#define ASSEMBLE_ERRNUM_VARIANT(errnum) \
+    ((uint32_t) ((uint32_t) (errnum) & 0xFFu))
+
+/*
+ * Values produced by resolving an expression. BASIC expressions can
+ * yield a string, an integer or a floating point value.
+ */
+typedef enum assemble_value_type
+{
+    ASSEMBLE_VALUE_INTEGER,
+    ASSEMBLE_VALUE_FLOAT,
+    ASSEMBLE_VALUE_STRING
+} assemble_value_type_t;
+
+typedef struct assemble_value
+{
+    assemble_value_type_t type;
+    union
+    {
+        int32_t     as_integer;
+        double      as_float;
+        struct
+        {
+            const char *text;
+            size_t      length;
+        } as_string;
+    } value;
+} assemble_value_t;
+
+typedef enum assemble_result
+{
+    ASSEMBLE_RESULT_OK,
+    ASSEMBLE_RESULT_ERROR
+} assemble_result_t;
+
+/*
+ * Resolves an expression found at the start of 'text' (of which at
+ * most 'length' tokenised bytes remain on the source line). On
+ * success, '*value' is filled in and '*consumed' is set to the
+ * number of bytes of 'text' which made up the expression.
+ */
+typedef assemble_result_t (*assemble_resolve_expr_fn)(void *user_data,
+                                                        const uint8_t *text,
+                                                        size_t length,
+                                                        assemble_value_t *value,
+                                                        size_t *consumed,
+                                                        _kernel_oserror **error);
+
+/*
+ * Assigns 'value' to the variable named by 'name'/'name_length' (eg
+ * for a '.label' definition).
+ */
+typedef assemble_result_t (*assemble_assign_var_fn)(void *user_data,
+                                                      const char *name,
+                                                      size_t name_length,
+                                                      const assemble_value_t *value,
+                                                      _kernel_oserror **error);
+
+/*
+ * The context passed to every 'assemble a line' call. A single call
+ * assembles exactly one source line; the caller is responsible for
+ * advancing 'buffer' and 'address' by 'bytes_used' before the next
+ * call, and for driving multiple passes (eg an undefined-length pass
+ * to size the output, followed by a real pass).
+ */
+typedef struct assemble_context
+{
+    uint8_t  *buffer;           /* Destination for assembled bytes, or NULL if buffer_length < 0 */
+    int32_t   buffer_length;    /* Capacity of buffer in bytes, or -1 if undefined */
+    uint32_t  address;          /* Logical address (P%) being assembled for */
+    uint32_t  opt;              /* BASIC OPT setting; see ASSEMBLE_OPT_* and the CPU backend's header */
+
+    assemble_resolve_expr_fn resolve_expr;
+    assemble_assign_var_fn   assign_var;
+    void                     *user_data; /* Passed through to the callbacks above, untouched */
+
+    uint32_t  bytes_used;       /* [[out]] Bytes written, or that would have been written */
+} assemble_context_t;
+
+/*******************************************************************
+ Function:      assemble_emit_byte
+ Description:   Emits a single byte to the context's buffer, honouring
+                an undefined buffer length (size-only pass) and
+                reporting overflow if the buffer is too small.
+ Parameters:    context = the assembly context being written to
+                cpu_class = the CPU backend calling this, used only
+                            to annotate any overflow error raised
+                byte = the byte value to emit
+ Returns:       NULL if successful, otherwise a pointer to a static
+                error block
+ ******************************************************************/
+_kernel_oserror *assemble_emit_byte(assemble_context_t *context,
+                                     assemble_cpu_class_t cpu_class,
+                                     uint8_t byte);
+
+/*******************************************************************
+ Function:      assemble_emit_word
+ Description:   Emits a 16-bit little-endian word to the context's
+                buffer.
+ Parameters:    context = the assembly context being written to
+                cpu_class = the CPU backend calling this
+                word = the value to emit
+ Returns:       NULL if successful, otherwise a pointer to a static
+                error block
+ ******************************************************************/
+_kernel_oserror *assemble_emit_word(assemble_context_t *context,
+                                     assemble_cpu_class_t cpu_class,
+                                     uint16_t word);
+
+/*******************************************************************
+ Function:      assemble_emit_tribyte
+ Description:   Emits a 24-bit little-endian value to the context's
+                buffer (used for 65816 long addresses).
+ Parameters:    context = the assembly context being written to
+                cpu_class = the CPU backend calling this
+                value = the value to emit, top 8 bits ignored
+ Returns:       NULL if successful, otherwise a pointer to a static
+                error block
+ ******************************************************************/
+_kernel_oserror *assemble_emit_tribyte(assemble_context_t *context,
+                                        assemble_cpu_class_t cpu_class,
+                                        uint32_t value);
+
+/*******************************************************************
+ Function:      assemble_emit_dword
+ Description:   Emits a 32-bit little-endian value to the context's
+                buffer.
+ Parameters:    context = the assembly context being written to
+                cpu_class = the CPU backend calling this
+                value = the value to emit
+ Returns:       NULL if successful, otherwise a pointer to a static
+                error block
+ ******************************************************************/
+_kernel_oserror *assemble_emit_dword(assemble_context_t *context,
+                                      assemble_cpu_class_t cpu_class,
+                                      uint32_t value);
+
+/*******************************************************************
+ Function:      assemble_set_error
+ Description:   Fills in the shared static error block and returns a
+                pointer to it. The message is used verbatim.
+ Parameters:    cpu_class = the CPU backend raising the error
+                type = the generalised error category
+                variant = CPU-specific detail, or 0
+                message = human-readable error text (copied)
+ Returns:       pointer to the static error block
+ ******************************************************************/
+_kernel_oserror *assemble_set_error(assemble_cpu_class_t cpu_class,
+                                     assemble_error_type_t type,
+                                     uint32_t variant,
+                                     const char *message);
+
+/*******************************************************************
+ Function:      assemble_set_error_f
+ Description:   As assemble_set_error, but builds the message with
+                printf-style formatting.
+ Parameters:    cpu_class = the CPU backend raising the error
+                type = the generalised error category
+                variant = CPU-specific detail, or 0
+                format = printf-style format string
+                ... = arguments for the format string
+ Returns:       pointer to the static error block
+ ******************************************************************/
+_kernel_oserror *assemble_set_error_f(assemble_cpu_class_t cpu_class,
+                                       assemble_error_type_t type,
+                                       uint32_t variant,
+                                       const char *format, ...);
+
+/*******************************************************************
+ Function:      assemble_is_space
+ Description:   Tests whether a tokenised source byte is a space.
+ Parameters:    ch = the byte to test
+ Returns:       non-zero if 'ch' is a space
+ ******************************************************************/
+int assemble_is_space(uint8_t ch);
+
+/*******************************************************************
+ Function:      assemble_is_ident_start
+ Description:   Tests whether a tokenised source byte can start a
+                BASIC variable/label identifier.
+ Parameters:    ch = the byte to test
+ Returns:       non-zero if 'ch' can start an identifier
+ ******************************************************************/
+int assemble_is_ident_start(uint8_t ch);
+
+/*******************************************************************
+ Function:      assemble_is_ident_char
+ Description:   Tests whether a tokenised source byte can continue a
+                BASIC variable/label identifier already under way.
+ Parameters:    ch = the byte to test
+ Returns:       non-zero if 'ch' can continue an identifier
+ ******************************************************************/
+int assemble_is_ident_char(uint8_t ch);
+
+/*******************************************************************
+ Function:      assemble_skip_spaces
+ Description:   Counts the number of consecutive space bytes at the
+                start of a tokenised source fragment.
+ Parameters:    text = pointer to the source bytes
+                length = number of bytes available at 'text'
+ Returns:       number of leading space bytes (may be 0)
+ ******************************************************************/
+size_t assemble_skip_spaces(const uint8_t *text, size_t length);
+
+#endif
