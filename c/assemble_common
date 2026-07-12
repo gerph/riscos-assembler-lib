@@ -114,6 +114,21 @@ _kernel_oserror *assemble_emit_dword_be(assemble_context_t *context,
     return assemble_emit_word_be(context, cpu_class, (uint16_t) (value & 0xFFFFu));
 }
 
+_kernel_oserror *assemble_emit_qword(assemble_context_t *context,
+                                      assemble_cpu_class_t cpu_class,
+                                      int32_t value)
+{
+    uint32_t high = (value < 0) ? 0xFFFFFFFFu : 0u;
+    _kernel_oserror *error;
+
+    error = assemble_emit_dword(context, cpu_class, (uint32_t) value);
+    if (error != NULL)
+    {
+        return error;
+    }
+    return assemble_emit_dword(context, cpu_class, high);
+}
+
 _kernel_oserror *assemble_set_error(assemble_cpu_class_t cpu_class,
                                      assemble_error_type_t type,
                                      uint32_t variant,

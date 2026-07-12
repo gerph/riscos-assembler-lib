@@ -1,0 +1,65 @@
+/*******************************************************************
+ * File:        assemble_x86_64
+ * Purpose:     Assembler backend for x86-64, ported from Richard
+ *              Russell's BBC BASIC bbasmb_x86_64.c (see
+ *              riscos64-rtrussell-bbcbasic/src/bbasmb_x86_64.c). A
+ *              deliberately limited subset, matching that source: no
+ *              privileged instructions, no SSSE3/SSE4/AVX.
+ * Author:      Charles Ferguson (Gerph)
+ ******************************************************************/
+
+#ifndef ASSEMBLE_X86_64_H
+#define ASSEMBLE_X86_64_H
+
+#include <stdint.h>
+#include <stddef.h>
+
+#include "kernel.h"
+#include "assemble_common.h"
+
+/* CPU-specific detail for errors raised by this backend; see
+   ASSEMBLE_ERRNUM_VARIANT(). x86-64 has a single dialect, so
+   (unlike assemble_6502) context->opt carries no CPU-specific bits;
+   only the standard ASSEMBLE_OPT_* bits apply. */
+typedef enum assemble_x86_64_error_variant
+{
+    ASSEMBLE_X86_64_ERR_NONE = 0,
+    ASSEMBLE_X86_64_ERR_BAD_MNEMONIC,
+    ASSEMBLE_X86_64_ERR_INVALID_SIZE_OVERRIDE,
+    ASSEMBLE_X86_64_ERR_INVALID_REGISTER_COMBINATION,
+    ASSEMBLE_X86_64_ERR_INDEX_CANNOT_BE_RSP,
+    ASSEMBLE_X86_64_ERR_SIZE_NEEDED,          /* ambiguous operand size, eg 'INC [RAX]' */
+    ASSEMBLE_X86_64_ERR_SIZE_MISMATCH,        /* operand sizes disagree, eg 'MOV AX,EBX' */
+    ASSEMBLE_X86_64_ERR_TYPE_MISMATCH,
+    ASSEMBLE_X86_64_ERR_JUMP_OUT_OF_RANGE,
+    ASSEMBLE_X86_64_ERR_MULTIPLE_LABEL,       /* '.label' used more than once */
+    ASSEMBLE_X86_64_ERR_STRING_TOO_LONG,
+    ASSEMBLE_X86_64_ERR_SYSTEM_CALL_UNSUPPORTED /* resolving a routine name to an
+                                                    address needs a live runtime
+                                                    registry this library does not
+                                                    have; see assemble_x86_64.c */
+} assemble_x86_64_error_variant_t;
+
+/*******************************************************************
+ Function:      assemble_x86_64_line
+ Description:   Assembles one line of tokenised BASIC source as an
+                x86-64 instruction or label definition, writing the
+                result to context->buffer (or just measuring it, if
+                context->buffer_length is -1). context->bytes_used is
+                set to the number of bytes written or that would have
+                been written. There is no separate data pseudo-op
+                handling: DB/DD/DQ/DW/EQUB/EQUD/EQUQ/EQUW are ordinary
+                mnemonics, handled the same way as real instructions.
+ Parameters:    context = the assembly context; address, buffer,
+                          buffer_length and opt must be filled in
+                line = tokenised BASIC source for the line, not
+                       including the terminating CR/LF
+                line_length = number of bytes at 'line'
+ Returns:       NULL if successful, otherwise a pointer to a static
+                error block (see assemble_common.h)
+ ******************************************************************/
+_kernel_oserror *assemble_x86_64_line(assemble_context_t *context,
+                                       const uint8_t *line,
+                                       size_t line_length);
+
+#endif

@@ -1,0 +1,484 @@
+/*******************************************************************
+ * File:        tests_x86_64
+ * Purpose:     Self-tests for the assemble_x86_64 library. Provides
+ *              a minimal stand-in for BASIC's expression evaluator
+ *              and variable table so lines can be assembled and
+ *              checked against expected byte sequences.
+ * Author:      Charles Ferguson (Gerph)
+ ******************************************************************/
+
+#include <stdio.h>
+#include <string.h>
+#include <ctype.h>
+
+#include "tests.h"
+#include "assemble_x86_64.h"
+
+#define MAX_SYMBOLS 32
+#define MAX_OUTPUT  64
+
+typedef struct symbol
+{
+    char             name[32];
+    assemble_value_t value;
+} symbol_t;
+
+typedef struct test_state
+{
+    symbol_t symbols[MAX_SYMBOLS];
+    size_t   symbol_count;
+} test_state_t;
+
+static _kernel_oserror test_error_block;
+
+static _kernel_oserror *test_error(const char *message)
+{
+    test_error_block.errnum = 0;
+    strncpy(test_error_block.errmess, message, sizeof(test_error_block.errmess) - 1);
+    test_error_block.errmess[sizeof(test_error_block.errmess) - 1] = '\0';
+    return &test_error_block;
+}
+
+static int hex_digit_value(uint8_t ch)
+{
+    if (ch >= '0' && ch <= '9')
+    {
+        return ch - '0';
+    }
+    return toupper((int) ch) - 'A' + 10;
+}
+
+static assemble_result_t test_parse_primary(test_state_t *state, const uint8_t *text, size_t length,
+                                             size_t *pos_inout, int32_t *out_value, _kernel_oserror **error)
+{
+    size_t pos = *pos_inout;
+
+    while (pos < length && text[pos] == ' ')
+    {
+        pos += 1;
+    }
+
+    if (pos < length && (text[pos] == '&' || (text[pos] == '0' && pos + 1 < length &&
+                                                toupper((int) text[pos + 1]) == 'X')))
+    {
+        int32_t v = 0;
+
+        pos += (text[pos] == '&') ? 1 : 2;
+        while (pos < length && isxdigit((int) text[pos]))
+        {
+            v = v * 16 + hex_digit_value(text[pos]);
+            pos += 1;
+        }
+        *out_value = v;
+        *pos_inout = pos;
+        return ASSEMBLE_RESULT_OK;
+    }
+
+    if (pos < length && text[pos] >= '0' && text[pos] <= '9')
+    {
+        int32_t v = 0;
+
+        while (pos < length && text[pos] >= '0' && text[pos] <= '9')
+        {
+            v = v * 10 + (text[pos] - '0');
+            pos += 1;
+        }
+        *out_value = v;
+        *pos_inout = pos;
+        return ASSEMBLE_RESULT_OK;
+    }
+
+    if (pos < length && (isalpha((int) text[pos]) || text[pos] == '_' || text[pos] == '`'))
+    {
+        size_t start = pos;
+        size_t namelen;
+        char name[32];
+        size_t i;
+
+        while (pos < length &&
+               (isalnum((int) text[pos]) || text[pos] == '_' || text[pos] == '`' ||
+                text[pos] == '%' || text[pos] == '$'))
+        {
+            pos += 1;
+        }
+        namelen = pos - start;
+        if (namelen >= sizeof(name))
+        {
+            namelen = sizeof(name) - 1;
+        }
+        memcpy(name, text + start, namelen);
+        name[namelen] = '\0';
+
+        for (i = 0; i < state->symbol_count; i++)
+        {
+            if (strcmp(state->symbols[i].name, name) == 0)
+            {
+                *out_value = state->symbols[i].value.value.as_integer;
+                *pos_inout = pos;
+                return ASSEMBLE_RESULT_OK;
+            }
+        }
+        *error = test_error("Undefined test symbol");
+        return ASSEMBLE_RESULT_ERROR;
+    }
+
+    *error = test_error("Expected a value");
+    return ASSEMBLE_RESULT_ERROR;
+}
+
+static assemble_result_t test_resolve_expr(void *user_data, const uint8_t *text, size_t length,
+                                            assemble_value_t *value, size_t *consumed, _kernel_oserror **error)
+{
+    test_state_t *state = (test_state_t *) user_data;
+    size_t pos = 0;
+    int32_t result;
+    int negate = 0;
+
+    while (pos < length && text[pos] == ' ')
+    {
+        pos += 1;
+    }
+    if (pos < length && text[pos] == '-')
+    {
+        negate = 1;
+        pos += 1;
+    }
+
+    if (test_parse_primary(state, text, length, &pos, &result, error) != ASSEMBLE_RESULT_OK)
+    {
+        return ASSEMBLE_RESULT_ERROR;
+    }
+    if (negate)
+    {
+        result = -result;
+    }
+
+    for (;;)
+    {
+        size_t save = pos;
+        int op;
+        int32_t rhs;
+
+        while (pos < length && text[pos] == ' ')
+        {
+            pos += 1;
+        }
+        if (!(pos < length && (text[pos] == '+' || text[pos] == '-')))
+        {
+            pos = save;
+            break;
+        }
+        op = text[pos];
+        pos += 1;
+        while (pos < length && text[pos] == ' ')
+        {
+            pos += 1;
+        }
+        if (test_parse_primary(state, text, length, &pos, &rhs, error) != ASSEMBLE_RESULT_OK)
+        {
+            return ASSEMBLE_RESULT_ERROR;
+        }
+        result = (op == '+') ? (result + rhs) : (result - rhs);
+    }
+
+    value->type = ASSEMBLE_VALUE_INTEGER;
+    value->value.as_integer = result;
+    *consumed = pos;
+    return ASSEMBLE_RESULT_OK;
+}
+
+static assemble_result_t test_assign_var(void *user_data, const char *name, size_t name_length,
+                                          const assemble_value_t *value, _kernel_oserror **error)
+{
+    test_state_t *state = (test_state_t *) user_data;
+    char namebuf[32];
+    size_t len = name_length;
+    size_t i;
+
+    if (len >= sizeof(namebuf))
+    {
+        len = sizeof(namebuf) - 1;
+    }
+    memcpy(namebuf, name, len);
+    namebuf[len] = '\0';
+
+    for (i = 0; i < state->symbol_count; i++)
+    {
+        if (strcmp(state->symbols[i].name, namebuf) == 0)
+        {
+            state->symbols[i].value = *value;
+            return ASSEMBLE_RESULT_OK;
+        }
+    }
+    if (state->symbol_count >= MAX_SYMBOLS)
+    {
+        *error = test_error("Test symbol table is full");
+        return ASSEMBLE_RESULT_ERROR;
+    }
+    strcpy(state->symbols[state->symbol_count].name, namebuf);
+    state->symbols[state->symbol_count].value = *value;
+    state->symbol_count += 1;
+    return ASSEMBLE_RESULT_OK;
+}
+
+typedef struct test_case
+{
+    const char        *description;
+    const char *const *lines;      /* NULL-terminated */
+    const uint8_t      *expected;  /* concatenated bytes across all lines */
+    size_t              expected_length;
+    int                 expect_error;
+} test_case_t;
+
+static int run_case(const test_case_t *test)
+{
+    test_state_t state;
+    assemble_context_t context;
+    uint8_t output[MAX_OUTPUT];
+    uint32_t offset = 0;
+    size_t i;
+    _kernel_oserror *error = NULL;
+    int saw_error = 0;
+
+    state.symbol_count = 0;
+
+    context.buffer = output;
+    context.buffer_length = (int32_t) sizeof(output);
+    context.address = 0x8000;
+    context.opt = 0;
+    context.resolve_expr = test_resolve_expr;
+    context.assign_var = test_assign_var;
+    context.user_data = &state;
+    context.bytes_used = 0;
+
+    for (i = 0; test->lines[i] != NULL; i++)
+    {
+        const uint8_t *line = (const uint8_t *) test->lines[i];
+        size_t line_length = strlen(test->lines[i]);
+
+        error = assemble_x86_64_line(&context, line, line_length);
+        if (error != NULL)
+        {
+            saw_error = 1;
+            break;
+        }
+
+        if (offset + context.bytes_used > sizeof(output))
+        {
+            printf("FAIL: %s (test output buffer too small)\n", test->description);
+            return 0;
+        }
+        offset += context.bytes_used;
+        context.address += context.bytes_used;
+        context.buffer = output + offset;
+        context.buffer_length = (int32_t) (sizeof(output) - offset);
+    }
+
+    if (test->expect_error)
+    {
+        if (!saw_error)
+        {
+            printf("FAIL: %s (expected an error, none was raised)\n", test->description);
+            return 0;
+        }
+        return 1;
+    }
+
+    if (saw_error)
+    {
+        printf("FAIL: %s (unexpected error: %s)\n", test->description, error->errmess);
+        return 0;
+    }
+
+    if (offset != test->expected_length || memcmp(output, test->expected, offset) != 0)
+    {
+        size_t j;
+
+        printf("FAIL: %s (byte mismatch, got:", test->description);
+        for (j = 0; j < offset; j++)
+        {
+            printf(" %02X", output[j]);
+        }
+        printf(" expected:");
+        for (j = 0; j < test->expected_length; j++)
+        {
+            printf(" %02X", test->expected[j]);
+        }
+        printf(")\n");
+        return 0;
+    }
+
+    return 1;
+}
+
+/* ---- Test case data ---------------------------------------------- */
+
+static const char *const lines_mov_rax_rbx[] = { "MOV RAX,RBX", NULL };
+static const uint8_t     bytes_mov_rax_rbx[] = { 0x48, 0x89, 0xD8 };
+
+static const char *const lines_mov_eax_ebx[] = { "MOV EAX,EBX", NULL };
+static const uint8_t     bytes_mov_eax_ebx[] = { 0x89, 0xD8 };
+
+static const char *const lines_mov_ax_bx[]   = { "MOV AX,BX", NULL };
+static const uint8_t     bytes_mov_ax_bx[]   = { 0x66, 0x89, 0xD8 };
+
+static const char *const lines_mov_al_bl[]   = { "MOV AL,BL", NULL };
+static const uint8_t     bytes_mov_al_bl[]   = { 0x88, 0xD8 };
+
+static const char *const lines_mov_eax_imm[] = { "MOV EAX,5", NULL };
+static const uint8_t     bytes_mov_eax_imm[] = { 0xB8, 0x05, 0x00, 0x00, 0x00 };
+
+static const char *const lines_mov_al_imm[]  = { "MOV AL,5", NULL };
+static const uint8_t     bytes_mov_al_imm[]  = { 0xB0, 0x05 };
+
+static const char *const lines_mov_rax_imm[] = { "MOV RAX,5", NULL };
+static const uint8_t     bytes_mov_rax_imm[] = { 0x48, 0xB8, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
+
+static const char *const lines_mov_r8_r9[]   = { "MOV R8,R9", NULL };
+static const uint8_t     bytes_mov_r8_r9[]   = { 0x4D, 0x89, 0xC8 };
+
+static const char *const lines_mov_mem[]     = { "MOV RAX,[RBX]", NULL };
+static const uint8_t     bytes_mov_mem[]     = { 0x48, 0x8B, 0x03 };
+
+static const char *const lines_mov_mem_disp[] = { "MOV RAX,[RBX+16]", NULL };
+static const uint8_t     bytes_mov_mem_disp[] = { 0x48, 0x8B, 0x43, 0x10 };
+
+static const char *const lines_add_rr[]  = { "ADD RAX,RBX", NULL };
+static const uint8_t     bytes_add_rr[]  = { 0x48, 0x01, 0xD8 };
+
+/* SUB RAX,1: the original's 8-bit-immediate fast path checks
+   operand1==0x30 (EAX) literally, not a range covering every
+   register size, so RAX falls through to the accumulator-immediate
+   short form (2D) with a full 32-bit immediate, not the general
+   'reg,imm8' group1 form -- confirmed against the true original
+   source, not assumed. */
+static const char *const lines_sub_imm[] = { "SUB RAX,1", NULL };
+static const uint8_t     bytes_sub_imm[] = { 0x48, 0x2D, 0x01, 0x00, 0x00, 0x00 };
+
+/* SUB EAX,1: operand1==0x30 (EAX) does hit that fast path, producing
+   the shorter 'reg,imm8' group1 form instead. */
+static const char *const lines_sub_imm_eax[] = { "SUB EAX,1", NULL };
+static const uint8_t     bytes_sub_imm_eax[] = { 0x83, 0xE8, 0x01 };
+
+static const char *const lines_cmp_rr[]  = { "CMP RAX,RBX", NULL };
+static const uint8_t     bytes_cmp_rr[]  = { 0x48, 0x39, 0xD8 };
+
+static const char *const lines_push_rax[] = { "PUSH RAX", NULL };
+static const uint8_t     bytes_push_rax[] = { 0x50 };
+
+static const char *const lines_pop_rax[]  = { "POP RAX", NULL };
+static const uint8_t     bytes_pop_rax[]  = { 0x58 };
+
+static const char *const lines_push_r8[]  = { "PUSH R8", NULL };
+static const uint8_t     bytes_push_r8[]  = { 0x41, 0x50 };
+
+static const char *const lines_nop[] = { "NOP", NULL };
+static const uint8_t     bytes_nop[] = { 0x90 };
+
+static const char *const lines_ret[] = { "RET", NULL };
+static const uint8_t     bytes_ret[] = { 0xC3 };
+
+static const char *const lines_inc_rax[] = { "INC RAX", NULL };
+static const uint8_t     bytes_inc_rax[] = { 0x48, 0xFF, 0xC0 };
+
+/* label backward reference: address 0x8000 -> here, NOP (1 byte), then
+   JMP here; JMP with no SHORT override promotes to the 32-bit near
+   form (opcode E9), matching the original's default (only 'JMP SHORT'
+   uses the 2-byte EB form): next_addr = 0x8001 + 5 = 0x8006,
+   offset = 0x8000 - 0x8006 = -6 */
+static const char *const lines_jmp_near[] = { ".here", "NOP", "JMP here", NULL };
+static const uint8_t     bytes_jmp_near[] = { 0x90, 0xE9, 0xFA, 0xFF, 0xFF, 0xFF };
+
+static const char *const lines_jmp_short[] = { ".here", "NOP", "JMP SHORT here", NULL };
+static const uint8_t     bytes_jmp_short[] = { 0x90, 0xEB, 0xFD };
+
+/* DB's table entry takes exactly one operand (unlike 6502/6809's
+   DCB), so three separate DB statements are needed for three bytes. */
+static const char *const lines_db[] = { "DB 1", "DB 2", "DB 3", NULL };
+static const uint8_t     bytes_db[] = { 0x01, 0x02, 0x03 };
+
+static const char *const lines_dw[] = { "DW &1234", NULL };
+static const uint8_t     bytes_dw[] = { 0x34, 0x12 };
+
+static const char *const lines_dd[] = { "DD &12345678", NULL };
+static const uint8_t     bytes_dd[] = { 0x78, 0x56, 0x34, 0x12 };
+
+static const char *const lines_byte_override[] = { "INC BYTE [RBX]", NULL };
+static const uint8_t     bytes_byte_override[] = { 0xFE, 0x03 };
+
+/* SIB addressing: base RBX, index RCX scaled by 4 */
+static const char *const lines_sib[] = { "MOV RAX,[RBX+RCX*4]", NULL };
+static const uint8_t     bytes_sib[] = { 0x48, 0x8B, 0x04, 0x8B };
+
+/* RIP-relative via [REL target]: target == this instruction's own
+   start address, so the auto-computed pre-patch displacement is 0;
+   exercises the late fix-up (subtracting the 7-byte instruction
+   length once it's known) that [rel]/[rip] addressing needs. */
+static const char *const lines_rel[] = { ".here", "MOV RAX,[REL here]", NULL };
+static const uint8_t     bytes_rel[] = { 0x48, 0x8B, 0x05, 0xF9, 0xFF, 0xFF, 0xFF };
+
+static const char *const lines_addsd[] = { "ADDSD XMM0,XMM1", NULL };
+static const uint8_t     bytes_addsd[] = { 0xF2, 0x0F, 0x58, 0xC1 };
+
+static const char *const lines_err_bad_mnemonic[] = { "FROB RAX,RBX", NULL };
+static const char *const lines_err_size_mismatch[] = { "MOV RAX,EBX", NULL };
+static const char *const lines_err_size_needed[]   = { "INC [RBX]", NULL };
+
+static const test_case_t tests[] = {
+    { "MOV RAX,RBX (64-bit reg-reg)",       lines_mov_rax_rbx,  bytes_mov_rax_rbx,  sizeof(bytes_mov_rax_rbx),  0 },
+    { "MOV EAX,EBX (32-bit reg-reg)",       lines_mov_eax_ebx,  bytes_mov_eax_ebx,  sizeof(bytes_mov_eax_ebx),  0 },
+    { "MOV AX,BX (16-bit, 66 prefix)",      lines_mov_ax_bx,    bytes_mov_ax_bx,    sizeof(bytes_mov_ax_bx),    0 },
+    { "MOV AL,BL (8-bit reg-reg)",          lines_mov_al_bl,    bytes_mov_al_bl,    sizeof(bytes_mov_al_bl),    0 },
+    { "MOV EAX,imm32",                      lines_mov_eax_imm,  bytes_mov_eax_imm,  sizeof(bytes_mov_eax_imm),  0 },
+    { "MOV AL,imm8",                        lines_mov_al_imm,   bytes_mov_al_imm,   sizeof(bytes_mov_al_imm),   0 },
+    { "MOV RAX,imm64",                      lines_mov_rax_imm,  bytes_mov_rax_imm,  sizeof(bytes_mov_rax_imm),  0 },
+    { "MOV R8,R9 (REX.R/B extended regs)",  lines_mov_r8_r9,    bytes_mov_r8_r9,    sizeof(bytes_mov_r8_r9),    0 },
+    { "MOV RAX,[RBX] (memory operand)",     lines_mov_mem,      bytes_mov_mem,      sizeof(bytes_mov_mem),      0 },
+    { "MOV RAX,[RBX+16] (disp8)",           lines_mov_mem_disp, bytes_mov_mem_disp, sizeof(bytes_mov_mem_disp), 0 },
+    { "ADD RAX,RBX",                        lines_add_rr,       bytes_add_rr,       sizeof(bytes_add_rr),       0 },
+    { "SUB RAX,1 (accumulator short form)", lines_sub_imm,      bytes_sub_imm,      sizeof(bytes_sub_imm),      0 },
+    { "SUB EAX,1 (imm8 group1 form)",       lines_sub_imm_eax,  bytes_sub_imm_eax,  sizeof(bytes_sub_imm_eax),  0 },
+    { "CMP RAX,RBX",                        lines_cmp_rr,       bytes_cmp_rr,       sizeof(bytes_cmp_rr),       0 },
+    { "PUSH RAX",                           lines_push_rax,     bytes_push_rax,     sizeof(bytes_push_rax),     0 },
+    { "POP RAX",                            lines_pop_rax,      bytes_pop_rax,      sizeof(bytes_pop_rax),      0 },
+    { "PUSH R8 (REX.B)",                    lines_push_r8,      bytes_push_r8,      sizeof(bytes_push_r8),      0 },
+    { "NOP",                                lines_nop,          bytes_nop,          sizeof(bytes_nop),          0 },
+    { "RET",                                lines_ret,          bytes_ret,          sizeof(bytes_ret),          0 },
+    { "INC RAX",                            lines_inc_rax,      bytes_inc_rax,      sizeof(bytes_inc_rax),      0 },
+    { "JMP label (default near/E9 form)",   lines_jmp_near,     bytes_jmp_near,     sizeof(bytes_jmp_near),     0 },
+    { "JMP SHORT label (EB form)",          lines_jmp_short,    bytes_jmp_short,    sizeof(bytes_jmp_short),    0 },
+    { "DB pseudo-op",                       lines_db,           bytes_db,           sizeof(bytes_db),           0 },
+    { "DW pseudo-op (little-endian)",       lines_dw,           bytes_dw,           sizeof(bytes_dw),           0 },
+    { "DD pseudo-op (little-endian)",       lines_dd,           bytes_dd,           sizeof(bytes_dd),           0 },
+    { "INC BYTE [RBX] (size override)",     lines_byte_override, bytes_byte_override, sizeof(bytes_byte_override), 0 },
+    { "MOV RAX,[RBX+RCX*4] (SIB)",          lines_sib,          bytes_sib,          sizeof(bytes_sib),          0 },
+    { "MOV RAX,[REL here] (RIP-relative)",  lines_rel,          bytes_rel,          sizeof(bytes_rel),          0 },
+    { "ADDSD XMM0,XMM1 (SSE)",              lines_addsd,        bytes_addsd,        sizeof(bytes_addsd),        0 },
+
+    { "error: bad mnemonic",                lines_err_bad_mnemonic,  NULL, 0, 1 },
+    { "error: size mismatch",               lines_err_size_mismatch, NULL, 0, 1 },
+    { "error: size needed",                 lines_err_size_needed,   NULL, 0, 1 }
+};
+
+int run_tests_x86_64(void)
+{
+    size_t i;
+    int passed = 0;
+    int failed = 0;
+
+    for (i = 0; i < sizeof(tests) / sizeof(tests[0]); i++)
+    {
+        if (run_case(&tests[i]))
+        {
+            passed += 1;
+        }
+        else
+        {
+            failed += 1;
+        }
+    }
+
+    printf("assemble_x86_64: %d passed, %d failed (of %d)\n", passed, failed, passed + failed);
+
+    return failed;
+}
