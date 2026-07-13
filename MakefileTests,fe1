@@ -33,14 +33,14 @@ CDEFINES   =
 LIBS       = ${CLIB}
 
 # Objects to build, using the format o.<name> (will be varied for build type)
-OBJS       = o.main \
+OBJS       = o.tests \
              o.assemble_common \
              o.assemble_6502 \
              o.assemble_6809 \
              o.assemble_x86_64 \
              o.assemble_z80 \
              o.assemble_arm32 \
-             o.tests \
+             o.tests_6502 \
              o.tests_6809 \
              o.tests_x86_64 \
              o.tests_z80 \

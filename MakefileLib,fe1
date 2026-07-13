@@ -1,0 +1,56 @@
+#!/usr/bin/env riscos-amu -f
+# Makefile for Assemble
+#
+
+#
+# Program specific options:
+#
+COMPONENT  = Assemble
+
+# Specifies additional targets for startup
+#INITTARGET = inittarget
+
+# Specifies additional targets for clean
+#CLEANTARGET = cleantarget
+
+# Files to export as part of export_hdr or export_libs
+# To export to the library in a subdirectory, use an export like:
+#   ${EXP_LIB}.${COMPONENT}.h.myheader
+EXPORTS    = ${EXP_LIB}.${COMPONENT}.h.assemble_6502 \
+		     ${EXP_LIB}.${COMPONENT}.h.assemble_6809 \
+		     ${EXP_LIB}.${COMPONENT}.h.assemble_arm32 \
+		     ${EXP_LIB}.${COMPONENT}.h.assemble_x86_64 \
+		     ${EXP_LIB}.${COMPONENT}.h.assemble_z80 \
+		     ${EXP_LIB}.${COMPONENT}.h.assemble_common \
+
+# Comma-separated list of paths to use for includes, such as:
+#	C:LibName.
+INCLUDES   =
+
+# Space separated list of defines to set, eg -DDEBUG
+CDEFINES   =
+
+# Objects to build, using the format o.<name> (will be varied for build type)
+OBJS       = \
+             o.assemble_common \
+             o.assemble_6502 \
+             o.assemble_6809 \
+             o.assemble_x86_64 \
+             o.assemble_z80 \
+             o.assemble_arm32 \
+
+
+include LibExport
+
+# Export rules
+# For any files you export with EXPORTS you may need to include an
+# export rule
+${EXP_LIB}.${COMPONENT}.h.assemble_6502:   h.assemble_6502;       ${CP} $?  $@  ${CPFLAGS}
+${EXP_LIB}.${COMPONENT}.h.assemble_6809:   h.assemble_6809;       ${CP} $?  $@  ${CPFLAGS}
+${EXP_LIB}.${COMPONENT}.h.assemble_arm32:  h.assemble_arm32;      ${CP} $?  $@  ${CPFLAGS}
+${EXP_LIB}.${COMPONENT}.h.assemble_x86_64: h.assemble_x86_64;     ${CP} $?  $@  ${CPFLAGS}
+${EXP_LIB}.${COMPONENT}.h.assemble_z80:    h.assemble_z80;        ${CP} $?  $@  ${CPFLAGS}
+${EXP_LIB}.${COMPONENT}.h.assemble_common: h.assemble_common;     ${CP} $?  $@  ${CPFLAGS}
+
+#---------------------------------------------------------------------------
+# Dynamic dependencies:
