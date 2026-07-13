@@ -1,0 +1,3801 @@
+/*******************************************************************
+ * File:        assemble_arm32
+ * Purpose:     Assembler backend for the base 32-bit ARM instruction
+ *              set (ARMv4 through the AArch32 subset of ARMv8),
+ *              ported from ROOLBASIC's s/Assembler (BBC BASIC's
+ *              inline ARM assembler). All values are little-endian.
+ *              FPA and VFP/NEON mnemonics are handled by separate
+ *              follow-on backends, not this one.
+ * Author:      Charles Ferguson (Gerph)
+ ******************************************************************/
+
+#include <string.h>
+#include <ctype.h>
+
+#include "assemble_arm32.h"
+
+#define COND_AL 0xEu
+#define COND_NV 0xFu
+
+/* ---------------------------------------------------------------
+ * Condition codes. Both canonical and alias spellings (HS==CS,
+ * LO==CC) are matched, mirroring the original CONDTAB.
+ * --------------------------------------------------------------- */
+
+typedef struct cond_entry
+{
+    const char *name;
+    uint32_t    value;
+} cond_entry_t;
+
+static const cond_entry_t cond_table[] = {
+    { "EQ", 0x0 }, { "NE", 0x1 }, { "CS", 0x2 }, { "HS", 0x2 },
+    { "CC", 0x3 }, { "LO", 0x3 }, { "MI", 0x4 }, { "PL", 0x5 },
+    { "VS", 0x6 }, { "VC", 0x7 }, { "HI", 0x8 }, { "LS", 0x9 },
+    { "GE", 0xA }, { "LT", 0xB }, { "GT", 0xC }, { "LE", 0xD },
+    { "AL", 0xE }, { "NV", 0xF }
+};
+#define NUM_CONDS (sizeof(cond_table) / sizeof(cond_table[0]))
+
+/*******************************************************************
+ Function:      match_condition
+ Description:   Tests whether two characters at 'text' spell a
+                condition code.
+ Parameters:    text/length = candidate characters (need length >= 2)
+                out_value = [[out]] the 4-bit condition field
+ Returns:       non-zero if matched
+ ******************************************************************/
+static int match_condition(const uint8_t *text, size_t length, uint32_t *out_value)
+{
+    char c1, c2;
+    size_t i;
+
+    if (length < 2)
+    {
+        return 0;
+    }
+    c1 = (char) toupper((int) text[0]);
+    c2 = (char) toupper((int) text[1]);
+    for (i = 0; i < NUM_CONDS; i++)
+    {
+        if (cond_table[i].name[0] == c1 && cond_table[i].name[1] == c2)
+        {
+            *out_value = cond_table[i].value;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* ---------------------------------------------------------------
+ * Registers: R0-R15, PC(=15), LR(=14), SP(=13). No APCS aliases,
+ * matching the original (GETREG recognises only these spellings).
+ * Anything else falls back to a full expression, range-checked to
+ * 0-15.
+ * --------------------------------------------------------------- */
+
+static _kernel_oserror *error_bad_register(void)
+{
+    return assemble_set_error(ASSEMBLE_CPU_ARM32, ASSEMBLE_ERROR_TYPE_BAD_LABEL, ASSEMBLE_ARM32_ERR_BAD_REGISTER,
+                               "Bad register");
+}
+
+static int32_t value_to_integer(const assemble_value_t *value)
+{
+    switch (value->type)
+    {
+        case ASSEMBLE_VALUE_FLOAT:
+            return (int32_t) value->value.as_float;
+        case ASSEMBLE_VALUE_INTEGER:
+        default:
+            return value->value.as_integer;
+    }
+}
+
+static _kernel_oserror *eval_expr(assemble_context_t *context,
+                                   const uint8_t *text, size_t length,
+                                   assemble_value_t *value, size_t *consumed)
+{
+    _kernel_oserror *error = NULL;
+
+    if (context->resolve_expr(context->user_data, text, length, value, consumed, &error) != ASSEMBLE_RESULT_OK)
+    {
+        if (error != NULL)
+        {
+            return error;
+        }
+        return assemble_set_error(ASSEMBLE_CPU_ARM32, ASSEMBLE_ERROR_TYPE_EXPRESSION, ASSEMBLE_ARM32_ERR_NONE,
+                                   "Expression could not be evaluated");
+    }
+    if (value->type == ASSEMBLE_VALUE_STRING)
+    {
+        return assemble_set_error(ASSEMBLE_CPU_ARM32, ASSEMBLE_ERROR_TYPE_EXPRESSION, ASSEMBLE_ARM32_ERR_NONE,
+                                   "Expected a numeric value");
+    }
+    return NULL;
+}
+
+static _kernel_oserror *eval_numeric(assemble_context_t *context,
+                                      const uint8_t *text, size_t length,
+                                      size_t *pos_inout, int32_t *out_value)
+{
+    assemble_value_t value;
+    size_t consumed;
+    _kernel_oserror *error;
+
+    error = eval_expr(context, text + *pos_inout, length - *pos_inout, &value, &consumed);
+    if (error != NULL)
+    {
+        return error;
+    }
+    *pos_inout += consumed;
+    *out_value = value_to_integer(&value);
+    return NULL;
+}
+
+/* Is 'ch' a character that could continue an identifier -- used to stop
+   R/PC/LR/SP being matched as a prefix of a longer variable name. */
+static int continues_identifier(const uint8_t *text, size_t length, size_t pos)
+{
+    return pos < length && assemble_is_ident_char(text[pos]);
+}
+
+/*******************************************************************
+ Function:      parse_register
+ Description:   Parses a register operand: R0-R15, PC, LR, SP, or
+                (falling back) any expression evaluating to 0-15.
+ Parameters:    context = the assembly context
+                text/length = source text
+                pos_inout = [[inout]] position within text
+                out_reg = [[out]] register number 0-15
+ Returns:       NULL if successful, otherwise a static error block
+ ******************************************************************/
+static _kernel_oserror *parse_register(assemble_context_t *context,
+                                        const uint8_t *text, size_t length,
+                                        size_t *pos_inout, uint32_t *out_reg)
+{
+    size_t pos = *pos_inout;
+    uint8_t c0, c1;
+    int32_t value;
+    _kernel_oserror *error;
+
+    pos += assemble_skip_spaces(text + pos, length - pos);
+    c0 = (pos < length) ? (uint8_t) toupper((int) text[pos]) : 0;
+    c1 = (pos + 1 < length) ? (uint8_t) toupper((int) text[pos + 1]) : 0;
+
+    if (c0 == 'R' && c1 >= '0' && c1 <= '9')
+    {
+        size_t end = pos + 2;
+        uint32_t regnum = (uint32_t) (c1 - '0');
+
+        if (end < length && text[end] >= '0' && text[end] <= '9' && regnum <= 1)
+        {
+            regnum = regnum * 10 + (uint32_t) (text[end] - '0');
+            end += 1;
+        }
+        if (regnum <= 15 && !continues_identifier(text, length, end))
+        {
+            *out_reg = regnum;
+            *pos_inout = end;
+            return NULL;
+        }
+    }
+    else if (c0 == 'P' && c1 == 'C' && !continues_identifier(text, length, pos + 2))
+    {
+        *out_reg = 15;
+        *pos_inout = pos + 2;
+        return NULL;
+    }
+    else if (c0 == 'L' && c1 == 'R' && !continues_identifier(text, length, pos + 2))
+    {
+        *out_reg = 14;
+        *pos_inout = pos + 2;
+        return NULL;
+    }
+    else if (c0 == 'S' && c1 == 'P' && !continues_identifier(text, length, pos + 2))
+    {
+        *out_reg = 13;
+        *pos_inout = pos + 2;
+        return NULL;
+    }
+
+    *pos_inout = pos;
+    error = eval_numeric(context, text, length, pos_inout, &value);
+    if (error != NULL)
+    {
+        return error;
+    }
+    if (value < 0 || value > 15)
+    {
+        return error_bad_register();
+    }
+    *out_reg = (uint32_t) value;
+    return NULL;
+}
+
+static _kernel_oserror *expect_char(const uint8_t *text, size_t length, size_t *pos_inout, char ch)
+{
+    size_t pos = *pos_inout;
+
+    pos += assemble_skip_spaces(text + pos, length - pos);
+    if (pos >= length || text[pos] != (uint8_t) ch)
+    {
+        if (ch == ',')
+        {
+            return assemble_set_error(ASSEMBLE_CPU_ARM32, ASSEMBLE_ERROR_TYPE_SYNTAX, ASSEMBLE_ARM32_ERR_NONE,
+                                       "Missing ,");
+        }
+        return assemble_set_error_f(ASSEMBLE_CPU_ARM32, ASSEMBLE_ERROR_TYPE_SYNTAX, ASSEMBLE_ARM32_ERR_NONE,
+                                     "Missing %c", ch);
+    }
+    *pos_inout = pos + 1;
+    return NULL;
+}
+
+static _kernel_oserror *check_trailing(const uint8_t *text, size_t length, size_t pos)
+{
+    pos += assemble_skip_spaces(text + pos, length - pos);
+    if (pos != length)
+    {
+        return assemble_set_error(ASSEMBLE_CPU_ARM32, ASSEMBLE_ERROR_TYPE_SYNTAX, ASSEMBLE_ARM32_ERR_NONE,
+                                   "Unexpected text after operand");
+    }
+    return NULL;
+}
+
+/* ---------------------------------------------------------------
+ * Data-processing 8-bit rotated immediate encoding.
+ * --------------------------------------------------------------- */
+
+/*******************************************************************
+ Function:      encode_dp_immediate
+ Description:   Finds a rotation (0-30, even) that packs 'value'
+                into an 8-bit immediate rotated right by that amount,
+                as required by ARM data-processing immediate operands.
+ Parameters:    value = the 32-bit value to encode
+                out_encoded = [[out]] the 12-bit encoded operand2
+                              (rotate<<8 | imm8)
+ Returns:       non-zero if 'value' could be encoded
+ ******************************************************************/
+static int encode_dp_immediate(uint32_t value, uint32_t *out_encoded)
+{
+    int rot;
+
+    if (value <= 0xFFu)
+    {
+        *out_encoded = value;
+        return 1;
+    }
+    for (rot = 2; rot <= 30; rot += 2)
+    {
+        uint32_t rotated = (value << rot) | (value >> (32 - rot));
+
+        if (rotated <= 0xFFu)
+        {
+            *out_encoded = (((uint32_t) (32 - rot) / 2) << 8) | rotated;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static _kernel_oserror *error_bad_immediate(void)
+{
+    return assemble_set_error(ASSEMBLE_CPU_ARM32, ASSEMBLE_ERROR_TYPE_RANGE, ASSEMBLE_ARM32_ERR_BAD_IMMEDIATE,
+                               "Bad immediate constant");
+}
+
+static _kernel_oserror *error_bad_shift(void)
+{
+    return assemble_set_error(ASSEMBLE_CPU_ARM32, ASSEMBLE_ERROR_TYPE_RANGE, ASSEMBLE_ARM32_ERR_BAD_SHIFT,
+                               "Bad shift");
+}
+
+/* ---------------------------------------------------------------
+ * Shifts: LSL/ASL, LSR, ASR, ROR, RRX, applied either as a constant
+ * (#imm) or by a register (Rs). Shift type occupies bits 6:5 of the
+ * encoded shift field; bit 4 marks a register shift.
+ * --------------------------------------------------------------- */
+
+#define SHIFT_LSL 0u
+#define SHIFT_LSR 1u
+#define SHIFT_ASR 2u
+#define SHIFT_ROR 3u
+
+typedef struct shift_name_entry
+{
+    const char *name;
+    uint32_t    type;
+} shift_name_entry_t;
+
+static const shift_name_entry_t shift_names[] = {
+    { "LSL", SHIFT_LSL }, { "ASL", SHIFT_LSL },
+    { "LSR", SHIFT_LSR }, { "ASR", SHIFT_ASR }, { "ROR", SHIFT_ROR }
+};
+#define NUM_SHIFT_NAMES (sizeof(shift_names) / sizeof(shift_names[0]))
+
+/*******************************************************************
+ Function:      parse_shift_suffix
+ Description:   Parses an optional ',<shift> <amount>' suffix (used
+                after a register operand in data-processing Op2,
+                LDR/STR register offsets, and PKH). If no comma is
+                present, the operand is left as a plain register with
+                no shift.
+ Parameters:    context = the assembly context
+                text/length = source text
+                pos_inout = [[inout]] position within text
+                allow_register_shift = whether 'Rs' (not just '#imm')
+                                        is permitted as the amount
+                out_field = [[out]] encoded shift field (bits 11:4 of
+                            a data-processing/LDR-STR instruction)
+ Returns:       NULL if successful, otherwise a static error block
+ ******************************************************************/
+static _kernel_oserror *parse_shift_suffix(assemble_context_t *context,
+                                            const uint8_t *text, size_t length,
+                                            size_t *pos_inout, int allow_register_shift,
+                                            uint32_t *out_field)
+{
+    size_t pos = *pos_inout;
+    size_t save = pos;
+    size_t i;
+    char c0, c1, c2;
+    uint32_t type = SHIFT_LSL;
+    int is_rrx = 0;
+    int found = 0;
+
+    *out_field = 0;
+    pos += assemble_skip_spaces(text + pos, length - pos);
+    if (pos >= length || text[pos] != ',')
+    {
+        *pos_inout = save;
+        return NULL;
+    }
+    pos += 1;
+    pos += assemble_skip_spaces(text + pos, length - pos);
+
+    c0 = (pos < length) ? (char) toupper((int) text[pos]) : 0;
+    c1 = (pos + 1 < length) ? (char) toupper((int) text[pos + 1]) : 0;
+    c2 = (pos + 2 < length) ? (char) toupper((int) text[pos + 2]) : 0;
+
+    if (c0 == 'R' && c1 == 'R' && c2 == 'X' && !continues_identifier(text, length, pos + 3))
+    {
+        is_rrx = 1;
+        found = 1;
+        pos += 3;
+    }
+    else
+    {
+        for (i = 0; i < NUM_SHIFT_NAMES; i++)
+        {
+            if (c0 == shift_names[i].name[0] && c1 == shift_names[i].name[1] && c2 == shift_names[i].name[2] &&
+                !continues_identifier(text, length, pos + 3))
+            {
+                type = shift_names[i].type;
+                found = 1;
+                pos += 3;
+                break;
+            }
+        }
+    }
+    if (!found)
+    {
+        return error_bad_shift();
+    }
+
+    if (is_rrx)
+    {
+        *out_field = (SHIFT_ROR << 5);
+        *pos_inout = pos;
+        return NULL;
+    }
+
+    pos += assemble_skip_spaces(text + pos, length - pos);
+    if (pos < length && text[pos] == '#')
+    {
+        int32_t amount;
+        _kernel_oserror *error;
+
+        pos += 1;
+        *pos_inout = pos;
+        error = eval_numeric(context, text, length, pos_inout, &amount);
+        if (error != NULL)
+        {
+            return error;
+        }
+        if (type == SHIFT_LSL)
+        {
+            if (amount < 0 || amount > 31)
+            {
+                return error_bad_shift();
+            }
+        }
+        else if (type == SHIFT_ROR)
+        {
+            if (amount <= 0 || amount > 31)
+            {
+                return error_bad_shift();
+            }
+        }
+        else /* LSR/ASR: 1-32, with 32 encoded as 0 */
+        {
+            if (amount <= 0 || amount > 32)
+            {
+                return error_bad_shift();
+            }
+            if (amount == 32)
+            {
+                amount = 0;
+            }
+        }
+        *out_field = ((uint32_t) amount << 7) | (type << 5);
+        return NULL;
+    }
+    else
+    {
+        uint32_t rs;
+        _kernel_oserror *error;
+
+        if (!allow_register_shift)
+        {
+            return assemble_set_error(ASSEMBLE_CPU_ARM32, ASSEMBLE_ERROR_TYPE_SYNTAX, ASSEMBLE_ARM32_ERR_NONE,
+                                       "Register shift not permitted here");
+        }
+        *pos_inout = pos;
+        error = parse_register(context, text, length, pos_inout, &rs);
+        if (error != NULL)
+        {
+            return error;
+        }
+        *out_field = (rs << 8) | (type << 5) | (1u << 4);
+        return NULL;
+    }
+}
+
+/*******************************************************************
+ Function:      parse_operand2
+ Description:   Parses a data-processing Operand2: either '#imm'
+                (rotate-8 encoded, setting the I bit) or 'Rm{,shift}'.
+ Parameters:    context = the assembly context
+                text/length = source text
+                pos_inout = [[inout]] position within text
+                out_field = [[out]] bits 25 (I) and 11:0 (Operand2) of
+                            the instruction
+ Returns:       NULL if successful, otherwise a static error block
+ ******************************************************************/
+static _kernel_oserror *parse_operand2(assemble_context_t *context,
+                                        const uint8_t *text, size_t length,
+                                        size_t *pos_inout, uint32_t *out_field)
+{
+    size_t pos = *pos_inout;
+
+    pos += assemble_skip_spaces(text + pos, length - pos);
+    if (pos < length && text[pos] == '#')
+    {
+        int32_t value;
+        uint32_t encoded;
+        _kernel_oserror *error;
+
+        pos += 1;
+        *pos_inout = pos;
+        error = eval_numeric(context, text, length, pos_inout, &value);
+        if (error != NULL)
+        {
+            return error;
+        }
+        if (!encode_dp_immediate((uint32_t) value, &encoded))
+        {
+            return error_bad_immediate();
+        }
+        *out_field = (1u << 25) | encoded;
+        return NULL;
+    }
+    else
+    {
+        uint32_t rm, shift_field;
+        _kernel_oserror *error;
+
+        *pos_inout = pos;
+        error = parse_register(context, text, length, pos_inout, &rm);
+        if (error != NULL)
+        {
+            return error;
+        }
+        error = parse_shift_suffix(context, text, length, pos_inout, 1, &shift_field);
+        if (error != NULL)
+        {
+            return error;
+        }
+        *out_field = shift_field | rm;
+        return NULL;
+    }
+}
+
+/* ---------------------------------------------------------------
+ * LDM/STM register lists: '{' Rn {,Rn|Rn-Rm} '}' ['^'].
+ * --------------------------------------------------------------- */
+
+static _kernel_oserror *error_bad_register_list(const char *message)
+{
+    return assemble_set_error(ASSEMBLE_CPU_ARM32, ASSEMBLE_ERROR_TYPE_BAD_OPERAND, ASSEMBLE_ARM32_ERR_BAD_REGISTER_LIST,
+                               message);
+}
+
+/*******************************************************************
+ Function:      parse_register_list
+ Description:   Parses a '{...}' register list as used by LDM/STM,
+                including 'Rn-Rm' ranges (either order) and a
+                trailing '^' user-bank/S-bit marker.
+ Parameters:    context = the assembly context
+                text/length = source text
+                pos_inout = [[inout]] position within text
+                out_mask = [[out]] 16-bit register bitmask
+                out_caret = [[out]] non-zero if '^' was present
+ Returns:       NULL if successful, otherwise a static error block
+ ******************************************************************/
+static _kernel_oserror *parse_register_list(assemble_context_t *context,
+                                             const uint8_t *text, size_t length,
+                                             size_t *pos_inout, uint32_t *out_mask, int *out_caret)
+{
+    uint32_t mask = 0;
+    _kernel_oserror *error;
+
+    *out_caret = 0;
+    error = expect_char(text, length, pos_inout, '{');
+    if (error != NULL)
+    {
+        return error;
+    }
+    for (;;)
+    {
+        uint32_t first, last, r;
+
+        error = parse_register(context, text, length, pos_inout, &first);
+        if (error != NULL)
+        {
+            return error;
+        }
+        last = first;
+        *pos_inout += assemble_skip_spaces(text + *pos_inout, length - *pos_inout);
+        if (*pos_inout < length && text[*pos_inout] == '-')
+        {
+            *pos_inout += 1;
+            error = parse_register(context, text, length, pos_inout, &last);
+            if (error != NULL)
+            {
+                return error;
+            }
+            if (last < first)
+            {
+                uint32_t tmp = first;
+                first = last;
+                last = tmp;
+            }
+        }
+        for (r = first; r <= last; r++)
+        {
+            if (mask & (1u << r))
+            {
+                return error_bad_register_list("Register specified more than once");
+            }
+            mask |= (1u << r);
+        }
+        *pos_inout += assemble_skip_spaces(text + *pos_inout, length - *pos_inout);
+        if (*pos_inout < length && text[*pos_inout] == ',')
+        {
+            *pos_inout += 1;
+            continue;
+        }
+        break;
+    }
+    error = expect_char(text, length, pos_inout, '}');
+    if (error != NULL)
+    {
+        return error;
+    }
+    if (mask == 0)
+    {
+        return error_bad_register_list("Register list must not be empty");
+    }
+    *pos_inout += assemble_skip_spaces(text + *pos_inout, length - *pos_inout);
+    if (*pos_inout < length && text[*pos_inout] == '^')
+    {
+        *pos_inout += 1;
+        *out_caret = 1;
+    }
+    *out_mask = mask;
+    return NULL;
+}
+
+/* ---------------------------------------------------------------
+ * LDR/STR addressing modes: [Rn], [Rn,#imm]{!}, [Rn,{-}Rm{,shift}]{!},
+ * [Rn]{,#imm|,{-}Rm} (post-indexed). Two offset encodings exist:
+ * LDST_CLASS_NORMAL (word/byte -- 12-bit immediate, bit25 marks a
+ * register offset) and LDST_CLASS_EXTRA (halfword/signed/doubleword
+ * -- 8-bit split immediate, bit22 marks an *immediate* offset, the
+ * opposite sense to bit25, and no shift is allowed on a register
+ * offset). Both quirks are genuine ARM architecture behaviour, not
+ * typos.
+ * --------------------------------------------------------------- */
+
+#define LDST_CLASS_NORMAL 0
+#define LDST_CLASS_EXTRA  1
+
+static _kernel_oserror *error_bad_offset(void)
+{
+    return assemble_set_error(ASSEMBLE_CPU_ARM32, ASSEMBLE_ERROR_TYPE_RANGE, ASSEMBLE_ARM32_ERR_BAD_ADDRESS_OFFSET,
+                               "Bad address offset");
+}
+
+static _kernel_oserror *encode_ldst_offset(int cls, int32_t value, uint32_t *out_bits)
+{
+    uint32_t bits = 0;
+
+    if (value < 0)
+    {
+        value = -value;
+    }
+    else
+    {
+        bits |= (1u << 23); /* U: offset added */
+    }
+    if (cls == LDST_CLASS_NORMAL)
+    {
+        if (value > 0xFFF)
+        {
+            return error_bad_offset();
+        }
+        bits |= (uint32_t) value;
+    }
+    else
+    {
+        if (value > 0xFF)
+        {
+            return error_bad_offset();
+        }
+        bits |= (1u << 22); /* I: immediate offset */
+        bits |= (uint32_t) ((value & 0xF0) << 4) | (uint32_t) (value & 0xF);
+    }
+    *out_bits = bits;
+    return NULL;
+}
+
+/*******************************************************************
+ Function:      parse_ldr_str_address
+ Description:   Parses a full LDR/STR-family addressing mode,
+                including the leading '[' and everything up to and
+                including a trailing '!', if present.
+ Parameters:    context = the assembly context
+                text/length = source text
+                pos_inout = [[inout]] position within text
+                cls = LDST_CLASS_NORMAL or LDST_CLASS_EXTRA
+                io_bits = [[inout]] instruction bits so far; on entry
+                          bit 21 may already carry a 'T' (unprivileged)
+                          marker set by the caller, valid only for the
+                          post-indexed result this may produce; on
+                          exit, bits 24 (P), 23 (U), 22/25 (I, per
+                          'cls'), 21 (W), 19:16 (Rn) and the offset
+                          field are all filled in
+ Returns:       NULL if successful, otherwise a static error block
+ ******************************************************************/
+static _kernel_oserror *parse_ldr_str_address(assemble_context_t *context,
+                                               const uint8_t *text, size_t length,
+                                               size_t *pos_inout, int cls,
+                                               uint32_t *io_bits)
+{
+    uint32_t rn;
+    uint32_t bits = *io_bits;
+    _kernel_oserror *error;
+
+    error = expect_char(text, length, pos_inout, '[');
+    if (error != NULL)
+    {
+        return error;
+    }
+    error = parse_register(context, text, length, pos_inout, &rn);
+    if (error != NULL)
+    {
+        return error;
+    }
+    bits |= rn << 16;
+
+    *pos_inout += assemble_skip_spaces(text + *pos_inout, length - *pos_inout);
+    if (*pos_inout < length && text[*pos_inout] == ']')
+    {
+        *pos_inout += 1;
+        /* Post-indexed, or no offset at all. */
+        *pos_inout += assemble_skip_spaces(text + *pos_inout, length - *pos_inout);
+        if (*pos_inout < length && text[*pos_inout] == ',')
+        {
+            *pos_inout += 1;
+            *pos_inout += assemble_skip_spaces(text + *pos_inout, length - *pos_inout);
+            if (*pos_inout < length && text[*pos_inout] == '#')
+            {
+                int32_t value;
+                uint32_t offset_bits;
+
+                *pos_inout += 1;
+                error = eval_numeric(context, text, length, pos_inout, &value);
+                if (error != NULL)
+                {
+                    return error;
+                }
+                error = encode_ldst_offset(cls, value, &offset_bits);
+                if (error != NULL)
+                {
+                    return error;
+                }
+                bits |= offset_bits;
+            }
+            else
+            {
+                uint32_t rm, shift_field = 0;
+                int negative = 0;
+
+                if (*pos_inout < length && text[*pos_inout] == '-')
+                {
+                    negative = 1;
+                    *pos_inout += 1;
+                }
+                error = parse_register(context, text, length, pos_inout, &rm);
+                if (error != NULL)
+                {
+                    return error;
+                }
+                if (!negative)
+                {
+                    bits |= (1u << 23);
+                }
+                if (cls == LDST_CLASS_NORMAL)
+                {
+                    error = parse_shift_suffix(context, text, length, pos_inout, 0, &shift_field);
+                    if (error != NULL)
+                    {
+                        return error;
+                    }
+                    bits |= (1u << 25) | shift_field | rm;
+                }
+                else
+                {
+                    bits |= rm; /* bit22 (I) stays clear: register offset */
+                }
+            }
+        }
+        else
+        {
+            /* "[Rn]" with nothing else is pre-indexed with an implicit
+               zero offset (equivalent to "[Rn,#0]"), NOT post-indexed
+               -- post-indexing needs a comma and offset after the ']'. */
+            bits |= (1u << 24) | (1u << 23); /* P, U */
+            if (cls == LDST_CLASS_EXTRA)
+            {
+                bits |= (1u << 22);
+            }
+        }
+    }
+    else
+    {
+        /* Pre-indexed: [Rn, ...] ']' ['!'] */
+        bits |= (1u << 24); /* P */
+        *pos_inout += assemble_skip_spaces(text + *pos_inout, length - *pos_inout);
+        if (*pos_inout < length && text[*pos_inout] == ',')
+        {
+            *pos_inout += 1;
+            *pos_inout += assemble_skip_spaces(text + *pos_inout, length - *pos_inout);
+            if (*pos_inout < length && text[*pos_inout] == '#')
+            {
+                int32_t value;
+                uint32_t offset_bits;
+
+                *pos_inout += 1;
+                error = eval_numeric(context, text, length, pos_inout, &value);
+                if (error != NULL)
+                {
+                    return error;
+                }
+                error = encode_ldst_offset(cls, value, &offset_bits);
+                if (error != NULL)
+                {
+                    return error;
+                }
+                bits |= offset_bits;
+            }
+            else
+            {
+                uint32_t rm, shift_field = 0;
+                int negative = 0;
+
+                if (*pos_inout < length && text[*pos_inout] == '-')
+                {
+                    negative = 1;
+                    *pos_inout += 1;
+                }
+                error = parse_register(context, text, length, pos_inout, &rm);
+                if (error != NULL)
+                {
+                    return error;
+                }
+                if (!negative)
+                {
+                    bits |= (1u << 23);
+                }
+                if (cls == LDST_CLASS_NORMAL)
+                {
+                    error = parse_shift_suffix(context, text, length, pos_inout, 0, &shift_field);
+                    if (error != NULL)
+                    {
+                        return error;
+                    }
+                    bits |= (1u << 25) | shift_field | rm;
+                }
+                else
+                {
+                    bits |= rm;
+                }
+            }
+        }
+        else
+        {
+            bits |= (1u << 23); /* [Rn] with no offset: U=1, offset 0 */
+            if (cls == LDST_CLASS_EXTRA)
+            {
+                bits |= (1u << 22);
+            }
+        }
+        error = expect_char(text, length, pos_inout, ']');
+        if (error != NULL)
+        {
+            return error;
+        }
+        *pos_inout += assemble_skip_spaces(text + *pos_inout, length - *pos_inout);
+        if (*pos_inout < length && text[*pos_inout] == '!')
+        {
+            *pos_inout += 1;
+            bits |= (1u << 21); /* W */
+        }
+    }
+    *io_bits = bits;
+    return NULL;
+}
+
+/* ---------------------------------------------------------------
+ * Mnemonic dispatch. Every mnemonic root is matched against the raw
+ * source token; whatever text follows the root must be empty, 'S'
+ * (if the root allows it), a condition code, or a condition code
+ * followed by 'S'. All roots that satisfy this for a given token are
+ * considered, and the longest root wins, so root ordering in the
+ * table below does not matter for correctness.
+ * --------------------------------------------------------------- */
+
+typedef enum instr_family
+{
+    FAMILY_DATA_PROC,   /* Rd,Rn,Op2 -- AND EOR SUB RSB ADD ADC SBC RSC ORR BIC */
+    FAMILY_DATA_CMP,    /* Rn,Op2 -- TST TEQ CMP CMN (S implied) */
+    FAMILY_DATA_MOV,    /* Rd,Op2 -- MOV MVN */
+    FAMILY_MUL,         /* Rd,Rm,Rs{,Rn} -- MUL MLA MLS */
+    FAMILY_MULL,        /* RdLo,RdHi,Rm,Rs -- UMULL UMLAL SMULL SMLAL */
+    FAMILY_UMAAL,       /* RdLo,RdHi,Rm,Rs */
+    FAMILY_BRANCH,      /* B BL */
+    FAMILY_BX,          /* BX BLX BXJ */
+    FAMILY_LDR_STR,     /* full LDR/STR family incl B/H/SB/SH/D/T */
+    FAMILY_LDM_STM,     /* LDM/STM incl PUSH/POP */
+    FAMILY_SWI,
+    FAMILY_SWP,         /* SWP SWPB */
+    FAMILY_CDP,         /* CDP CDP2 */
+    FAMILY_MCR_MRC,     /* MCR MRC MCR2 MRC2 */
+    FAMILY_MCRR_MRRC,   /* MCRR MRRC */
+    FAMILY_LDC_STC,     /* LDC STC LDC2 STC2 */
+    FAMILY_MSR,
+    FAMILY_MRS,
+    FAMILY_CLZ,         /* Rd,Rm */
+    FAMILY_PLD_PLI,
+    FAMILY_BFC,         /* Rd,#lsb,#width */
+    FAMILY_BFI,         /* Rd,Rn,#lsb,#width */
+    FAMILY_SBFX_UBFX,   /* Rd,Rn,#lsb,#width */
+    FAMILY_REV,         /* Rd,Rm -- REV REV16 REVSH RBIT */
+    FAMILY_SEL,         /* Rd,Rn,Rm */
+    FAMILY_USAD8,       /* Rd,Rn,Rm */
+    FAMILY_USADA8,      /* Rd,Rn,Rm,Ra */
+    FAMILY_SAT,         /* Rd,#sat_imm,Rn{,shift} -- SSAT USAT */
+    FAMILY_SAT16,       /* Rd,#sat_imm,Rn -- SSAT16 USAT16 */
+    FAMILY_QSAT,        /* Rd,Rm,Rn -- QADD QSUB QDADD QDSUB */
+    FAMILY_PARALLEL,    /* Rd,Rn,Rm -- the 36 SIMD add/subtract family */
+    FAMILY_SMMUL_LA_LS, /* SMMUL SMMLA SMMLS (+R rounding forms) */
+    FAMILY_SMLAXY,      /* Rd,Rm,Rs,Rn -- SMLABB/BT/TB/TT */
+    FAMILY_SMLAWX,      /* Rd,Rm,Rs,Rn -- SMLAWB/WT */
+    FAMILY_SMULXY,      /* Rd,Rm,Rs -- SMULBB/BT/TB/TT */
+    FAMILY_SMULWX,      /* Rd,Rm,Rs -- SMULWB/WT */
+    FAMILY_SMUAD_SMUSD, /* Rd,Rm,Rs{,X} */
+    FAMILY_SMLAD_SMLSD, /* Rd,Rm,Rs,Rn{,X} */
+    FAMILY_SMLALD_SMLSLD, /* RdLo,RdHi,Rm,Rs{,X} */
+    FAMILY_SDIV_UDIV,   /* Rd,Rn,Rm */
+    FAMILY_LDREX_STREX, /* LDREX/STREX{B|H|D} */
+    FAMILY_CLREX,
+    FAMILY_CPS,         /* CPS CPSIE CPSID */
+    FAMILY_SETEND,
+    FAMILY_SETPAN,
+    FAMILY_BARRIER,     /* DMB DSB ISB */
+    FAMILY_HINT,        /* NOP SEV SEVL WFE WFI YIELD ESB CSDB */
+    FAMILY_RFE,
+    FAMILY_SRS,
+    FAMILY_BKPT,
+    FAMILY_SVC_HINT,    /* HVC SMC */
+    FAMILY_ERET,
+    FAMILY_HLT,
+    FAMILY_CRC32,
+    FAMILY_BARRIER_NOOP, /* SSBB PSSBB */
+    FAMILY_PKH,         /* PKHBT PKHTB */
+    FAMILY_SXT_UXT,      /* SXTB SXTH SXTB16 UXTB UXTH UXTB16 */
+    FAMILY_SXT_UXT_A,    /* SXTAB SXTAH SXTAB16 UXTAB UXTAH UXTAB16 */
+    FAMILY_ADR,
+    FAMILY_ALIGN,
+    FAMILY_EQU,
+    FAMILY_DC,          /* DCB DCW DCD */
+    FAMILY_OPT,
+    FAMILY_NONE         /* unreachable placeholder root, never dispatched */
+} instr_family_t;
+
+typedef struct mnemonic_entry
+{
+    const char      *root;
+    instr_family_t   family;
+    uint32_t         param1;    /* family-specific: base opcode/class field */
+    uint32_t         param2;    /* family-specific: secondary field */
+    unsigned char    allows_cond;
+    unsigned char    allows_s;
+} mnemonic_entry_t;
+
+/* LDR, STR, LDM, STM, SWP, REV (and REV16/REVSH), and the long/DSP
+   multiply family (UMULL/UMLAL/SMULL/SMLAL) are matched and encoded
+   by dedicated functions below, because -- uniquely among ARM
+   mnemonics -- their addressing/size suffix is written *after* the
+   condition code (eg "LDREQB", not "LDRBEQ"), which the generic
+   root+cond+[S] grammar below cannot express. Everything else goes
+   through this table.
+
+   Known, deliberate gaps versus the original (a future pass, not
+   silently dropped): the ARMv5TE/v6 'xy' DSP multiply family
+   (SMLABB/WB/UAD/SMLAD/SMLALD and friends) and SMMLA/SMMLS/SMMUL;
+   MRRC/MCRR; the ARMv8 LDA/STL/LDAEX/STLEX load-acquire/store-release
+   family; and the banked-register form of MSR/MRS used for
+   hypervisor-mode register access. All raise "Mnemonic not
+   recognised" for now. */
+static const mnemonic_entry_t mnemonic_table[] = {
+    /* Data processing: Rd, Rn, Op2 */
+    { "AND", FAMILY_DATA_PROC, 0x0, 0, 1, 1 },
+    { "EOR", FAMILY_DATA_PROC, 0x1, 0, 1, 1 },
+    { "SUB", FAMILY_DATA_PROC, 0x2, 0, 1, 1 },
+    { "RSB", FAMILY_DATA_PROC, 0x3, 0, 1, 1 },
+    { "ADD", FAMILY_DATA_PROC, 0x4, 0, 1, 1 },
+    { "ADC", FAMILY_DATA_PROC, 0x5, 0, 1, 1 },
+    { "SBC", FAMILY_DATA_PROC, 0x6, 0, 1, 1 },
+    { "RSC", FAMILY_DATA_PROC, 0x7, 0, 1, 1 },
+    { "ORR", FAMILY_DATA_PROC, 0xC, 0, 1, 1 },
+    { "BIC", FAMILY_DATA_PROC, 0xE, 0, 1, 1 },
+    /* Data processing compares: Rn, Op2 (S is implicit) */
+    { "TST", FAMILY_DATA_CMP, 0x8, 0, 1, 1 },
+    { "TEQ", FAMILY_DATA_CMP, 0x9, 0, 1, 1 },
+    { "CMP", FAMILY_DATA_CMP, 0xA, 0, 1, 1 },
+    { "CMN", FAMILY_DATA_CMP, 0xB, 0, 1, 1 },
+    /* Data processing moves: Rd, Op2 */
+    { "MOV", FAMILY_DATA_MOV, 0xD, 0, 1, 1 },
+    { "MVN", FAMILY_DATA_MOV, 0xF, 0, 1, 1 },
+
+    /* Multiply: Rd, Rm, Rs[, Rn] */
+    { "MUL", FAMILY_MUL, 0x000000, 3, 1, 1 },
+    { "MLA", FAMILY_MUL, 0x200000, 4, 1, 1 },
+    { "MLS", FAMILY_MUL, 0x600000, 4, 1, 0 },
+    { "UMAAL", FAMILY_UMAAL, 0, 0, 1, 0 },
+
+    /* Branch */
+    { "B",  FAMILY_BRANCH, 0, 0, 1, 0 },
+    { "BL", FAMILY_BRANCH, 1, 0, 1, 0 },
+    { "BX",  FAMILY_BX, 0, 0, 1, 0 },
+    { "BLX", FAMILY_BX, 1, 0, 1, 0 },
+    { "BXJ", FAMILY_BX, 2, 0, 1, 0 },
+
+    { "SWI", FAMILY_SWI, 0, 0, 1, 0 },
+    { "SVC", FAMILY_SWI, 0, 0, 1, 0 },
+
+    /* Register-list transfer pseudo-ops (full-descending stack) */
+    { "PUSH", FAMILY_LDM_STM, 1, 0, 1, 0 },
+    { "POP",  FAMILY_LDM_STM, 0, 0, 1, 0 },
+
+    { "MSR", FAMILY_MSR, 0, 0, 1, 0 },
+    { "MRS", FAMILY_MRS, 0, 0, 1, 0 },
+
+    { "CLZ", FAMILY_CLZ, 0, 0, 1, 0 },
+    { "PLD", FAMILY_PLD_PLI, 0, 0, 0, 0 },
+    { "PLI", FAMILY_PLD_PLI, 1, 0, 0, 0 },
+
+    { "BFC", FAMILY_BFC, 0, 0, 1, 0 },
+    { "BFI", FAMILY_BFI, 0, 0, 1, 0 },
+    { "SBFX", FAMILY_SBFX_UBFX, 0, 0, 1, 0 },
+    { "UBFX", FAMILY_SBFX_UBFX, 1, 0, 1, 0 },
+
+    { "REV",   FAMILY_REV, 0, 0, 1, 0 },
+    { "REV16", FAMILY_REV, 1, 0, 1, 0 },
+    { "REVSH", FAMILY_REV, 2, 0, 1, 0 },
+    { "RBIT",  FAMILY_REV, 3, 0, 1, 0 },
+
+    { "SEL", FAMILY_SEL, 0, 0, 1, 0 },
+    { "USAD8",  FAMILY_USAD8, 0, 0, 1, 0 },
+    { "USADA8", FAMILY_USADA8, 0, 0, 1, 0 },
+
+    { "SSAT",   FAMILY_SAT, 0, 0, 1, 0 },
+    { "USAT",   FAMILY_SAT, 1, 0, 1, 0 },
+    { "SSAT16", FAMILY_SAT16, 0, 0, 1, 0 },
+    { "USAT16", FAMILY_SAT16, 1, 0, 1, 0 },
+
+    { "QADD",  FAMILY_QSAT, 0, 0, 1, 0 },
+    { "QSUB",  FAMILY_QSAT, 1, 0, 1, 0 },
+    { "QDADD", FAMILY_QSAT, 2, 0, 1, 0 },
+    { "QDSUB", FAMILY_QSAT, 3, 0, 1, 0 },
+
+    /* Parallel add/subtract family: prefix (S/Q/SH/U/UQ/UH) selects
+       U (bit22) and op1 (bits21:20); suffix (ADD16/ADD8/SUB16/SUB8/
+       ASX/SAX) selects op2 (bits7:5). param1 = (U<<3)|op1,
+       param2 = op2. */
+    { "SADD16",  FAMILY_PARALLEL, 0x1, 0x0, 1, 0 },
+    { "SADD8",   FAMILY_PARALLEL, 0x1, 0x4, 1, 0 },
+    { "SASX",    FAMILY_PARALLEL, 0x1, 0x1, 1, 0 },
+    { "SSAX",    FAMILY_PARALLEL, 0x1, 0x2, 1, 0 },
+    { "SSUB16",  FAMILY_PARALLEL, 0x1, 0x3, 1, 0 },
+    { "SSUB8",   FAMILY_PARALLEL, 0x1, 0x7, 1, 0 },
+    { "QADD16",  FAMILY_PARALLEL, 0x2, 0x0, 1, 0 },
+    { "QADD8",   FAMILY_PARALLEL, 0x2, 0x4, 1, 0 },
+    { "QASX",    FAMILY_PARALLEL, 0x2, 0x1, 1, 0 },
+    { "QSAX",    FAMILY_PARALLEL, 0x2, 0x2, 1, 0 },
+    { "QSUB16",  FAMILY_PARALLEL, 0x2, 0x3, 1, 0 },
+    { "QSUB8",   FAMILY_PARALLEL, 0x2, 0x7, 1, 0 },
+    { "SHADD16", FAMILY_PARALLEL, 0x3, 0x0, 1, 0 },
+    { "SHADD8",  FAMILY_PARALLEL, 0x3, 0x4, 1, 0 },
+    { "SHASX",   FAMILY_PARALLEL, 0x3, 0x1, 1, 0 },
+    { "SHSAX",   FAMILY_PARALLEL, 0x3, 0x2, 1, 0 },
+    { "SHSUB16", FAMILY_PARALLEL, 0x3, 0x3, 1, 0 },
+    { "SHSUB8",  FAMILY_PARALLEL, 0x3, 0x7, 1, 0 },
+    { "UADD16",  FAMILY_PARALLEL, 0x9, 0x0, 1, 0 },
+    { "UADD8",   FAMILY_PARALLEL, 0x9, 0x4, 1, 0 },
+    { "UASX",    FAMILY_PARALLEL, 0x9, 0x1, 1, 0 },
+    { "USAX",    FAMILY_PARALLEL, 0x9, 0x2, 1, 0 },
+    { "USUB16",  FAMILY_PARALLEL, 0x9, 0x3, 1, 0 },
+    { "USUB8",   FAMILY_PARALLEL, 0x9, 0x7, 1, 0 },
+    { "UQADD16", FAMILY_PARALLEL, 0xA, 0x0, 1, 0 },
+    { "UQADD8",  FAMILY_PARALLEL, 0xA, 0x4, 1, 0 },
+    { "UQASX",   FAMILY_PARALLEL, 0xA, 0x1, 1, 0 },
+    { "UQSAX",   FAMILY_PARALLEL, 0xA, 0x2, 1, 0 },
+    { "UQSUB16", FAMILY_PARALLEL, 0xA, 0x3, 1, 0 },
+    { "UQSUB8",  FAMILY_PARALLEL, 0xA, 0x7, 1, 0 },
+    { "UHADD16", FAMILY_PARALLEL, 0xB, 0x0, 1, 0 },
+    { "UHADD8",  FAMILY_PARALLEL, 0xB, 0x4, 1, 0 },
+    { "UHASX",   FAMILY_PARALLEL, 0xB, 0x1, 1, 0 },
+    { "UHSAX",   FAMILY_PARALLEL, 0xB, 0x2, 1, 0 },
+    { "UHSUB16", FAMILY_PARALLEL, 0xB, 0x3, 1, 0 },
+    { "UHSUB8",  FAMILY_PARALLEL, 0xB, 0x7, 1, 0 },
+
+    { "SDIV", FAMILY_SDIV_UDIV, 0, 0, 1, 0 },
+    { "UDIV", FAMILY_SDIV_UDIV, 1, 0, 1, 0 },
+
+    { "LDREX",  FAMILY_LDREX_STREX, 0, 0, 1, 0 },
+    { "LDREXB", FAMILY_LDREX_STREX, 1, 0, 1, 0 },
+    { "LDREXH", FAMILY_LDREX_STREX, 2, 0, 1, 0 },
+    { "LDREXD", FAMILY_LDREX_STREX, 3, 0, 1, 0 },
+    { "STREX",  FAMILY_LDREX_STREX, 4, 0, 1, 0 },
+    { "STREXB", FAMILY_LDREX_STREX, 5, 0, 1, 0 },
+    { "STREXH", FAMILY_LDREX_STREX, 6, 0, 1, 0 },
+    { "STREXD", FAMILY_LDREX_STREX, 7, 0, 1, 0 },
+    { "CLREX",  FAMILY_CLREX, 0, 0, 0, 0 },
+
+    { "CPS",   FAMILY_CPS, 0, 0, 0, 0 },
+    { "CPSIE", FAMILY_CPS, 1, 0, 0, 0 },
+    { "CPSID", FAMILY_CPS, 2, 0, 0, 0 },
+    { "SETEND", FAMILY_SETEND, 0, 0, 0, 0 },
+    { "SETPAN", FAMILY_SETPAN, 0, 0, 0, 0 },
+
+    { "DMB", FAMILY_BARRIER, 0, 0, 0, 0 },
+    { "DSB", FAMILY_BARRIER, 1, 0, 0, 0 },
+    { "ISB", FAMILY_BARRIER, 2, 0, 0, 0 },
+
+    { "NOP",   FAMILY_HINT, 0, 0, 1, 0 },
+    { "SEV",   FAMILY_HINT, 4, 0, 1, 0 },
+    { "SEVL",  FAMILY_HINT, 5, 0, 1, 0 },
+    { "WFE",   FAMILY_HINT, 2, 0, 1, 0 },
+    { "WFI",   FAMILY_HINT, 3, 0, 1, 0 },
+    { "YIELD", FAMILY_HINT, 1, 0, 1, 0 },
+
+    /* param1 = (P<<1)|U, matching the standard LDM/STM addressing
+       aliases: IA=1, IB=3, DA=0, DB=2; FD=IA, FA=DA, EA=DB, ED=IB. */
+    { "RFEDA", FAMILY_RFE, 0x0, 0, 0, 0 },
+    { "RFEDB", FAMILY_RFE, 0x2, 0, 0, 0 },
+    { "RFEIA", FAMILY_RFE, 0x1, 0, 0, 0 },
+    { "RFEIB", FAMILY_RFE, 0x3, 0, 0, 0 },
+    { "RFEFD", FAMILY_RFE, 0x1, 0, 0, 0 },
+    { "RFEFA", FAMILY_RFE, 0x0, 0, 0, 0 },
+    { "RFEEA", FAMILY_RFE, 0x2, 0, 0, 0 },
+    { "RFEED", FAMILY_RFE, 0x3, 0, 0, 0 },
+    { "SRSDA", FAMILY_SRS, 0x0, 0, 0, 0 },
+    { "SRSDB", FAMILY_SRS, 0x2, 0, 0, 0 },
+    { "SRSIA", FAMILY_SRS, 0x1, 0, 0, 0 },
+    { "SRSIB", FAMILY_SRS, 0x3, 0, 0, 0 },
+    { "SRSFD", FAMILY_SRS, 0x1, 0, 0, 0 },
+    { "SRSFA", FAMILY_SRS, 0x0, 0, 0, 0 },
+    { "SRSEA", FAMILY_SRS, 0x2, 0, 0, 0 },
+    { "SRSED", FAMILY_SRS, 0x3, 0, 0, 0 },
+
+    { "BKPT", FAMILY_BKPT, 0, 0, 1, 0 },
+    { "HVC",  FAMILY_SVC_HINT, 0, 0, 0, 0 },
+    { "SMC",  FAMILY_SVC_HINT, 1, 0, 1, 0 },
+    { "ERET", FAMILY_ERET, 0, 0, 1, 0 },
+    { "HLT",  FAMILY_HLT, 0, 0, 1, 0 },
+
+    { "CRC32B",  FAMILY_CRC32, 0, 0, 0, 0 },
+    { "CRC32H",  FAMILY_CRC32, 1, 0, 0, 0 },
+    { "CRC32W",  FAMILY_CRC32, 2, 0, 0, 0 },
+    { "CRC32CB", FAMILY_CRC32, 4, 0, 0, 0 },
+    { "CRC32CH", FAMILY_CRC32, 5, 0, 0, 0 },
+    { "CRC32CW", FAMILY_CRC32, 6, 0, 0, 0 },
+
+    { "SSBB",  FAMILY_BARRIER_NOOP, 0, 0, 0, 0 },
+    { "PSSBB", FAMILY_BARRIER_NOOP, 1, 0, 0, 0 },
+
+    { "PKHBT", FAMILY_PKH, 0, 0, 1, 0 },
+    { "PKHTB", FAMILY_PKH, 1, 0, 1, 0 },
+
+    { "SXTB",   FAMILY_SXT_UXT, 0, 0, 1, 0 },
+    { "SXTH",   FAMILY_SXT_UXT, 1, 0, 1, 0 },
+    { "SXTB16", FAMILY_SXT_UXT, 2, 0, 1, 0 },
+    { "UXTB",   FAMILY_SXT_UXT, 3, 0, 1, 0 },
+    { "UXTH",   FAMILY_SXT_UXT, 4, 0, 1, 0 },
+    { "UXTB16", FAMILY_SXT_UXT, 5, 0, 1, 0 },
+    { "SXTAB",   FAMILY_SXT_UXT_A, 0, 0, 1, 0 },
+    { "SXTAH",   FAMILY_SXT_UXT_A, 1, 0, 1, 0 },
+    { "SXTAB16", FAMILY_SXT_UXT_A, 2, 0, 1, 0 },
+    { "UXTAB",   FAMILY_SXT_UXT_A, 3, 0, 1, 0 },
+    { "UXTAH",   FAMILY_SXT_UXT_A, 4, 0, 1, 0 },
+    { "UXTAB16", FAMILY_SXT_UXT_A, 5, 0, 1, 0 },
+
+    { "ADR", FAMILY_ADR, 0, 0, 1, 0 }
+};
+#define NUM_MNEMONICS (sizeof(mnemonic_table) / sizeof(mnemonic_table[0]))
+
+/*******************************************************************
+ Function:      read_token
+ Description:   Reads a raw mnemonic token (letters and digits) from
+                'text', upper-cased, into 'out' (which must be at
+                least 16 bytes).
+ Parameters:    text/length = source text
+                out = [[out]] the upper-cased token, NUL terminated
+ Returns:       number of source bytes consumed
+ ******************************************************************/
+static size_t read_token(const uint8_t *text, size_t length, char *out)
+{
+    size_t pos = 0;
+    size_t count = 0;
+
+    while (pos < length && count < 15 &&
+           ((text[pos] >= 'A' && text[pos] <= 'Z') || (text[pos] >= 'a' && text[pos] <= 'z') ||
+            (text[pos] >= '0' && text[pos] <= '9')))
+    {
+        out[count] = (char) toupper((int) text[pos]);
+        count += 1;
+        pos += 1;
+    }
+    out[count] = '\0';
+    return pos;
+}
+
+/*******************************************************************
+ Function:      match_mnemonic
+ Description:   Matches a raw token against mnemonic_table, trying
+                every root that prefixes the token and accepting the
+                longest root whose remaining text is empty, 'S' (if
+                the root allows it), a condition code, or a condition
+                code followed by 'S'.
+ Parameters:    token = the upper-cased raw token (from read_token)
+                out_entry = [[out]] the matched table entry
+                out_cond = [[out]] the 4-bit condition field (AL if
+                           none was written)
+                out_s = [[out]] non-zero if an 'S' flag was written
+ Returns:       non-zero if a mnemonic was matched
+ ******************************************************************/
+static int match_mnemonic(const char *token, const mnemonic_entry_t **out_entry,
+                           uint32_t *out_cond, int *out_s)
+{
+    size_t token_len = strlen(token);
+    const mnemonic_entry_t *best = NULL;
+    size_t best_len = 0;
+    uint32_t best_cond = COND_AL;
+    int best_s = 0;
+    size_t i;
+
+    for (i = 0; i < NUM_MNEMONICS; i++)
+    {
+        size_t root_len = strlen(mnemonic_table[i].root);
+        const char *rest;
+        size_t rest_len;
+        uint32_t cond;
+        int s_flag;
+
+        if (root_len <= best_len || root_len > token_len ||
+            memcmp(mnemonic_table[i].root, token, root_len) != 0)
+        {
+            continue;
+        }
+        rest = token + root_len;
+        rest_len = token_len - root_len;
+        cond = COND_AL;
+        s_flag = 0;
+
+        if (rest_len == 0)
+        {
+            /* matches */
+        }
+        else if (rest_len == 1 && rest[0] == 'S' && mnemonic_table[i].allows_s)
+        {
+            s_flag = 1;
+        }
+        else if (rest_len == 2 && mnemonic_table[i].allows_cond && match_condition((const uint8_t *) rest, 2, &cond))
+        {
+            /* matches */
+        }
+        else if (rest_len == 3 && rest[2] == 'S' && mnemonic_table[i].allows_cond && mnemonic_table[i].allows_s &&
+                 match_condition((const uint8_t *) rest, 2, &cond))
+        {
+            s_flag = 1;
+        }
+        else
+        {
+            continue;
+        }
+        best = &mnemonic_table[i];
+        best_len = root_len;
+        best_cond = cond;
+        best_s = s_flag;
+    }
+    if (best == NULL)
+    {
+        return 0;
+    }
+    *out_entry = best;
+    *out_cond = best_cond;
+    *out_s = best_s;
+    return 1;
+}
+
+static _kernel_oserror *error_bad_mnemonic(void)
+{
+    return assemble_set_error(ASSEMBLE_CPU_ARM32, ASSEMBLE_ERROR_TYPE_BAD_MNEMONIC, ASSEMBLE_ARM32_ERR_NONE,
+                               "Mnemonic not recognised");
+}
+
+/* ---------------------------------------------------------------
+ * Per-family encoders. Each is called with 'pos' positioned just
+ * after the mnemonic (and any condition/S suffix already consumed),
+ * and returns the completed instruction word via '*out_instr'
+ * (cond/26:27 class bits already filled in by the caller). Operand
+ * text runs from text[pos] to text[length].
+ * --------------------------------------------------------------- */
+
+typedef _kernel_oserror *(*family_encoder_fn)(assemble_context_t *context,
+                                               const mnemonic_entry_t *entry,
+                                               uint32_t cond, int s_flag,
+                                               const uint8_t *text, size_t length, size_t pos,
+                                               uint32_t *out_instr);
+
+static _kernel_oserror *encode_data_proc(assemble_context_t *context, const mnemonic_entry_t *entry,
+                                          uint32_t cond, int s_flag,
+                                          const uint8_t *text, size_t length, size_t pos,
+                                          uint32_t *out_instr)
+{
+    uint32_t rd, rn, op2;
+    _kernel_oserror *error;
+
+    error = parse_register(context, text, length, &pos, &rd);
+    if (error != NULL) return error;
+    error = expect_char(text, length, &pos, ',');
+    if (error != NULL) return error;
+    error = parse_register(context, text, length, &pos, &rn);
+    if (error != NULL) return error;
+    error = expect_char(text, length, &pos, ',');
+    if (error != NULL) return error;
+    error = parse_operand2(context, text, length, &pos, &op2);
+    if (error != NULL) return error;
+    error = check_trailing(text, length, pos);
+    if (error != NULL) return error;
+
+    *out_instr = (cond << 28) | (entry->param1 << 21) | (s_flag ? (1u << 20) : 0) |
+                 (rn << 16) | (rd << 12) | op2;
+    return NULL;
+}
+
+static _kernel_oserror *encode_data_cmp(assemble_context_t *context, const mnemonic_entry_t *entry,
+                                         uint32_t cond, int s_flag,
+                                         const uint8_t *text, size_t length, size_t pos,
+                                         uint32_t *out_instr)
+{
+    uint32_t rn, op2;
+    _kernel_oserror *error;
+
+    (void) s_flag;
+    error = parse_register(context, text, length, &pos, &rn);
+    if (error != NULL) return error;
+    error = expect_char(text, length, &pos, ',');
+    if (error != NULL) return error;
+    error = parse_operand2(context, text, length, &pos, &op2);
+    if (error != NULL) return error;
+    error = check_trailing(text, length, pos);
+    if (error != NULL) return error;
+
+    *out_instr = (cond << 28) | (entry->param1 << 21) | (1u << 20) | (rn << 16) | op2;
+    return NULL;
+}
+
+static _kernel_oserror *encode_data_mov(assemble_context_t *context, const mnemonic_entry_t *entry,
+                                         uint32_t cond, int s_flag,
+                                         const uint8_t *text, size_t length, size_t pos,
+                                         uint32_t *out_instr)
+{
+    uint32_t rd, op2;
+    _kernel_oserror *error;
+
+    error = parse_register(context, text, length, &pos, &rd);
+    if (error != NULL) return error;
+    error = expect_char(text, length, &pos, ',');
+    if (error != NULL) return error;
+    error = parse_operand2(context, text, length, &pos, &op2);
+    if (error != NULL) return error;
+    error = check_trailing(text, length, pos);
+    if (error != NULL) return error;
+
+    *out_instr = (cond << 28) | (entry->param1 << 21) | (s_flag ? (1u << 20) : 0) | (rd << 12) | op2;
+    return NULL;
+}
+
+static _kernel_oserror *error_duplicate_register(void)
+{
+    return assemble_set_error(ASSEMBLE_CPU_ARM32, ASSEMBLE_ERROR_TYPE_BAD_OPERAND, ASSEMBLE_ARM32_ERR_DUPLICATE_REGISTER,
+                               "Duplicate register");
+}
+
+static _kernel_oserror *encode_mul(assemble_context_t *context, const mnemonic_entry_t *entry,
+                                    uint32_t cond, int s_flag,
+                                    const uint8_t *text, size_t length, size_t pos,
+                                    uint32_t *out_instr)
+{
+    uint32_t rd, rm, rs, rn = 0;
+    _kernel_oserror *error;
+
+    error = parse_register(context, text, length, &pos, &rd);
+    if (error != NULL) return error;
+    error = expect_char(text, length, &pos, ',');
+    if (error != NULL) return error;
+    error = parse_register(context, text, length, &pos, &rm);
+    if (error != NULL) return error;
+    error = expect_char(text, length, &pos, ',');
+    if (error != NULL) return error;
+    error = parse_register(context, text, length, &pos, &rs);
+    if (error != NULL) return error;
+    if (entry->param2 == 4)
+    {
+        error = expect_char(text, length, &pos, ',');
+        if (error != NULL) return error;
+        error = parse_register(context, text, length, &pos, &rn);
+        if (error != NULL) return error;
+    }
+    error = check_trailing(text, length, pos);
+    if (error != NULL) return error;
+    if (rd == rm && entry->param1 == 0x000000)
+    {
+        return error_duplicate_register();
+    }
+
+    *out_instr = (cond << 28) | entry->param1 | (s_flag ? (1u << 20) : 0) |
+                 (rd << 16) | (rn << 12) | (rs << 8) | 0x90u | rm;
+    return NULL;
+}
+
+static _kernel_oserror *encode_umaal(assemble_context_t *context, const mnemonic_entry_t *entry,
+                                      uint32_t cond, int s_flag,
+                                      const uint8_t *text, size_t length, size_t pos,
+                                      uint32_t *out_instr)
+{
+    uint32_t rdlo, rdhi, rm, rs;
+    _kernel_oserror *error;
+
+    (void) entry; (void) s_flag;
+    error = parse_register(context, text, length, &pos, &rdlo);
+    if (error != NULL) return error;
+    error = expect_char(text, length, &pos, ',');
+    if (error != NULL) return error;
+    error = parse_register(context, text, length, &pos, &rdhi);
+    if (error != NULL) return error;
+    error = expect_char(text, length, &pos, ',');
+    if (error != NULL) return error;
+    error = parse_register(context, text, length, &pos, &rm);
+    if (error != NULL) return error;
+    error = expect_char(text, length, &pos, ',');
+    if (error != NULL) return error;
+    error = parse_register(context, text, length, &pos, &rs);
+    if (error != NULL) return error;
+    error = check_trailing(text, length, pos);
+    if (error != NULL) return error;
+
+    *out_instr = (cond << 28) | 0x00400090u | (rdhi << 16) | (rdlo << 12) | (rs << 8) | rm;
+    return NULL;
+}
+
+static _kernel_oserror *error_branch_range(void)
+{
+    return assemble_set_error(ASSEMBLE_CPU_ARM32, ASSEMBLE_ERROR_TYPE_RANGE, ASSEMBLE_ARM32_ERR_BRANCH_RANGE,
+                               "Branch target out of range");
+}
+
+static _kernel_oserror *encode_branch(assemble_context_t *context, const mnemonic_entry_t *entry,
+                                       uint32_t cond, int s_flag,
+                                       const uint8_t *text, size_t length, size_t pos,
+                                       uint32_t *out_instr)
+{
+    int32_t target;
+    int32_t offset;
+    _kernel_oserror *error;
+
+    (void) s_flag;
+    error = eval_numeric(context, text, length, &pos, &target);
+    if (error != NULL) return error;
+    error = check_trailing(text, length, pos);
+    if (error != NULL) return error;
+
+    offset = target - (int32_t) (context->address + 8);
+    if ((offset & 3) != 0 || offset < -0x2000000 || offset >= 0x2000000)
+    {
+        return error_branch_range();
+    }
+    *out_instr = (cond << 28) | 0x0A000000u | (entry->param1 << 24) | (((uint32_t) offset >> 2) & 0xFFFFFFu);
+    return NULL;
+}
+
+static _kernel_oserror *encode_bx(assemble_context_t *context, const mnemonic_entry_t *entry,
+                                   uint32_t cond, int s_flag,
+                                   const uint8_t *text, size_t length, size_t pos,
+                                   uint32_t *out_instr)
+{
+    uint32_t rm;
+    _kernel_oserror *error;
+    static const uint32_t base[3] = { 0x012FFF10u, 0x012FFF30u, 0x012FFF20u };
+
+    (void) s_flag;
+    error = parse_register(context, text, length, &pos, &rm);
+    if (error != NULL) return error;
+    error = check_trailing(text, length, pos);
+    if (error != NULL) return error;
+
+    *out_instr = (cond << 28) | base[entry->param1] | rm;
+    return NULL;
+}
+
+static _kernel_oserror *encode_swi(assemble_context_t *context, const mnemonic_entry_t *entry,
+                                    uint32_t cond, int s_flag,
+                                    const uint8_t *text, size_t length, size_t pos,
+                                    uint32_t *out_instr)
+{
+    int32_t value;
+    _kernel_oserror *error;
+
+    (void) entry; (void) s_flag;
+    error = eval_numeric(context, text, length, &pos, &value);
+    if (error != NULL) return error;
+    error = check_trailing(text, length, pos);
+    if (error != NULL) return error;
+
+    *out_instr = (cond << 28) | 0x0F000000u | ((uint32_t) value & 0xFFFFFFu);
+    return NULL;
+}
+
+static _kernel_oserror *encode_clz(assemble_context_t *context, const mnemonic_entry_t *entry,
+                                    uint32_t cond, int s_flag,
+                                    const uint8_t *text, size_t length, size_t pos,
+                                    uint32_t *out_instr)
+{
+    uint32_t rd, rm;
+    _kernel_oserror *error;
+
+    (void) entry; (void) s_flag;
+    error = parse_register(context, text, length, &pos, &rd);
+    if (error != NULL) return error;
+    error = expect_char(text, length, &pos, ',');
+    if (error != NULL) return error;
+    error = parse_register(context, text, length, &pos, &rm);
+    if (error != NULL) return error;
+    error = check_trailing(text, length, pos);
+    if (error != NULL) return error;
+
+    *out_instr = (cond << 28) | 0x016F0F10u | (rd << 12) | rm;
+    return NULL;
+}
+
+/* PLD/PLI [Rn{,#imm}] or [Rn,{-}Rm{,shift}] -- always pre-indexed,
+   never writeback, unconditional (cond forced 1111). */
+static _kernel_oserror *encode_pld_pli(assemble_context_t *context, const mnemonic_entry_t *entry,
+                                        uint32_t cond, int s_flag,
+                                        const uint8_t *text, size_t length, size_t pos,
+                                        uint32_t *out_instr)
+{
+    uint32_t bits = 0xF550F000u; /* NV | P=1 U=1 B(=1 for PLD data, differs for PLI) | Rd=1111 */
+    _kernel_oserror *error;
+
+    (void) cond; (void) s_flag;
+    if (entry->param1 == 1) /* PLI: opcode byte differs from PLD (no B bit, uses 0110 class) */
+    {
+        bits = 0xF450F000u;
+    }
+    error = parse_ldr_str_address(context, text, length, &pos, LDST_CLASS_NORMAL, &bits);
+    if (error != NULL) return error;
+    error = check_trailing(text, length, pos);
+    if (error != NULL) return error;
+    /* PLD/PLI addressing never sets bit25 register-offset-with-shift's I
+       differently; parse_ldr_str_address already encoded it correctly. */
+    *out_instr = bits;
+    return NULL;
+}
+
+static _kernel_oserror *error_bad_bit_field(void)
+{
+    return assemble_set_error(ASSEMBLE_CPU_ARM32, ASSEMBLE_ERROR_TYPE_RANGE, ASSEMBLE_ARM32_ERR_BAD_BIT_FIELD,
+                               "Bad bitfield lsb/width");
+}
+
+static _kernel_oserror *encode_bfc(assemble_context_t *context, const mnemonic_entry_t *entry,
+                                    uint32_t cond, int s_flag,
+                                    const uint8_t *text, size_t length, size_t pos,
+                                    uint32_t *out_instr)
+{
+    uint32_t rd;
+    int32_t lsb, width;
+    _kernel_oserror *error;
+
+    (void) entry; (void) s_flag;
+    error = parse_register(context, text, length, &pos, &rd);
+    if (error != NULL) return error;
+    error = expect_char(text, length, &pos, ',');
+    if (error != NULL) return error;
+    error = expect_char(text, length, &pos, '#');
+    if (error != NULL) return error;
+    error = eval_numeric(context, text, length, &pos, &lsb);
+    if (error != NULL) return error;
+    error = expect_char(text, length, &pos, ',');
+    if (error != NULL) return error;
+    error = expect_char(text, length, &pos, '#');
+    if (error != NULL) return error;
+    error = eval_numeric(context, text, length, &pos, &width);
+    if (error != NULL) return error;
+    error = check_trailing(text, length, pos);
+    if (error != NULL) return error;
+    if (lsb < 0 || lsb > 31 || width < 1 || lsb + width > 32)
+    {
+        return error_bad_bit_field();
+    }
+
+    *out_instr = (cond << 28) | 0x07C0001Fu | ((uint32_t) (lsb + width - 1) << 16) | (rd << 12) | ((uint32_t) lsb << 7);
+    return NULL;
+}
+
+static _kernel_oserror *encode_bfi(assemble_context_t *context, const mnemonic_entry_t *entry,
+                                    uint32_t cond, int s_flag,
+                                    const uint8_t *text, size_t length, size_t pos,
+                                    uint32_t *out_instr)
+{
+    uint32_t rd, rn;
+    int32_t lsb, width;
+    _kernel_oserror *error;
+
+    (void) entry; (void) s_flag;
+    error = parse_register(context, text, length, &pos, &rd);
+    if (error != NULL) return error;
+    error = expect_char(text, length, &pos, ',');
+    if (error != NULL) return error;
+    error = parse_register(context, text, length, &pos, &rn);
+    if (error != NULL) return error;
+    error = expect_char(text, length, &pos, ',');
+    if (error != NULL) return error;
+    error = expect_char(text, length, &pos, '#');
+    if (error != NULL) return error;
+    error = eval_numeric(context, text, length, &pos, &lsb);
+    if (error != NULL) return error;
+    error = expect_char(text, length, &pos, ',');
+    if (error != NULL) return error;
+    error = expect_char(text, length, &pos, '#');
+    if (error != NULL) return error;
+    error = eval_numeric(context, text, length, &pos, &width);
+    if (error != NULL) return error;
+    error = check_trailing(text, length, pos);
+    if (error != NULL) return error;
+    if (lsb < 0 || lsb > 31 || width < 1 || lsb + width > 32)
+    {
+        return error_bad_bit_field();
+    }
+
+    *out_instr = (cond << 28) | 0x07C00010u | ((uint32_t) (lsb + width - 1) << 16) | (rd << 12) |
+                 ((uint32_t) lsb << 7) | rn;
+    return NULL;
+}
+
+/* SBFX/UBFX Rd,Rn,#lsb,#width */
+static _kernel_oserror *encode_bfx(assemble_context_t *context, const mnemonic_entry_t *entry,
+                                    uint32_t cond, int s_flag,
+                                    const uint8_t *text, size_t length, size_t pos,
+                                    uint32_t *out_instr)
+{
+    uint32_t rd, rn;
+    int32_t lsb, width;
+    _kernel_oserror *error;
+
+    (void) s_flag;
+    error = parse_register(context, text, length, &pos, &rd);
+    if (error != NULL) return error;
+    error = expect_char(text, length, &pos, ',');
+    if (error != NULL) return error;
+    error = parse_register(context, text, length, &pos, &rn);
+    if (error != NULL) return error;
+    error = expect_char(text, length, &pos, ',');
+    if (error != NULL) return error;
+    error = expect_char(text, length, &pos, '#');
+    if (error != NULL) return error;
+    error = eval_numeric(context, text, length, &pos, &lsb);
+    if (error != NULL) return error;
+    error = expect_char(text, length, &pos, ',');
+    if (error != NULL) return error;
+    error = expect_char(text, length, &pos, '#');
+    if (error != NULL) return error;
+    error = eval_numeric(context, text, length, &pos, &width);
+    if (error != NULL) return error;
+    error = check_trailing(text, length, pos);
+    if (error != NULL) return error;
+    if (lsb < 0 || lsb > 31 || width < 1 || width > 32 - lsb)
+    {
+        return error_bad_bit_field();
+    }
+
+    /* SBFX: 0x07A00050, UBFX: 0x07E00050; entry->param1 selects. */
+    *out_instr = (cond << 28) | (entry->param1 ? 0x07E00050u : 0x07A00050u) |
+                 ((uint32_t) (width - 1) << 16) | (rd << 12) | ((uint32_t) lsb << 7) | rn;
+    return NULL;
+}
+
+static _kernel_oserror *encode_rev(assemble_context_t *context, const mnemonic_entry_t *entry,
+                                    uint32_t cond, int s_flag,
+                                    const uint8_t *text, size_t length, size_t pos,
+                                    uint32_t *out_instr)
+{
+    uint32_t rd, rm;
+    _kernel_oserror *error;
+    static const uint32_t base[4] = { 0x06BF0F30u, 0x06BF0FB0u, 0x06FF0FB0u, 0x06FF0F30u };
+
+    (void) s_flag;
+    error = parse_register(context, text, length, &pos, &rd);
+    if (error != NULL) return error;
+    error = expect_char(text, length, &pos, ',');
+    if (error != NULL) return error;
+    error = parse_register(context, text, length, &pos, &rm);
+    if (error != NULL) return error;
+    error = check_trailing(text, length, pos);
+    if (error != NULL) return error;
+
+    *out_instr = (cond << 28) | base[entry->param1] | (rd << 12) | rm;
+    return NULL;
+}
+
+static _kernel_oserror *encode_sel(assemble_context_t *context, const mnemonic_entry_t *entry,
+                                    uint32_t cond, int s_flag,
+                                    const uint8_t *text, size_t length, size_t pos,
+                                    uint32_t *out_instr)
+{
+    uint32_t rd, rn, rm;
+    _kernel_oserror *error;
+
+    (void) entry; (void) s_flag;
+    error = parse_register(context, text, length, &pos, &rd);
+    if (error != NULL) return error;
+    error = expect_char(text, length, &pos, ',');
+    if (error != NULL) return error;
+    error = parse_register(context, text, length, &pos, &rn);
+    if (error != NULL) return error;
+    error = expect_char(text, length, &pos, ',');
+    if (error != NULL) return error;
+    error = parse_register(context, text, length, &pos, &rm);
+    if (error != NULL) return error;
+    error = check_trailing(text, length, pos);
+    if (error != NULL) return error;
+
+    *out_instr = (cond << 28) | 0x068000B0u | (rn << 16) | (rd << 12) | rm;
+    return NULL;
+}
+
+/* SDIV/UDIV/USAD8 Rd,Rn,Rm (Rd->19:16, Rn->3:0, Rm->11:8); USADA8
+   additionally takes a 4th register Ra->15:12. The 2-operand
+   "implicit Rd" shorthand (Rn omitted, taken equal to Rd) that the
+   original supports for SDIV/UDIV/USAD8 is not implemented here --
+   write the 3-operand form explicitly instead. */
+static _kernel_oserror *encode_usad8(assemble_context_t *context, const mnemonic_entry_t *entry,
+                                      uint32_t cond, int s_flag,
+                                      const uint8_t *text, size_t length, size_t pos,
+                                      uint32_t *out_instr)
+{
+    uint32_t rd, rn, rm;
+    _kernel_oserror *error;
+
+    (void) entry; (void) s_flag;
+    error = parse_register(context, text, length, &pos, &rd);
+    if (error != NULL) return error;
+    error = expect_char(text, length, &pos, ',');
+    if (error != NULL) return error;
+    error = parse_register(context, text, length, &pos, &rn);
+    if (error != NULL) return error;
+    error = expect_char(text, length, &pos, ',');
+    if (error != NULL) return error;
+    error = parse_register(context, text, length, &pos, &rm);
+    if (error != NULL) return error;
+    error = check_trailing(text, length, pos);
+    if (error != NULL) return error;
+
+    *out_instr = (cond << 28) | 0x0780F010u | (rd << 16) | (rm << 8) | rn;
+    return NULL;
+}
+
+static _kernel_oserror *encode_usada8(assemble_context_t *context, const mnemonic_entry_t *entry,
+                                       uint32_t cond, int s_flag,
+                                       const uint8_t *text, size_t length, size_t pos,
+                                       uint32_t *out_instr)
+{
+    uint32_t rd, rn, rm, ra;
+    _kernel_oserror *error;
+
+    (void) entry; (void) s_flag;
+    error = parse_register(context, text, length, &pos, &rd);
+    if (error != NULL) return error;
+    error = expect_char(text, length, &pos, ',');
+    if (error != NULL) return error;
+    error = parse_register(context, text, length, &pos, &rn);
+    if (error != NULL) return error;
+    error = expect_char(text, length, &pos, ',');
+    if (error != NULL) return error;
+    error = parse_register(context, text, length, &pos, &rm);
+    if (error != NULL) return error;
+    error = expect_char(text, length, &pos, ',');
+    if (error != NULL) return error;
+    error = parse_register(context, text, length, &pos, &ra);
+    if (error != NULL) return error;
+    error = check_trailing(text, length, pos);
+    if (error != NULL) return error;
+
+    *out_instr = (cond << 28) | 0x07800010u | (rd << 16) | (ra << 12) | (rm << 8) | rn;
+    return NULL;
+}
+
+static _kernel_oserror *encode_sdiv_udiv(assemble_context_t *context, const mnemonic_entry_t *entry,
+                                          uint32_t cond, int s_flag,
+                                          const uint8_t *text, size_t length, size_t pos,
+                                          uint32_t *out_instr)
+{
+    uint32_t rd, rn, rm;
+    _kernel_oserror *error;
+
+    (void) s_flag;
+    error = parse_register(context, text, length, &pos, &rd);
+    if (error != NULL) return error;
+    error = expect_char(text, length, &pos, ',');
+    if (error != NULL) return error;
+    error = parse_register(context, text, length, &pos, &rn);
+    if (error != NULL) return error;
+    error = expect_char(text, length, &pos, ',');
+    if (error != NULL) return error;
+    error = parse_register(context, text, length, &pos, &rm);
+    if (error != NULL) return error;
+    error = check_trailing(text, length, pos);
+    if (error != NULL) return error;
+
+    *out_instr = (cond << 28) | (entry->param1 ? 0x0730F010u : 0x0710F010u) | (rd << 16) | (rm << 8) | rn;
+    return NULL;
+}
+
+/* SSAT/USAT Rd,#sat_imm,Rn{,LSL #imm|ASR #imm}. Signed saturation
+   takes sat_imm 1-32 (encoded n-1); unsigned takes 0-31 (encoded
+   directly). */
+static _kernel_oserror *encode_sat(assemble_context_t *context, const mnemonic_entry_t *entry,
+                                    uint32_t cond, int s_flag,
+                                    const uint8_t *text, size_t length, size_t pos,
+                                    uint32_t *out_instr)
+{
+    uint32_t rd, rn;
+    int32_t sat_imm;
+    uint32_t sh = 0, imm5 = 0;
+    _kernel_oserror *error;
+    int is_unsigned = (int) entry->param1;
+
+    (void) s_flag;
+    error = parse_register(context, text, length, &pos, &rd);
+    if (error != NULL) return error;
+    error = expect_char(text, length, &pos, ',');
+    if (error != NULL) return error;
+    error = expect_char(text, length, &pos, '#');
+    if (error != NULL) return error;
+    error = eval_numeric(context, text, length, &pos, &sat_imm);
+    if (error != NULL) return error;
+    if (is_unsigned)
+    {
+        if (sat_imm < 0 || sat_imm > 31) return error_bad_immediate();
+    }
+    else
+    {
+        if (sat_imm < 1 || sat_imm > 32) return error_bad_immediate();
+        sat_imm -= 1;
+    }
+    error = expect_char(text, length, &pos, ',');
+    if (error != NULL) return error;
+    error = parse_register(context, text, length, &pos, &rn);
+    if (error != NULL) return error;
+    pos += assemble_skip_spaces(text + pos, length - pos);
+    if (pos < length && text[pos] == ',')
+    {
+        char c0, c1, c2;
+        int32_t shift_amount;
+
+        pos += 1;
+        pos += assemble_skip_spaces(text + pos, length - pos);
+        c0 = (pos < length) ? (char) toupper((int) text[pos]) : 0;
+        c1 = (pos + 1 < length) ? (char) toupper((int) text[pos + 1]) : 0;
+        c2 = (pos + 2 < length) ? (char) toupper((int) text[pos + 2]) : 0;
+        if (c0 == 'L' && c1 == 'S' && c2 == 'L')
+        {
+            sh = 0;
+        }
+        else if (c0 == 'A' && c1 == 'S' && c2 == 'R')
+        {
+            sh = 1;
+        }
+        else
+        {
+            return error_bad_shift();
+        }
+        pos += 3;
+        error = expect_char(text, length, &pos, '#');
+        if (error != NULL) return error;
+        error = eval_numeric(context, text, length, &pos, &shift_amount);
+        if (error != NULL) return error;
+        if (sh == 0)
+        {
+            if (shift_amount < 0 || shift_amount > 31) return error_bad_shift();
+        }
+        else
+        {
+            if (shift_amount < 1 || shift_amount > 32) return error_bad_shift();
+            if (shift_amount == 32) shift_amount = 0;
+        }
+        imm5 = (uint32_t) shift_amount;
+    }
+    error = check_trailing(text, length, pos);
+    if (error != NULL) return error;
+
+    *out_instr = (cond << 28) | (is_unsigned ? 0x06E00010u : 0x06A00010u) |
+                 ((uint32_t) sat_imm << 16) | (rd << 12) | (imm5 << 7) | (sh << 6) | rn;
+    return NULL;
+}
+
+/* SSAT16/USAT16 Rd,#sat_imm,Rn. Signed: 1-16 (encoded n-1); unsigned: 0-15. */
+static _kernel_oserror *encode_sat16(assemble_context_t *context, const mnemonic_entry_t *entry,
+                                      uint32_t cond, int s_flag,
+                                      const uint8_t *text, size_t length, size_t pos,
+                                      uint32_t *out_instr)
+{
+    uint32_t rd, rn;
+    int32_t sat_imm;
+    _kernel_oserror *error;
+    int is_unsigned = (int) entry->param1;
+
+    (void) s_flag;
+    error = parse_register(context, text, length, &pos, &rd);
+    if (error != NULL) return error;
+    error = expect_char(text, length, &pos, ',');
+    if (error != NULL) return error;
+    error = expect_char(text, length, &pos, '#');
+    if (error != NULL) return error;
+    error = eval_numeric(context, text, length, &pos, &sat_imm);
+    if (error != NULL) return error;
+    if (is_unsigned)
+    {
+        if (sat_imm < 0 || sat_imm > 15) return error_bad_immediate();
+    }
+    else
+    {
+        if (sat_imm < 1 || sat_imm > 16) return error_bad_immediate();
+        sat_imm -= 1;
+    }
+    error = expect_char(text, length, &pos, ',');
+    if (error != NULL) return error;
+    error = parse_register(context, text, length, &pos, &rn);
+    if (error != NULL) return error;
+    error = check_trailing(text, length, pos);
+    if (error != NULL) return error;
+
+    *out_instr = (cond << 28) | (is_unsigned ? 0x06E0F030u : 0x06A0F030u) | ((uint32_t) sat_imm << 16) | (rd << 12) | rn;
+    return NULL;
+}
+
+/* QADD/QSUB/QDADD/QDSUB Rd,Rm,Rn -- note the unusual operand order:
+   Rm is the value being (de)saturated, Rn (added for QDADD/QDSUB) is
+   doubled and saturated first. */
+static _kernel_oserror *encode_qsat(assemble_context_t *context, const mnemonic_entry_t *entry,
+                                     uint32_t cond, int s_flag,
+                                     const uint8_t *text, size_t length, size_t pos,
+                                     uint32_t *out_instr)
+{
+    uint32_t rd, rm, rn;
+    _kernel_oserror *error;
+    static const uint32_t base[4] = { 0x01000050u, 0x01200050u, 0x01400050u, 0x01600050u };
+
+    (void) s_flag;
+    error = parse_register(context, text, length, &pos, &rd);
+    if (error != NULL) return error;
+    error = expect_char(text, length, &pos, ',');
+    if (error != NULL) return error;
+    error = parse_register(context, text, length, &pos, &rm);
+    if (error != NULL) return error;
+    error = expect_char(text, length, &pos, ',');
+    if (error != NULL) return error;
+    error = parse_register(context, text, length, &pos, &rn);
+    if (error != NULL) return error;
+    error = check_trailing(text, length, pos);
+    if (error != NULL) return error;
+
+    *out_instr = (cond << 28) | base[entry->param1] | (rn << 16) | (rd << 12) | rm;
+    return NULL;
+}
+
+/* The 36-instruction parallel add/subtract family: Rd,Rn,Rm.
+   param1 = (U<<3)|op1 (bits22,21:20), param2 = op2 (bits7:5). */
+static _kernel_oserror *encode_parallel(assemble_context_t *context, const mnemonic_entry_t *entry,
+                                         uint32_t cond, int s_flag,
+                                         const uint8_t *text, size_t length, size_t pos,
+                                         uint32_t *out_instr)
+{
+    uint32_t rd, rn, rm;
+    uint32_t u = (entry->param1 >> 3) & 1u;
+    uint32_t op1 = entry->param1 & 3u;
+    _kernel_oserror *error;
+
+    (void) s_flag;
+    error = parse_register(context, text, length, &pos, &rd);
+    if (error != NULL) return error;
+    error = expect_char(text, length, &pos, ',');
+    if (error != NULL) return error;
+    error = parse_register(context, text, length, &pos, &rn);
+    if (error != NULL) return error;
+    error = expect_char(text, length, &pos, ',');
+    if (error != NULL) return error;
+    error = parse_register(context, text, length, &pos, &rm);
+    if (error != NULL) return error;
+    error = check_trailing(text, length, pos);
+    if (error != NULL) return error;
+
+    *out_instr = (cond << 28) | 0x06000010u | (u << 22) | (op1 << 20) | (rn << 16) | (rd << 12) |
+                 (0xFu << 8) | (entry->param2 << 5) | rm;
+    return NULL;
+}
+
+/*******************************************************************
+ Function:      parse_bracketed_register
+ Description:   Parses a plain '[Rn]' operand with no offset, as
+                used by LDREX/STREX/CLREX-family instructions.
+ ******************************************************************/
+static _kernel_oserror *parse_bracketed_register(assemble_context_t *context,
+                                                   const uint8_t *text, size_t length,
+                                                   size_t *pos_inout, uint32_t *out_rn)
+{
+    _kernel_oserror *error;
+
+    error = expect_char(text, length, pos_inout, '[');
+    if (error != NULL) return error;
+    error = parse_register(context, text, length, pos_inout, out_rn);
+    if (error != NULL) return error;
+    return expect_char(text, length, pos_inout, ']');
+}
+
+/* LDREX{B|H|D} Rt,[Rn]; STREX{B|H|D} Rd,Rt,[Rn]. param1: 0=LDREX,
+   1=LDREXB, 2=LDREXH, 3=LDREXD, 4=STREX, 5=STREXB, 6=STREXH, 7=STREXD. */
+static _kernel_oserror *encode_ldrex_strex(assemble_context_t *context, const mnemonic_entry_t *entry,
+                                            uint32_t cond, int s_flag,
+                                            const uint8_t *text, size_t length, size_t pos,
+                                            uint32_t *out_instr)
+{
+    static const uint32_t ldrex_base[4] = { 0x01900F9Fu, 0x01D00F9Fu, 0x01F00F9Fu, 0x01B00F9Fu };
+    static const uint32_t strex_base[4] = { 0x01800F90u, 0x01C00F90u, 0x01E00F90u, 0x01A00F90u };
+    uint32_t rn;
+    _kernel_oserror *error;
+
+    (void) s_flag;
+    if (entry->param1 < 4)
+    {
+        uint32_t rt;
+
+        error = parse_register(context, text, length, &pos, &rt);
+        if (error != NULL) return error;
+        error = expect_char(text, length, &pos, ',');
+        if (error != NULL) return error;
+        error = parse_bracketed_register(context, text, length, &pos, &rn);
+        if (error != NULL) return error;
+        error = check_trailing(text, length, pos);
+        if (error != NULL) return error;
+
+        *out_instr = (cond << 28) | ldrex_base[entry->param1] | (rn << 16) | (rt << 12);
+    }
+    else
+    {
+        uint32_t rd, rt;
+
+        error = parse_register(context, text, length, &pos, &rd);
+        if (error != NULL) return error;
+        error = expect_char(text, length, &pos, ',');
+        if (error != NULL) return error;
+        error = parse_register(context, text, length, &pos, &rt);
+        if (error != NULL) return error;
+        error = expect_char(text, length, &pos, ',');
+        if (error != NULL) return error;
+        error = parse_bracketed_register(context, text, length, &pos, &rn);
+        if (error != NULL) return error;
+        error = check_trailing(text, length, pos);
+        if (error != NULL) return error;
+
+        *out_instr = (cond << 28) | strex_base[entry->param1 - 4] | (rn << 16) | (rd << 12) | rt;
+    }
+    return NULL;
+}
+
+static _kernel_oserror *encode_clrex(assemble_context_t *context, const mnemonic_entry_t *entry,
+                                      uint32_t cond, int s_flag,
+                                      const uint8_t *text, size_t length, size_t pos,
+                                      uint32_t *out_instr)
+{
+    _kernel_oserror *error;
+
+    (void) context; (void) entry; (void) cond; (void) s_flag;
+    error = check_trailing(text, length, pos);
+    if (error != NULL) return error;
+    *out_instr = 0xF57FF01Fu;
+    return NULL;
+}
+
+/* CPS{IE|ID} {a}{i}{f}{,#mode}; CPS #mode. Always unconditional. */
+static _kernel_oserror *encode_cps(assemble_context_t *context, const mnemonic_entry_t *entry,
+                                    uint32_t cond, int s_flag,
+                                    const uint8_t *text, size_t length, size_t pos,
+                                    uint32_t *out_instr)
+{
+    uint32_t imod = 0, aif = 0, have_mode = 0;
+    int32_t mode = 0;
+    _kernel_oserror *error;
+
+    (void) cond; (void) s_flag;
+    if (entry->param1 != 0) /* CPSIE/CPSID */
+    {
+        imod = (entry->param1 == 1) ? 2u : 3u;
+        pos += assemble_skip_spaces(text + pos, length - pos);
+        while (pos < length && (text[pos] == 'a' || text[pos] == 'A' ||
+                                 text[pos] == 'i' || text[pos] == 'I' ||
+                                 text[pos] == 'f' || text[pos] == 'F'))
+        {
+            switch (toupper((int) text[pos]))
+            {
+                case 'A': aif |= 4u; break;
+                case 'I': aif |= 2u; break;
+                case 'F': aif |= 1u; break;
+                default: break;
+            }
+            pos += 1;
+        }
+        pos += assemble_skip_spaces(text + pos, length - pos);
+    }
+    if (pos < length && text[pos] == ',')
+    {
+        pos += 1;
+        pos += assemble_skip_spaces(text + pos, length - pos);
+        error = expect_char(text, length, &pos, '#');
+        if (error != NULL) return error;
+        error = eval_numeric(context, text, length, &pos, &mode);
+        if (error != NULL) return error;
+        have_mode = 1;
+    }
+    else if (entry->param1 == 0) /* plain 'CPS #mode' -- mode is mandatory */
+    {
+        error = expect_char(text, length, &pos, '#');
+        if (error != NULL) return error;
+        error = eval_numeric(context, text, length, &pos, &mode);
+        if (error != NULL) return error;
+        have_mode = 1;
+    }
+    error = check_trailing(text, length, pos);
+    if (error != NULL) return error;
+    if (mode < 0 || mode > 31)
+    {
+        return error_bad_immediate();
+    }
+
+    *out_instr = 0xF1000000u | (imod << 18) | (have_mode ? (1u << 17) : 0) | (aif << 6) |
+                 (have_mode ? (uint32_t) mode : 0);
+    return NULL;
+}
+
+static _kernel_oserror *encode_setend(assemble_context_t *context, const mnemonic_entry_t *entry,
+                                       uint32_t cond, int s_flag,
+                                       const uint8_t *text, size_t length, size_t pos,
+                                       uint32_t *out_instr)
+{
+    char c0;
+    _kernel_oserror *error;
+
+    (void) entry; (void) cond; (void) s_flag;
+    pos += assemble_skip_spaces(text + pos, length - pos);
+    c0 = (pos < length) ? (char) toupper((int) text[pos]) : 0;
+    if (c0 != 'B' && c0 != 'L')
+    {
+        return assemble_set_error(ASSEMBLE_CPU_ARM32, ASSEMBLE_ERROR_TYPE_SYNTAX, ASSEMBLE_ARM32_ERR_NONE,
+                                   "Expected BE or LE");
+    }
+    pos += 2; /* consume 'BE'/'LE' */
+    error = check_trailing(text, length, pos);
+    if (error != NULL) return error;
+
+    *out_instr = 0xF1010000u | ((c0 == 'B') ? (1u << 9) : 0);
+    return NULL;
+}
+
+static _kernel_oserror *encode_setpan(assemble_context_t *context, const mnemonic_entry_t *entry,
+                                       uint32_t cond, int s_flag,
+                                       const uint8_t *text, size_t length, size_t pos,
+                                       uint32_t *out_instr)
+{
+    int32_t value;
+    _kernel_oserror *error;
+
+    (void) entry; (void) cond; (void) s_flag;
+    error = expect_char(text, length, &pos, '#');
+    if (error != NULL) return error;
+    error = eval_numeric(context, text, length, &pos, &value);
+    if (error != NULL) return error;
+    error = check_trailing(text, length, pos);
+    if (error != NULL) return error;
+    if (value < 0 || value > 1)
+    {
+        return error_bad_immediate();
+    }
+
+    *out_instr = 0xF1010000u | ((uint32_t) value << 9);
+    return NULL;
+}
+
+/* DMB/DSB/ISB {option}. Only the common named options are matched;
+   the option defaults to SY (full system) if omitted. */
+static _kernel_oserror *encode_barrier(assemble_context_t *context, const mnemonic_entry_t *entry,
+                                        uint32_t cond, int s_flag,
+                                        const uint8_t *text, size_t length, size_t pos,
+                                        uint32_t *out_instr)
+{
+    static const uint32_t base[3] = { 0xF57FF050u, 0xF57FF040u, 0xF57FF060u };
+    static const char * const names[] = {
+        "OSHLD", "OSHST", "OSH", "NSHLD", "NSHST", "NSH", "ISHLD", "ISHST", "ISH", "LD", "ST", "SY"
+    };
+    static const uint32_t values[] = { 1, 2, 3, 5, 6, 7, 9, 10, 11, 13, 14, 15 };
+    uint32_t option = 15;
+    char token[8];
+    size_t i;
+
+    (void) context; (void) cond; (void) s_flag;
+    pos += assemble_skip_spaces(text + pos, length - pos);
+    if (pos < length)
+    {
+        size_t consumed = read_token(text + pos, length - pos, token);
+
+        if (consumed == 0)
+        {
+            return assemble_set_error(ASSEMBLE_CPU_ARM32, ASSEMBLE_ERROR_TYPE_SYNTAX, ASSEMBLE_ARM32_ERR_NONE,
+                                       "Expected a barrier option");
+        }
+        for (i = 0; i < sizeof(names) / sizeof(names[0]); i++)
+        {
+            if (strcmp(token, names[i]) == 0)
+            {
+                option = values[i];
+                break;
+            }
+        }
+        if (i == sizeof(names) / sizeof(names[0]))
+        {
+            return assemble_set_error(ASSEMBLE_CPU_ARM32, ASSEMBLE_ERROR_TYPE_SYNTAX, ASSEMBLE_ARM32_ERR_NONE,
+                                       "Unrecognised barrier option");
+        }
+        pos += consumed;
+    }
+    {
+        _kernel_oserror *error = check_trailing(text, length, pos);
+        if (error != NULL) return error;
+    }
+
+    *out_instr = base[entry->param1] | option;
+    return NULL;
+}
+
+static _kernel_oserror *encode_hint(assemble_context_t *context, const mnemonic_entry_t *entry,
+                                     uint32_t cond, int s_flag,
+                                     const uint8_t *text, size_t length, size_t pos,
+                                     uint32_t *out_instr)
+{
+    _kernel_oserror *error;
+
+    (void) context; (void) s_flag;
+    error = check_trailing(text, length, pos);
+    if (error != NULL) return error;
+    *out_instr = (cond << 28) | 0x0320F000u | entry->param1;
+    return NULL;
+}
+
+/* RFE{addr_mode} Rn{!} */
+static _kernel_oserror *encode_rfe(assemble_context_t *context, const mnemonic_entry_t *entry,
+                                    uint32_t cond, int s_flag,
+                                    const uint8_t *text, size_t length, size_t pos,
+                                    uint32_t *out_instr)
+{
+    uint32_t rn;
+    uint32_t w = 0;
+    _kernel_oserror *error;
+
+    (void) cond; (void) s_flag;
+    error = parse_register(context, text, length, &pos, &rn);
+    if (error != NULL) return error;
+    pos += assemble_skip_spaces(text + pos, length - pos);
+    if (pos < length && text[pos] == '!')
+    {
+        pos += 1;
+        w = 1;
+    }
+    error = check_trailing(text, length, pos);
+    if (error != NULL) return error;
+
+    *out_instr = 0xF8000A00u | (entry->param1 << 23) | (w << 21) | (rn << 16);
+    return NULL;
+}
+
+/* SRS{addr_mode} SP{!}, #mode */
+static _kernel_oserror *encode_srs(assemble_context_t *context, const mnemonic_entry_t *entry,
+                                    uint32_t cond, int s_flag,
+                                    const uint8_t *text, size_t length, size_t pos,
+                                    uint32_t *out_instr)
+{
+    uint32_t sp;
+    uint32_t w = 0;
+    int32_t mode;
+    _kernel_oserror *error;
+
+    (void) cond; (void) s_flag;
+    error = parse_register(context, text, length, &pos, &sp);
+    if (error != NULL) return error;
+    if (sp != 13)
+    {
+        return error_bad_register();
+    }
+    pos += assemble_skip_spaces(text + pos, length - pos);
+    if (pos < length && text[pos] == '!')
+    {
+        pos += 1;
+        w = 1;
+    }
+    error = expect_char(text, length, &pos, ',');
+    if (error != NULL) return error;
+    error = expect_char(text, length, &pos, '#');
+    if (error != NULL) return error;
+    error = eval_numeric(context, text, length, &pos, &mode);
+    if (error != NULL) return error;
+    error = check_trailing(text, length, pos);
+    if (error != NULL) return error;
+    if (mode < 0 || mode > 31)
+    {
+        return error_bad_immediate();
+    }
+
+    *out_instr = 0xF84D0500u | (entry->param1 << 23) | (w << 21) | (uint32_t) mode;
+    return NULL;
+}
+
+static _kernel_oserror *encode_bkpt(assemble_context_t *context, const mnemonic_entry_t *entry,
+                                     uint32_t cond, int s_flag,
+                                     const uint8_t *text, size_t length, size_t pos,
+                                     uint32_t *out_instr)
+{
+    int32_t value;
+    _kernel_oserror *error;
+
+    (void) entry; (void) s_flag;
+    error = eval_numeric(context, text, length, &pos, &value);
+    if (error != NULL) return error;
+    error = check_trailing(text, length, pos);
+    if (error != NULL) return error;
+    if (value < 0 || value > 0xFFFF)
+    {
+        return error_bad_immediate();
+    }
+
+    *out_instr = (cond << 28) | 0x01200070u | (((uint32_t) value & 0xFFF0u) << 4) | ((uint32_t) value & 0xFu);
+    return NULL;
+}
+
+/* HVC #imm16 (always unconditional); SMC #imm4 */
+static _kernel_oserror *encode_svc_hint(assemble_context_t *context, const mnemonic_entry_t *entry,
+                                         uint32_t cond, int s_flag,
+                                         const uint8_t *text, size_t length, size_t pos,
+                                         uint32_t *out_instr)
+{
+    int32_t value;
+    _kernel_oserror *error;
+
+    (void) s_flag;
+    error = eval_numeric(context, text, length, &pos, &value);
+    if (error != NULL) return error;
+    error = check_trailing(text, length, pos);
+    if (error != NULL) return error;
+
+    if (entry->param1 == 0) /* HVC */
+    {
+        if (value < 0 || value > 0xFFFF) return error_bad_immediate();
+        *out_instr = (cond << 28) | 0x01400070u | (((uint32_t) value & 0xFFF0u) << 4) | ((uint32_t) value & 0xFu);
+    }
+    else /* SMC */
+    {
+        if (value < 0 || value > 0xF) return error_bad_immediate();
+        *out_instr = (cond << 28) | 0x01600070u | (uint32_t) value;
+    }
+    return NULL;
+}
+
+static _kernel_oserror *encode_eret(assemble_context_t *context, const mnemonic_entry_t *entry,
+                                     uint32_t cond, int s_flag,
+                                     const uint8_t *text, size_t length, size_t pos,
+                                     uint32_t *out_instr)
+{
+    _kernel_oserror *error;
+
+    (void) context; (void) entry; (void) s_flag;
+    error = check_trailing(text, length, pos);
+    if (error != NULL) return error;
+    *out_instr = (cond << 28) | 0x0160006Eu;
+    return NULL;
+}
+
+static _kernel_oserror *encode_hlt(assemble_context_t *context, const mnemonic_entry_t *entry,
+                                    uint32_t cond, int s_flag,
+                                    const uint8_t *text, size_t length, size_t pos,
+                                    uint32_t *out_instr)
+{
+    int32_t value;
+    _kernel_oserror *error;
+
+    (void) entry; (void) s_flag;
+    error = eval_numeric(context, text, length, &pos, &value);
+    if (error != NULL) return error;
+    error = check_trailing(text, length, pos);
+    if (error != NULL) return error;
+    if (value < 0 || value > 0xFFFF)
+    {
+        return error_bad_immediate();
+    }
+
+    *out_instr = (cond << 28) | 0x01000070u | (((uint32_t) value & 0xFFF0u) << 4) | ((uint32_t) value & 0xFu);
+    return NULL;
+}
+
+/* CRC32{B|H|W}, CRC32C{B|H|W} Rd,Rn,Rm. Always unconditional. */
+static _kernel_oserror *encode_crc32(assemble_context_t *context, const mnemonic_entry_t *entry,
+                                      uint32_t cond, int s_flag,
+                                      const uint8_t *text, size_t length, size_t pos,
+                                      uint32_t *out_instr)
+{
+    uint32_t rd, rn, rm;
+    uint32_t sz = entry->param1 & 3u;
+    uint32_t c = (entry->param1 & 4u) ? 1u : 0u;
+    _kernel_oserror *error;
+
+    (void) cond; (void) s_flag;
+    error = parse_register(context, text, length, &pos, &rd);
+    if (error != NULL) return error;
+    error = expect_char(text, length, &pos, ',');
+    if (error != NULL) return error;
+    error = parse_register(context, text, length, &pos, &rn);
+    if (error != NULL) return error;
+    error = expect_char(text, length, &pos, ',');
+    if (error != NULL) return error;
+    error = parse_register(context, text, length, &pos, &rm);
+    if (error != NULL) return error;
+    error = check_trailing(text, length, pos);
+    if (error != NULL) return error;
+
+    *out_instr = 0xF1000040u | (sz << 21) | (c << 9) | (rn << 16) | (rd << 12) | rm;
+    return NULL;
+}
+
+static _kernel_oserror *encode_barrier_noop(assemble_context_t *context, const mnemonic_entry_t *entry,
+                                             uint32_t cond, int s_flag,
+                                             const uint8_t *text, size_t length, size_t pos,
+                                             uint32_t *out_instr)
+{
+    _kernel_oserror *error;
+
+    (void) context; (void) cond; (void) s_flag;
+    error = check_trailing(text, length, pos);
+    if (error != NULL) return error;
+    *out_instr = entry->param1 ? 0xF57FF044u : 0xF57FF040u;
+    return NULL;
+}
+
+/* PKHBT Rd,Rn,Rm{,LSL #imm(0-31)}; PKHTB Rd,Rn,Rm{,ASR #imm(1-32, 32
+   encoded as 0)}. */
+static _kernel_oserror *encode_pkh(assemble_context_t *context, const mnemonic_entry_t *entry,
+                                    uint32_t cond, int s_flag,
+                                    const uint8_t *text, size_t length, size_t pos,
+                                    uint32_t *out_instr)
+{
+    uint32_t rd, rn, rm;
+    uint32_t imm5 = 0;
+    int is_tb = (int) entry->param1;
+    _kernel_oserror *error;
+
+    (void) s_flag;
+    error = parse_register(context, text, length, &pos, &rd);
+    if (error != NULL) return error;
+    error = expect_char(text, length, &pos, ',');
+    if (error != NULL) return error;
+    error = parse_register(context, text, length, &pos, &rn);
+    if (error != NULL) return error;
+    error = expect_char(text, length, &pos, ',');
+    if (error != NULL) return error;
+    error = parse_register(context, text, length, &pos, &rm);
+    if (error != NULL) return error;
+    pos += assemble_skip_spaces(text + pos, length - pos);
+    if (pos < length && text[pos] == ',')
+    {
+        char c0, c1, c2;
+        int32_t shift_amount;
+
+        pos += 1;
+        pos += assemble_skip_spaces(text + pos, length - pos);
+        c0 = (pos < length) ? (char) toupper((int) text[pos]) : 0;
+        c1 = (pos + 1 < length) ? (char) toupper((int) text[pos + 1]) : 0;
+        c2 = (pos + 2 < length) ? (char) toupper((int) text[pos + 2]) : 0;
+        if (!is_tb && c0 == 'L' && c1 == 'S' && c2 == 'L')
+        {
+            pos += 3;
+            error = expect_char(text, length, &pos, '#');
+            if (error != NULL) return error;
+            error = eval_numeric(context, text, length, &pos, &shift_amount);
+            if (error != NULL) return error;
+            if (shift_amount < 0 || shift_amount > 31) return error_bad_shift();
+            imm5 = (uint32_t) shift_amount;
+        }
+        else if (is_tb && c0 == 'A' && c1 == 'S' && c2 == 'R')
+        {
+            pos += 3;
+            error = expect_char(text, length, &pos, '#');
+            if (error != NULL) return error;
+            error = eval_numeric(context, text, length, &pos, &shift_amount);
+            if (error != NULL) return error;
+            if (shift_amount < 1 || shift_amount > 32) return error_bad_shift();
+            imm5 = (shift_amount == 32) ? 0 : (uint32_t) shift_amount;
+        }
+        else
+        {
+            return error_bad_shift();
+        }
+    }
+    error = check_trailing(text, length, pos);
+    if (error != NULL) return error;
+
+    *out_instr = (cond << 28) | 0x06800010u | (is_tb ? (1u << 6) : 0) |
+                 (rn << 16) | (rd << 12) | (imm5 << 7) | rm;
+    return NULL;
+}
+
+/* SXTB/SXTH/SXTB16/UXTB/UXTH/UXTB16 Rd,Rm{,ROR #rotation(0/8/16/24)} */
+static _kernel_oserror *encode_sxt_uxt(assemble_context_t *context, const mnemonic_entry_t *entry,
+                                        uint32_t cond, int s_flag,
+                                        const uint8_t *text, size_t length, size_t pos,
+                                        uint32_t *out_instr)
+{
+    static const uint32_t base[6] = { 0x06AF0070u, 0x06BF0070u, 0x068F0070u, 0x06EF0070u, 0x06FF0070u, 0x06CF0070u };
+    uint32_t rd, rm;
+    uint32_t rotate2 = 0;
+    _kernel_oserror *error;
+
+    (void) s_flag;
+    error = parse_register(context, text, length, &pos, &rd);
+    if (error != NULL) return error;
+    error = expect_char(text, length, &pos, ',');
+    if (error != NULL) return error;
+    error = parse_register(context, text, length, &pos, &rm);
+    if (error != NULL) return error;
+    pos += assemble_skip_spaces(text + pos, length - pos);
+    if (pos < length && text[pos] == ',')
+    {
+        char c0, c1, c2;
+        int32_t rotation;
+
+        pos += 1;
+        pos += assemble_skip_spaces(text + pos, length - pos);
+        c0 = (pos < length) ? (char) toupper((int) text[pos]) : 0;
+        c1 = (pos + 1 < length) ? (char) toupper((int) text[pos + 1]) : 0;
+        c2 = (pos + 2 < length) ? (char) toupper((int) text[pos + 2]) : 0;
+        if (c0 != 'R' || c1 != 'O' || c2 != 'R')
+        {
+            return error_bad_shift();
+        }
+        pos += 3;
+        error = expect_char(text, length, &pos, '#');
+        if (error != NULL) return error;
+        error = eval_numeric(context, text, length, &pos, &rotation);
+        if (error != NULL) return error;
+        if (rotation != 0 && rotation != 8 && rotation != 16 && rotation != 24)
+        {
+            return error_bad_shift();
+        }
+        rotate2 = (uint32_t) rotation / 8u;
+    }
+    error = check_trailing(text, length, pos);
+    if (error != NULL) return error;
+
+    *out_instr = (cond << 28) | base[entry->param1] | (rd << 12) | (rotate2 << 10) | rm;
+    return NULL;
+}
+
+/* SXTAB/SXTAH/SXTAB16/UXTAB/UXTAH/UXTAB16 Rd,Rn,Rm{,ROR #rotation} */
+static _kernel_oserror *encode_sxt_uxt_a(assemble_context_t *context, const mnemonic_entry_t *entry,
+                                          uint32_t cond, int s_flag,
+                                          const uint8_t *text, size_t length, size_t pos,
+                                          uint32_t *out_instr)
+{
+    static const uint32_t base[6] = { 0x06A00070u, 0x06B00070u, 0x06800070u, 0x06E00070u, 0x06F00070u, 0x06C00070u };
+    uint32_t rd, rn, rm;
+    uint32_t rotate2 = 0;
+    _kernel_oserror *error;
+
+    (void) s_flag;
+    error = parse_register(context, text, length, &pos, &rd);
+    if (error != NULL) return error;
+    error = expect_char(text, length, &pos, ',');
+    if (error != NULL) return error;
+    error = parse_register(context, text, length, &pos, &rn);
+    if (error != NULL) return error;
+    error = expect_char(text, length, &pos, ',');
+    if (error != NULL) return error;
+    error = parse_register(context, text, length, &pos, &rm);
+    if (error != NULL) return error;
+    pos += assemble_skip_spaces(text + pos, length - pos);
+    if (pos < length && text[pos] == ',')
+    {
+        char c0, c1, c2;
+        int32_t rotation;
+
+        pos += 1;
+        pos += assemble_skip_spaces(text + pos, length - pos);
+        c0 = (pos < length) ? (char) toupper((int) text[pos]) : 0;
+        c1 = (pos + 1 < length) ? (char) toupper((int) text[pos + 1]) : 0;
+        c2 = (pos + 2 < length) ? (char) toupper((int) text[pos + 2]) : 0;
+        if (c0 != 'R' || c1 != 'O' || c2 != 'R')
+        {
+            return error_bad_shift();
+        }
+        pos += 3;
+        error = expect_char(text, length, &pos, '#');
+        if (error != NULL) return error;
+        error = eval_numeric(context, text, length, &pos, &rotation);
+        if (error != NULL) return error;
+        if (rotation != 0 && rotation != 8 && rotation != 16 && rotation != 24)
+        {
+            return error_bad_shift();
+        }
+        rotate2 = (uint32_t) rotation / 8u;
+    }
+    error = check_trailing(text, length, pos);
+    if (error != NULL) return error;
+
+    *out_instr = (cond << 28) | base[entry->param1] | (rn << 16) | (rd << 12) | (rotate2 << 10) | rm;
+    return NULL;
+}
+
+static _kernel_oserror *error_bad_psr_field(void)
+{
+    return assemble_set_error(ASSEMBLE_CPU_ARM32, ASSEMBLE_ERROR_TYPE_BAD_OPERAND, ASSEMBLE_ARM32_ERR_BAD_PSR_FIELD,
+                               "Bad PSR name or field mask");
+}
+
+/* MSR <psr>_<fields>, #imm | Rm. <psr> is CPSR or SPSR; <fields> is
+   1-4 of 'c' (control), 'x' (extension), 's' (status), 'f' (flags).
+   The banked-register form (eg 'MSR R0_usr, Rn') is not implemented
+   -- a documented gap, see the mnemonic table comment above. */
+static _kernel_oserror *encode_msr(assemble_context_t *context, const mnemonic_entry_t *entry,
+                                    uint32_t cond, int s_flag,
+                                    const uint8_t *text, size_t length, size_t pos,
+                                    uint32_t *out_instr)
+{
+    char c0, c1, c2;
+    uint32_t r_bit;
+    uint32_t mask = 0;
+    _kernel_oserror *error;
+
+    (void) entry; (void) s_flag;
+    pos += assemble_skip_spaces(text + pos, length - pos);
+    c0 = (pos < length) ? (char) toupper((int) text[pos]) : 0;
+    c1 = (pos + 1 < length) ? (char) toupper((int) text[pos + 1]) : 0;
+    c2 = (pos + 2 < length) ? (char) toupper((int) text[pos + 2]) : 0;
+    if (c0 == 'C' && c1 == 'P' && c2 == 'S' && pos + 3 < length && toupper((int) text[pos + 3]) == 'R')
+    {
+        r_bit = 0;
+        pos += 4;
+    }
+    else if (c0 == 'S' && c1 == 'P' && c2 == 'S' && pos + 3 < length && toupper((int) text[pos + 3]) == 'R')
+    {
+        r_bit = 1;
+        pos += 4;
+    }
+    else
+    {
+        return error_bad_psr_field();
+    }
+    if (pos < length && text[pos] == '_')
+    {
+        pos += 1;
+        while (pos < length)
+        {
+            char ch = (char) toupper((int) text[pos]);
+
+            if (ch == 'C') mask |= 1u;
+            else if (ch == 'X') mask |= 2u;
+            else if (ch == 'S') mask |= 4u;
+            else if (ch == 'F') mask |= 8u;
+            else break;
+            pos += 1;
+        }
+        if (mask == 0)
+        {
+            return error_bad_psr_field();
+        }
+    }
+    else
+    {
+        mask = 8u; /* bare CPSR/SPSR means the flags field, matching common usage */
+    }
+    error = expect_char(text, length, &pos, ',');
+    if (error != NULL) return error;
+    pos += assemble_skip_spaces(text + pos, length - pos);
+    if (pos < length && text[pos] == '#')
+    {
+        int32_t value;
+        uint32_t encoded;
+
+        pos += 1;
+        error = eval_numeric(context, text, length, &pos, &value);
+        if (error != NULL) return error;
+        if (!encode_dp_immediate((uint32_t) value, &encoded))
+        {
+            return error_bad_immediate();
+        }
+        error = check_trailing(text, length, pos);
+        if (error != NULL) return error;
+        *out_instr = (cond << 28) | 0x0320F000u | (r_bit << 22) | (mask << 16) | encoded;
+    }
+    else
+    {
+        uint32_t rm;
+
+        error = parse_register(context, text, length, &pos, &rm);
+        if (error != NULL) return error;
+        error = check_trailing(text, length, pos);
+        if (error != NULL) return error;
+        *out_instr = (cond << 28) | 0x0120F000u | (r_bit << 22) | (mask << 16) | rm;
+    }
+    return NULL;
+}
+
+/* MRS Rd, <psr> (CPSR or SPSR, no field mask). The banked-register
+   form is not implemented -- see the mnemonic table comment above. */
+static _kernel_oserror *encode_mrs(assemble_context_t *context, const mnemonic_entry_t *entry,
+                                    uint32_t cond, int s_flag,
+                                    const uint8_t *text, size_t length, size_t pos,
+                                    uint32_t *out_instr)
+{
+    uint32_t rd;
+    char c0, c1, c2, c3;
+    uint32_t r_bit;
+    _kernel_oserror *error;
+
+    (void) entry; (void) s_flag;
+    error = parse_register(context, text, length, &pos, &rd);
+    if (error != NULL) return error;
+    error = expect_char(text, length, &pos, ',');
+    if (error != NULL) return error;
+    pos += assemble_skip_spaces(text + pos, length - pos);
+    c0 = (pos < length) ? (char) toupper((int) text[pos]) : 0;
+    c1 = (pos + 1 < length) ? (char) toupper((int) text[pos + 1]) : 0;
+    c2 = (pos + 2 < length) ? (char) toupper((int) text[pos + 2]) : 0;
+    c3 = (pos + 3 < length) ? (char) toupper((int) text[pos + 3]) : 0;
+    if (c0 == 'C' && c1 == 'P' && c2 == 'S' && c3 == 'R')
+    {
+        r_bit = 0;
+    }
+    else if (c0 == 'S' && c1 == 'P' && c2 == 'S' && c3 == 'R')
+    {
+        r_bit = 1;
+    }
+    else
+    {
+        return error_bad_psr_field();
+    }
+    pos += 4;
+    error = check_trailing(text, length, pos);
+    if (error != NULL) return error;
+
+    *out_instr = (cond << 28) | 0x010F0000u | (r_bit << 22) | (rd << 12);
+    return NULL;
+}
+
+/* PUSH {list} == STMDB SP!,{list}; POP {list} == LDMIA SP!,{list}.
+   (Real LDM/STM are handled separately, before generic mnemonic
+   dispatch -- see handle_ldm_stm.) */
+static _kernel_oserror *encode_push_pop(assemble_context_t *context, const mnemonic_entry_t *entry,
+                                         uint32_t cond, int s_flag,
+                                         const uint8_t *text, size_t length, size_t pos,
+                                         uint32_t *out_instr)
+{
+    uint32_t mask;
+    int caret;
+    _kernel_oserror *error;
+
+    (void) s_flag;
+    error = parse_register_list(context, text, length, &pos, &mask, &caret);
+    if (error != NULL) return error;
+    if (caret)
+    {
+        return error_bad_register_list("'^' is not permitted with PUSH/POP");
+    }
+    error = check_trailing(text, length, pos);
+    if (error != NULL) return error;
+
+    *out_instr = (cond << 28) | (entry->param1 ? 0x092D0000u : 0x08BD0000u) | mask;
+    return NULL;
+}
+
+/* ---------------------------------------------------------------
+ * LDR/STR: uniquely among ARM mnemonics, the size/sign suffix is
+ * written *after* the condition code (eg "LDREQB", not "LDRBEQ"),
+ * so this is parsed directly rather than through the generic
+ * mnemonic table.
+ * --------------------------------------------------------------- */
+
+/*******************************************************************
+ Function:      handle_ldr_str
+ Description:   Parses and encodes a full LDR/STR-family instruction,
+                starting just after the matched "LDR"/"STR" root.
+ Parameters:    context = the assembly context
+                text/length = full source text
+                pos_inout = [[inout]] position, just after "LDR"/"STR"
+                is_str = non-zero for STR, zero for LDR
+                out_instr = [[out]] the completed instruction word
+ Returns:       NULL if successful, otherwise a static error block
+ ******************************************************************/
+static _kernel_oserror *handle_ldr_str(assemble_context_t *context,
+                                        const uint8_t *text, size_t length, size_t *pos_inout,
+                                        int is_str, uint32_t *out_instr)
+{
+    size_t pos = *pos_inout;
+    uint32_t cond = COND_AL;
+    uint8_t c0, c1;
+    uint32_t rd;
+    uint32_t bits = 0;
+    int cls = LDST_CLASS_NORMAL;
+    _kernel_oserror *error;
+
+    if (match_condition(text + pos, length - pos, &cond))
+    {
+        pos += 2;
+    }
+    else
+    {
+        cond = COND_AL;
+    }
+
+    c0 = (pos < length) ? (uint8_t) toupper((int) text[pos]) : 0;
+    c1 = (pos + 1 < length) ? (uint8_t) toupper((int) text[pos + 1]) : 0;
+
+    if (c0 == 'B' && !continues_identifier(text, length, pos + 1))
+    {
+        bits |= (1u << 22);
+        pos += 1;
+    }
+    else if (c0 == 'B' && c1 == 'T')
+    {
+        bits |= (1u << 22) | (1u << 21); /* B + T (unprivileged) */
+        pos += 2;
+    }
+    else if (c0 == 'T' && !continues_identifier(text, length, pos + 1))
+    {
+        bits |= (1u << 21); /* T (unprivileged), word-sized */
+        pos += 1;
+    }
+    else if (c0 == 'H')
+    {
+        cls = LDST_CLASS_EXTRA;
+        bits |= 0xB0u;
+        pos += 1;
+    }
+    else if (c0 == 'S' && c1 == 'B')
+    {
+        if (is_str)
+        {
+            return assemble_set_error(ASSEMBLE_CPU_ARM32, ASSEMBLE_ERROR_TYPE_UNSUPPORTED_ON_VARIANT,
+                                       ASSEMBLE_ARM32_ERR_NONE, "STRSB does not exist");
+        }
+        cls = LDST_CLASS_EXTRA;
+        bits |= 0xD0u | (1u << 20);
+        pos += 2;
+    }
+    else if (c0 == 'S' && c1 == 'H')
+    {
+        if (is_str)
+        {
+            return assemble_set_error(ASSEMBLE_CPU_ARM32, ASSEMBLE_ERROR_TYPE_UNSUPPORTED_ON_VARIANT,
+                                       ASSEMBLE_ARM32_ERR_NONE, "STRSH does not exist");
+        }
+        cls = LDST_CLASS_EXTRA;
+        bits |= 0xF0u | (1u << 20);
+        pos += 2;
+    }
+    else if (c0 == 'D')
+    {
+        cls = LDST_CLASS_EXTRA;
+        bits |= is_str ? 0xF0u : 0xD0u; /* bit20 (L) stays 0 for LDRD/STRD */
+        pos += 1;
+    }
+
+    if (cls == LDST_CLASS_NORMAL && !is_str)
+    {
+        bits |= (1u << 20); /* L: LDR word/byte */
+    }
+    else if (cls == LDST_CLASS_EXTRA && (bits & 0xF0u) == 0xB0u && !is_str)
+    {
+        bits |= (1u << 20); /* L: LDRH (STRH already has L=0 by default) */
+    }
+
+    error = parse_register(context, text, length, &pos, &rd);
+    if (error != NULL) return error;
+    error = expect_char(text, length, &pos, ',');
+    if (error != NULL) return error;
+    error = parse_ldr_str_address(context, text, length, &pos, cls, &bits);
+    if (error != NULL) return error;
+    error = check_trailing(text, length, pos);
+    if (error != NULL) return error;
+
+    if (cls == LDST_CLASS_NORMAL)
+    {
+        *out_instr = (cond << 28) | 0x04000000u | bits | (rd << 12);
+    }
+    else
+    {
+        *out_instr = (cond << 28) | 0x00000090u | bits | (rd << 12);
+    }
+    *pos_inout = pos;
+    return NULL;
+}
+
+/* ---------------------------------------------------------------
+ * LDM/STM: also has its addressing-mode suffix written after the
+ * condition code (eg "LDMEQFD", not "LDMFDEQ"), and unlike LDR/STR
+ * the suffix is mandatory. The FD/FA/EA/ED stack aliases mean a
+ * different P/U combination for LDM than for STM.
+ * --------------------------------------------------------------- */
+
+typedef struct ldm_stm_suffix_entry
+{
+    const char *name;
+    uint32_t    ldm_pu;   /* (P<<1)|U when used with LDM */
+    uint32_t    stm_pu;   /* (P<<1)|U when used with STM */
+} ldm_stm_suffix_entry_t;
+
+static const ldm_stm_suffix_entry_t ldm_stm_suffixes[] = {
+    { "IA", 1, 1 }, { "IB", 3, 3 }, { "DA", 0, 0 }, { "DB", 2, 2 },
+    { "FD", 1, 2 }, { "FA", 0, 3 }, { "EA", 2, 1 }, { "ED", 3, 0 }
+};
+#define NUM_LDM_STM_SUFFIXES (sizeof(ldm_stm_suffixes) / sizeof(ldm_stm_suffixes[0]))
+
+/*******************************************************************
+ Function:      handle_ldm_stm
+ Description:   Parses and encodes a full LDM/STM instruction,
+                starting just after the matched "LDM"/"STM" root.
+ Parameters:    context = the assembly context
+                text/length = full source text
+                pos_inout = [[inout]] position, just after "LDM"/"STM"
+                is_stm = non-zero for STM, zero for LDM
+                out_instr = [[out]] the completed instruction word
+ Returns:       NULL if successful, otherwise a static error block
+ ******************************************************************/
+static _kernel_oserror *handle_ldm_stm(assemble_context_t *context,
+                                        const uint8_t *text, size_t length, size_t *pos_inout,
+                                        int is_stm, uint32_t *out_instr)
+{
+    size_t pos = *pos_inout;
+    uint32_t cond = COND_AL;
+    char c0, c1;
+    uint32_t pu = 0xFFFFFFFFu;
+    uint32_t rn, mask;
+    int caret;
+    size_t i;
+    _kernel_oserror *error;
+
+    if (match_condition(text + pos, length - pos, &cond))
+    {
+        pos += 2;
+    }
+    else
+    {
+        cond = COND_AL;
+    }
+
+    c0 = (pos < length) ? (char) toupper((int) text[pos]) : 0;
+    c1 = (pos + 1 < length) ? (char) toupper((int) text[pos + 1]) : 0;
+    for (i = 0; i < NUM_LDM_STM_SUFFIXES; i++)
+    {
+        if (c0 == ldm_stm_suffixes[i].name[0] && c1 == ldm_stm_suffixes[i].name[1])
+        {
+            pu = is_stm ? ldm_stm_suffixes[i].stm_pu : ldm_stm_suffixes[i].ldm_pu;
+            pos += 2;
+            break;
+        }
+    }
+    if (pu == 0xFFFFFFFFu)
+    {
+        return assemble_set_error(ASSEMBLE_CPU_ARM32, ASSEMBLE_ERROR_TYPE_SYNTAX, ASSEMBLE_ARM32_ERR_NONE,
+                                   "Expected an addressing mode (IA/IB/DA/DB/FD/FA/EA/ED)");
+    }
+
+    error = parse_register(context, text, length, &pos, &rn);
+    if (error != NULL) return error;
+    pos += assemble_skip_spaces(text + pos, length - pos);
+    {
+        uint32_t w = 0;
+
+        if (pos < length && text[pos] == '!')
+        {
+            w = 1;
+            pos += 1;
+        }
+        error = expect_char(text, length, &pos, ',');
+        if (error != NULL) return error;
+        error = parse_register_list(context, text, length, &pos, &mask, &caret);
+        if (error != NULL) return error;
+        error = check_trailing(text, length, pos);
+        if (error != NULL) return error;
+
+        *out_instr = (cond << 28) | 0x08000000u | (pu << 23) | (caret ? (1u << 22) : 0) | (w << 21) |
+                     (is_stm ? 0 : (1u << 20)) | (rn << 16) | mask;
+    }
+    *pos_inout = pos;
+    return NULL;
+}
+
+/* SWP{B} Rd,Rm,[Rn] -- also has its 'B' suffix after the condition. */
+static _kernel_oserror *handle_swp(assemble_context_t *context,
+                                    const uint8_t *text, size_t length, size_t *pos_inout,
+                                    uint32_t *out_instr)
+{
+    size_t pos = *pos_inout;
+    uint32_t cond = COND_AL;
+    uint32_t b_bit = 0;
+    uint32_t rd, rm, rn;
+    _kernel_oserror *error;
+
+    if (match_condition(text + pos, length - pos, &cond))
+    {
+        pos += 2;
+    }
+    if (pos < length && toupper((int) text[pos]) == 'B' && !continues_identifier(text, length, pos + 1))
+    {
+        b_bit = 1;
+        pos += 1;
+    }
+
+    error = parse_register(context, text, length, &pos, &rd);
+    if (error != NULL) return error;
+    error = expect_char(text, length, &pos, ',');
+    if (error != NULL) return error;
+    error = parse_register(context, text, length, &pos, &rm);
+    if (error != NULL) return error;
+    error = expect_char(text, length, &pos, ',');
+    if (error != NULL) return error;
+    error = parse_bracketed_register(context, text, length, &pos, &rn);
+    if (error != NULL) return error;
+    error = check_trailing(text, length, pos);
+    if (error != NULL) return error;
+
+    *out_instr = (cond << 28) | 0x01000090u | (b_bit << 22) | (rn << 16) | (rd << 12) | rm;
+    *pos_inout = pos;
+    return NULL;
+}
+
+/* UMULL/UMLAL/SMULL/SMLAL RdLo,RdHi,Rm,Rs -- the "LL"/"LA" suffix
+   comes after the condition code, spelling eg "UMULEQLL". */
+static _kernel_oserror *handle_long_multiply(assemble_context_t *context,
+                                              const uint8_t *text, size_t length, size_t *pos_inout,
+                                              int is_signed, uint32_t *out_instr)
+{
+    size_t pos = *pos_inout;
+    uint32_t cond = COND_AL;
+    char c0, c1;
+    int is_accumulate;
+    uint32_t rdlo, rdhi, rm, rs;
+    int s_flag = 0;
+    _kernel_oserror *error;
+
+    if (match_condition(text + pos, length - pos, &cond))
+    {
+        pos += 2;
+    }
+    c0 = (pos < length) ? (char) toupper((int) text[pos]) : 0;
+    c1 = (pos + 1 < length) ? (char) toupper((int) text[pos + 1]) : 0;
+    if (c0 == 'L' && c1 == 'L')
+    {
+        is_accumulate = 0;
+    }
+    else if (c0 == 'L' && c1 == 'A')
+    {
+        is_accumulate = 1;
+    }
+    else
+    {
+        return error_bad_mnemonic();
+    }
+    pos += 2;
+    if (pos < length && toupper((int) text[pos]) == 'S' && !continues_identifier(text, length, pos + 1))
+    {
+        s_flag = 1;
+        pos += 1;
+    }
+
+    error = parse_register(context, text, length, &pos, &rdlo);
+    if (error != NULL) return error;
+    error = expect_char(text, length, &pos, ',');
+    if (error != NULL) return error;
+    error = parse_register(context, text, length, &pos, &rdhi);
+    if (error != NULL) return error;
+    error = expect_char(text, length, &pos, ',');
+    if (error != NULL) return error;
+    error = parse_register(context, text, length, &pos, &rm);
+    if (error != NULL) return error;
+    error = expect_char(text, length, &pos, ',');
+    if (error != NULL) return error;
+    error = parse_register(context, text, length, &pos, &rs);
+    if (error != NULL) return error;
+    error = check_trailing(text, length, pos);
+    if (error != NULL) return error;
+    if (rdlo == rdhi || rdlo == rm || rdhi == rm)
+    {
+        return error_duplicate_register();
+    }
+
+    *out_instr = (cond << 28) | 0x00800090u | (is_signed ? (1u << 22) : 0) | (is_accumulate ? (1u << 21) : 0) |
+                 (s_flag ? (1u << 20) : 0) | (rdhi << 16) | (rdlo << 12) | (rs << 8) | rm;
+    *pos_inout = pos;
+    return NULL;
+}
+
+/* ---------------------------------------------------------------
+ * Generic coprocessor instructions: CDP{2}, MCR{2}, MRC{2}, LDC{2},
+ * STC{2}. The '2' (force-unconditional) and, for LDC/STC, 'L' (long
+ * transfer) markers both come after the condition code, same pattern
+ * as LDR/STR. MRRC/MCRR are a documented gap (see the mnemonic table
+ * comment above), not handled here.
+ * --------------------------------------------------------------- */
+
+#define COPROC_CDP 0
+#define COPROC_MCR 1
+#define COPROC_MRC 2
+#define COPROC_LDC 3
+#define COPROC_STC 4
+
+static _kernel_oserror *error_bad_coprocessor_field(void)
+{
+    return assemble_set_error(ASSEMBLE_CPU_ARM32, ASSEMBLE_ERROR_TYPE_RANGE, ASSEMBLE_ARM32_ERR_BAD_COPROCESSOR_FIELD,
+                               "Bad coprocessor field");
+}
+
+/*******************************************************************
+ Function:      parse_coproc_number
+ Description:   Parses a coprocessor number, either 'CPn' or 'Cn'/
+                'pn' (0-15), or a plain expression.
+ ******************************************************************/
+static _kernel_oserror *parse_coproc_number(assemble_context_t *context,
+                                             const uint8_t *text, size_t length,
+                                             size_t *pos_inout, uint32_t *out_num)
+{
+    size_t pos = *pos_inout;
+    uint8_t c0, c1;
+    int32_t value;
+    _kernel_oserror *error;
+
+    pos += assemble_skip_spaces(text + pos, length - pos);
+    c0 = (pos < length) ? (uint8_t) toupper((int) text[pos]) : 0;
+    c1 = (pos + 1 < length) ? (uint8_t) toupper((int) text[pos + 1]) : 0;
+    if (c0 == 'C' && c1 == 'P' && pos + 2 < length && text[pos + 2] >= '0' && text[pos + 2] <= '9')
+    {
+        pos += 2;
+    }
+    else if (c0 == 'P' && pos + 1 < length && text[pos + 1] >= '0' && text[pos + 1] <= '9')
+    {
+        pos += 1;
+    }
+    *pos_inout = pos;
+    error = eval_numeric(context, text, length, pos_inout, &value);
+    if (error != NULL) return error;
+    if (value < 0 || value > 15)
+    {
+        return error_bad_coprocessor_field();
+    }
+    *out_num = (uint32_t) value;
+    return NULL;
+}
+
+/* Cn/CRn register (0-15), matching CHKCPREG in the original. */
+static _kernel_oserror *parse_cp_register(assemble_context_t *context,
+                                           const uint8_t *text, size_t length,
+                                           size_t *pos_inout, uint32_t *out_num)
+{
+    size_t pos = *pos_inout;
+    uint8_t c0;
+    int32_t value;
+    _kernel_oserror *error;
+
+    pos += assemble_skip_spaces(text + pos, length - pos);
+    c0 = (pos < length) ? (uint8_t) toupper((int) text[pos]) : 0;
+    if ((c0 == 'C' || c0 == 'R') && pos + 1 < length && text[pos + 1] >= '0' && text[pos + 1] <= '9')
+    {
+        pos += 1;
+    }
+    *pos_inout = pos;
+    error = eval_numeric(context, text, length, pos_inout, &value);
+    if (error != NULL) return error;
+    if (value < 0 || value > 15)
+    {
+        return error_bad_coprocessor_field();
+    }
+    *out_num = (uint32_t) value;
+    return NULL;
+}
+
+/*******************************************************************
+ Function:      handle_coprocessor
+ Description:   Parses and encodes CDP{2}/MCR{2}/MRC{2}/LDC{2}/STC{2},
+                starting just after the matched 3-character root.
+ ******************************************************************/
+static _kernel_oserror *handle_coprocessor(assemble_context_t *context,
+                                            const uint8_t *text, size_t length, size_t *pos_inout,
+                                            int kind, uint32_t *out_instr)
+{
+    size_t pos = *pos_inout;
+    uint32_t cond = COND_AL;
+    uint32_t coproc, crd_or_rd, crn, crm;
+    int32_t opcode1, opcode2 = 0;
+    _kernel_oserror *error;
+
+    if (match_condition(text + pos, length - pos, &cond))
+    {
+        pos += 2;
+    }
+    if (pos < length && text[pos] == '2')
+    {
+        cond = COND_NV;
+        pos += 1;
+    }
+
+    if (kind == COPROC_LDC || kind == COPROC_STC)
+    {
+        uint32_t n_bit = 0;
+        uint32_t l_bit = (kind == COPROC_LDC) ? 1u : 0u;
+        uint32_t bits = 0;
+
+        if (pos < length && toupper((int) text[pos]) == 'L')
+        {
+            n_bit = 1;
+            pos += 1;
+        }
+        error = parse_coproc_number(context, text, length, &pos, &coproc);
+        if (error != NULL) return error;
+        error = expect_char(text, length, &pos, ',');
+        if (error != NULL) return error;
+        error = parse_cp_register(context, text, length, &pos, &crd_or_rd);
+        if (error != NULL) return error;
+        error = expect_char(text, length, &pos, ',');
+        if (error != NULL) return error;
+
+        error = expect_char(text, length, &pos, '[');
+        if (error != NULL) return error;
+        {
+            uint32_t rn;
+
+            error = parse_register(context, text, length, &pos, &rn);
+            if (error != NULL) return error;
+            bits |= rn << 16;
+        }
+        pos += assemble_skip_spaces(text + pos, length - pos);
+        if (pos < length && text[pos] == ']')
+        {
+            pos += 1;
+            bits |= (1u << 23); /* U */
+            pos += assemble_skip_spaces(text + pos, length - pos);
+            if (pos < length && text[pos] == ',')
+            {
+                int32_t value;
+
+                pos += 1;
+                error = expect_char(text, length, &pos, '#');
+                if (error != NULL) return error;
+                error = eval_numeric(context, text, length, &pos, &value);
+                if (error != NULL) return error;
+                if (value < 0) { bits &= ~(1u << 23); value = -value; }
+                if ((value & 3) != 0 || value > 0x3FC) return error_bad_offset();
+                bits |= (uint32_t) (value >> 2);
+            }
+        }
+        else
+        {
+            int32_t value;
+
+            bits |= (1u << 24); /* P */
+            bits |= (1u << 23); /* U */
+            error = expect_char(text, length, &pos, ',');
+            if (error != NULL) return error;
+            error = expect_char(text, length, &pos, '#');
+            if (error != NULL) return error;
+            error = eval_numeric(context, text, length, &pos, &value);
+            if (error != NULL) return error;
+            if (value < 0) { bits &= ~(1u << 23); value = -value; }
+            if ((value & 3) != 0 || value > 0x3FC) return error_bad_offset();
+            bits |= (uint32_t) (value >> 2);
+            error = expect_char(text, length, &pos, ']');
+            if (error != NULL) return error;
+            pos += assemble_skip_spaces(text + pos, length - pos);
+            if (pos < length && text[pos] == '!')
+            {
+                pos += 1;
+                bits |= (1u << 21); /* W */
+            }
+        }
+        error = check_trailing(text, length, pos);
+        if (error != NULL) return error;
+
+        *out_instr = (cond << 28) | 0x0C000000u | (n_bit << 22) | (l_bit << 20) | bits |
+                     (crd_or_rd << 12) | (coproc << 8);
+    }
+    else
+    {
+        error = parse_coproc_number(context, text, length, &pos, &coproc);
+        if (error != NULL) return error;
+        error = expect_char(text, length, &pos, ',');
+        if (error != NULL) return error;
+        error = expect_char(text, length, &pos, '#');
+        if (error != NULL) return error;
+        error = eval_numeric(context, text, length, &pos, &opcode1);
+        if (error != NULL) return error;
+        error = expect_char(text, length, &pos, ',');
+        if (error != NULL) return error;
+
+        if (kind == COPROC_CDP)
+        {
+            if (opcode1 < 0 || opcode1 > 15) return error_bad_coprocessor_field();
+            error = parse_cp_register(context, text, length, &pos, &crd_or_rd);
+            if (error != NULL) return error;
+            error = expect_char(text, length, &pos, ',');
+            if (error != NULL) return error;
+            error = parse_cp_register(context, text, length, &pos, &crn);
+            if (error != NULL) return error;
+            error = expect_char(text, length, &pos, ',');
+            if (error != NULL) return error;
+            error = parse_cp_register(context, text, length, &pos, &crm);
+            if (error != NULL) return error;
+            pos += assemble_skip_spaces(text + pos, length - pos);
+            if (pos < length && text[pos] == ',')
+            {
+                pos += 1;
+                error = expect_char(text, length, &pos, '#');
+                if (error != NULL) return error;
+                error = eval_numeric(context, text, length, &pos, &opcode2);
+                if (error != NULL) return error;
+            }
+            if (opcode2 < 0 || opcode2 > 7) return error_bad_coprocessor_field();
+            error = check_trailing(text, length, pos);
+            if (error != NULL) return error;
+
+            *out_instr = (cond << 28) | 0x0E000000u | ((uint32_t) opcode1 << 20) | (crn << 16) |
+                         (crd_or_rd << 12) | (coproc << 8) | ((uint32_t) opcode2 << 5) | crm;
+        }
+        else /* MCR / MRC */
+        {
+            if (opcode1 < 0 || opcode1 > 7) return error_bad_coprocessor_field();
+            error = parse_register(context, text, length, &pos, &crd_or_rd);
+            if (error != NULL) return error;
+            error = expect_char(text, length, &pos, ',');
+            if (error != NULL) return error;
+            error = parse_cp_register(context, text, length, &pos, &crn);
+            if (error != NULL) return error;
+            error = expect_char(text, length, &pos, ',');
+            if (error != NULL) return error;
+            error = parse_cp_register(context, text, length, &pos, &crm);
+            if (error != NULL) return error;
+            pos += assemble_skip_spaces(text + pos, length - pos);
+            if (pos < length && text[pos] == ',')
+            {
+                pos += 1;
+                error = expect_char(text, length, &pos, '#');
+                if (error != NULL) return error;
+                error = eval_numeric(context, text, length, &pos, &opcode2);
+                if (error != NULL) return error;
+            }
+            if (opcode2 < 0 || opcode2 > 7) return error_bad_coprocessor_field();
+            error = check_trailing(text, length, pos);
+            if (error != NULL) return error;
+
+            *out_instr = (cond << 28) | 0x0E000010u | ((uint32_t) opcode1 << 21) |
+                         ((kind == COPROC_MRC) ? (1u << 20) : 0) | (crn << 16) |
+                         (crd_or_rd << 12) | (coproc << 8) | ((uint32_t) opcode2 << 5) | crm;
+        }
+    }
+    *pos_inout = pos;
+    return NULL;
+}
+
+/* ADR Rd, label -- an ADD/SUB Rd,PC,#imm pseudo-instruction. */
+static _kernel_oserror *encode_adr(assemble_context_t *context, const mnemonic_entry_t *entry,
+                                    uint32_t cond, int s_flag,
+                                    const uint8_t *text, size_t length, size_t pos,
+                                    uint32_t *out_instr)
+{
+    uint32_t rd;
+    int32_t target;
+    int32_t offset;
+    uint32_t encoded;
+    uint32_t opcode;
+    _kernel_oserror *error;
+
+    (void) entry; (void) s_flag;
+    error = parse_register(context, text, length, &pos, &rd);
+    if (error != NULL) return error;
+    error = expect_char(text, length, &pos, ',');
+    if (error != NULL) return error;
+    error = eval_numeric(context, text, length, &pos, &target);
+    if (error != NULL) return error;
+    error = check_trailing(text, length, pos);
+    if (error != NULL) return error;
+
+    offset = target - (int32_t) (context->address + 8);
+    if (offset >= 0)
+    {
+        opcode = 0x4; /* ADD */
+    }
+    else
+    {
+        opcode = 0x2; /* SUB */
+        offset = -offset;
+    }
+    if (!encode_dp_immediate((uint32_t) offset, &encoded))
+    {
+        return error_bad_immediate();
+    }
+
+    *out_instr = (cond << 28) | (opcode << 21) | (0xFu << 16) /* Rn = PC */ | (rd << 12) | (1u << 25) | encoded;
+    return NULL;
+}
+
+/* ---------------------------------------------------------------
+ * Dispatch table: maps each generically-handled family to its
+ * encoder function. Families handled by dedicated functions (LDR/STR,
+ * LDM/STM proper, SWP, the long-multiply family, and the generic
+ * coprocessor instructions) are not listed here -- they are matched
+ * directly in assemble_arm32_line before generic dispatch runs.
+ * --------------------------------------------------------------- */
+
+static family_encoder_fn family_encoder(instr_family_t family)
+{
+    switch (family)
+    {
+        case FAMILY_DATA_PROC:    return encode_data_proc;
+        case FAMILY_DATA_CMP:     return encode_data_cmp;
+        case FAMILY_DATA_MOV:     return encode_data_mov;
+        case FAMILY_MUL:          return encode_mul;
+        case FAMILY_UMAAL:        return encode_umaal;
+        case FAMILY_BRANCH:       return encode_branch;
+        case FAMILY_BX:           return encode_bx;
+        case FAMILY_SWI:          return encode_swi;
+        case FAMILY_LDM_STM:      return encode_push_pop;
+        case FAMILY_MSR:          return encode_msr;
+        case FAMILY_MRS:          return encode_mrs;
+        case FAMILY_CLZ:          return encode_clz;
+        case FAMILY_PLD_PLI:      return encode_pld_pli;
+        case FAMILY_BFC:          return encode_bfc;
+        case FAMILY_BFI:          return encode_bfi;
+        case FAMILY_SBFX_UBFX:    return encode_bfx;
+        case FAMILY_REV:          return encode_rev;
+        case FAMILY_SEL:          return encode_sel;
+        case FAMILY_USAD8:        return encode_usad8;
+        case FAMILY_USADA8:       return encode_usada8;
+        case FAMILY_SAT:          return encode_sat;
+        case FAMILY_SAT16:        return encode_sat16;
+        case FAMILY_QSAT:         return encode_qsat;
+        case FAMILY_PARALLEL:     return encode_parallel;
+        case FAMILY_SDIV_UDIV:    return encode_sdiv_udiv;
+        case FAMILY_LDREX_STREX:  return encode_ldrex_strex;
+        case FAMILY_CLREX:        return encode_clrex;
+        case FAMILY_CPS:          return encode_cps;
+        case FAMILY_SETEND:       return encode_setend;
+        case FAMILY_SETPAN:       return encode_setpan;
+        case FAMILY_BARRIER:      return encode_barrier;
+        case FAMILY_HINT:         return encode_hint;
+        case FAMILY_RFE:          return encode_rfe;
+        case FAMILY_SRS:          return encode_srs;
+        case FAMILY_BKPT:         return encode_bkpt;
+        case FAMILY_SVC_HINT:     return encode_svc_hint;
+        case FAMILY_ERET:         return encode_eret;
+        case FAMILY_HLT:          return encode_hlt;
+        case FAMILY_CRC32:        return encode_crc32;
+        case FAMILY_BARRIER_NOOP: return encode_barrier_noop;
+        case FAMILY_PKH:          return encode_pkh;
+        case FAMILY_SXT_UXT:      return encode_sxt_uxt;
+        case FAMILY_SXT_UXT_A:    return encode_sxt_uxt_a;
+        case FAMILY_ADR:          return encode_adr;
+        default:                  return NULL;
+    }
+}
+
+/* ---------------------------------------------------------------
+ * Pseudo-ops: EQU, DCB/DCW/DCD, ALIGN, OPT. These don't produce a
+ * single instruction word, so (like the other backends' EQU/DCB/etc)
+ * they're handled directly in assemble_arm32_line rather than through
+ * the family-encoder dispatch above.
+ * --------------------------------------------------------------- */
+
+static _kernel_oserror *assign_label(assemble_context_t *context,
+                                      const char *label, size_t label_length,
+                                      const assemble_value_t *value)
+{
+    _kernel_oserror *error = NULL;
+
+    if (context->assign_var(context->user_data, label, label_length, value, &error) != ASSEMBLE_RESULT_OK)
+    {
+        if (error != NULL)
+        {
+            return error;
+        }
+        return assemble_set_error(ASSEMBLE_CPU_ARM32, ASSEMBLE_ERROR_TYPE_BAD_LABEL, ASSEMBLE_ARM32_ERR_NONE,
+                                   "Label could not be assigned");
+    }
+    return NULL;
+}
+
+static _kernel_oserror *assemble_dc(assemble_context_t *context, const char *mnemonic,
+                                     const uint8_t *text, size_t length)
+{
+    size_t pos = 0;
+    _kernel_oserror *error;
+
+    for (;;)
+    {
+        int32_t number;
+
+        pos += assemble_skip_spaces(text + pos, length - pos);
+        error = eval_numeric(context, text, length, &pos, &number);
+        if (error != NULL)
+        {
+            return error;
+        }
+
+        if (strcmp(mnemonic, "DCB") == 0)
+        {
+            error = assemble_emit_byte(context, ASSEMBLE_CPU_ARM32, (uint8_t) (number & 0xFF));
+        }
+        else if (strcmp(mnemonic, "DCW") == 0)
+        {
+            error = assemble_emit_word(context, ASSEMBLE_CPU_ARM32, (uint16_t) (number & 0xFFFF));
+        }
+        else
+        {
+            error = assemble_emit_dword(context, ASSEMBLE_CPU_ARM32, (uint32_t) number);
+        }
+        if (error != NULL)
+        {
+            return error;
+        }
+
+        pos += assemble_skip_spaces(text + pos, length - pos);
+        if (pos < length && text[pos] == ',')
+        {
+            pos += 1;
+            continue;
+        }
+        break;
+    }
+
+    return check_trailing(text, length, pos);
+}
+
+static _kernel_oserror *assemble_align(assemble_context_t *context, const uint8_t *text, size_t length)
+{
+    uint32_t pad = (4u - (context->address & 3u)) & 3u;
+    _kernel_oserror *error;
+
+    error = check_trailing(text, length, 0);
+    if (error != NULL)
+    {
+        return error;
+    }
+    while (pad > 0)
+    {
+        error = assemble_emit_byte(context, ASSEMBLE_CPU_ARM32, 0);
+        if (error != NULL)
+        {
+            return error;
+        }
+        pad -= 1;
+    }
+    return NULL;
+}
+
+/*******************************************************************
+ Function:      assemble_arm32_line
+ Description:   see h/assemble_arm32
+ ******************************************************************/
+_kernel_oserror *assemble_arm32_line(assemble_context_t *context,
+                                      const uint8_t *line, size_t line_length)
+{
+    size_t pos;
+    char label[64];
+    size_t label_length = 0;
+    int have_label = 0;
+    char mnemonic[16];
+    size_t consumed;
+    _kernel_oserror *error;
+
+    context->bytes_used = 0;
+    pos = 0;
+    pos += assemble_skip_spaces(line + pos, line_length - pos);
+
+    if (pos < line_length && line[pos] == '.')
+    {
+        size_t start;
+
+        pos += 1;
+        start = pos;
+        if (!(pos < line_length && assemble_is_ident_start(line[pos])))
+        {
+            return assemble_set_error(ASSEMBLE_CPU_ARM32, ASSEMBLE_ERROR_TYPE_BAD_LABEL, ASSEMBLE_ARM32_ERR_NONE,
+                                       "Expected a label name after '.'");
+        }
+        while (pos < line_length && assemble_is_ident_char(line[pos]))
+        {
+            pos += 1;
+        }
+        label_length = pos - start;
+        if (label_length >= sizeof(label))
+        {
+            label_length = sizeof(label) - 1;
+        }
+        memcpy(label, line + start, label_length);
+        label[label_length] = '\0';
+        have_label = 1;
+        pos += assemble_skip_spaces(line + pos, line_length - pos);
+    }
+
+    if (pos >= line_length)
+    {
+        if (have_label)
+        {
+            assemble_value_t value;
+
+            value.type = ASSEMBLE_VALUE_INTEGER;
+            value.value.as_integer = (int32_t) context->address;
+            return assign_label(context, label, label_length, &value);
+        }
+        return NULL;
+    }
+
+    consumed = read_token(line + pos, line_length - pos, mnemonic);
+    if (consumed == 0 || mnemonic[0] == '\0')
+    {
+        return error_bad_mnemonic();
+    }
+
+    /* LDR, STR, LDM, STM, SWP, the long-multiply family, and the
+       generic coprocessor instructions all write their size/mode
+       suffix *after* the condition code, so they are matched here on
+       their fixed 3-character root and handed to a dedicated parser
+       rather than going through match_mnemonic(). */
+    if (strlen(mnemonic) >= 3 &&
+        (memcmp(mnemonic, "LDR", 3) == 0 || memcmp(mnemonic, "STR", 3) == 0 ||
+         memcmp(mnemonic, "LDM", 3) == 0 || memcmp(mnemonic, "STM", 3) == 0 ||
+         memcmp(mnemonic, "SWP", 3) == 0 || memcmp(mnemonic, "UMU", 3) == 0 ||
+         memcmp(mnemonic, "UML", 3) == 0 || memcmp(mnemonic, "SMU", 3) == 0 ||
+         memcmp(mnemonic, "SML", 3) == 0 || memcmp(mnemonic, "CDP", 3) == 0 ||
+         memcmp(mnemonic, "MCR", 3) == 0 || memcmp(mnemonic, "MRC", 3) == 0 ||
+         memcmp(mnemonic, "LDC", 3) == 0 || memcmp(mnemonic, "STC", 3) == 0))
+    {
+        size_t opstart = pos + 3;
+        uint32_t instr;
+
+        if (have_label)
+        {
+            assemble_value_t value;
+
+            value.type = ASSEMBLE_VALUE_INTEGER;
+            value.value.as_integer = (int32_t) context->address;
+            error = assign_label(context, label, label_length, &value);
+            if (error != NULL) return error;
+        }
+
+        if (memcmp(mnemonic, "LDR", 3) == 0)
+        {
+            error = handle_ldr_str(context, line, line_length, &opstart, 0, &instr);
+        }
+        else if (memcmp(mnemonic, "STR", 3) == 0)
+        {
+            error = handle_ldr_str(context, line, line_length, &opstart, 1, &instr);
+        }
+        else if (memcmp(mnemonic, "LDM", 3) == 0)
+        {
+            error = handle_ldm_stm(context, line, line_length, &opstart, 0, &instr);
+        }
+        else if (memcmp(mnemonic, "STM", 3) == 0)
+        {
+            error = handle_ldm_stm(context, line, line_length, &opstart, 1, &instr);
+        }
+        else if (memcmp(mnemonic, "SWP", 3) == 0)
+        {
+            error = handle_swp(context, line, line_length, &opstart, &instr);
+        }
+        else if (memcmp(mnemonic, "UMU", 3) == 0)
+        {
+            error = handle_long_multiply(context, line, line_length, &opstart, 0, &instr);
+        }
+        else if (memcmp(mnemonic, "UML", 3) == 0)
+        {
+            error = handle_long_multiply(context, line, line_length, &opstart, 0, &instr);
+        }
+        else if (memcmp(mnemonic, "SMU", 3) == 0)
+        {
+            error = handle_long_multiply(context, line, line_length, &opstart, 1, &instr);
+        }
+        else if (memcmp(mnemonic, "SML", 3) == 0)
+        {
+            error = handle_long_multiply(context, line, line_length, &opstart, 1, &instr);
+        }
+        else if (memcmp(mnemonic, "CDP", 3) == 0)
+        {
+            error = handle_coprocessor(context, line, line_length, &opstart, COPROC_CDP, &instr);
+        }
+        else if (memcmp(mnemonic, "MCR", 3) == 0)
+        {
+            error = handle_coprocessor(context, line, line_length, &opstart, COPROC_MCR, &instr);
+        }
+        else if (memcmp(mnemonic, "MRC", 3) == 0)
+        {
+            error = handle_coprocessor(context, line, line_length, &opstart, COPROC_MRC, &instr);
+        }
+        else if (memcmp(mnemonic, "LDC", 3) == 0)
+        {
+            error = handle_coprocessor(context, line, line_length, &opstart, COPROC_LDC, &instr);
+        }
+        else /* STC */
+        {
+            error = handle_coprocessor(context, line, line_length, &opstart, COPROC_STC, &instr);
+        }
+        if (error != NULL)
+        {
+            return error;
+        }
+        return assemble_emit_dword(context, ASSEMBLE_CPU_ARM32, instr);
+    }
+
+    if (strcmp(mnemonic, "EQU") == 0)
+    {
+        assemble_value_t value;
+        size_t p2 = pos + consumed;
+
+        if (!have_label)
+        {
+            return assemble_set_error(ASSEMBLE_CPU_ARM32, ASSEMBLE_ERROR_TYPE_BAD_LABEL,
+                                       ASSEMBLE_ARM32_ERR_NEED_LABEL_FOR_EQU,
+                                       "EQU used without a preceding label");
+        }
+        error = eval_expr(context, line + p2, line_length - p2, &value, &consumed);
+        if (error != NULL)
+        {
+            return error;
+        }
+        p2 += consumed;
+        error = check_trailing(line, line_length, p2);
+        if (error != NULL)
+        {
+            return error;
+        }
+        return assign_label(context, label, label_length, &value);
+    }
+
+    if (have_label)
+    {
+        assemble_value_t value;
+
+        value.type = ASSEMBLE_VALUE_INTEGER;
+        value.value.as_integer = (int32_t) context->address;
+        error = assign_label(context, label, label_length, &value);
+        if (error != NULL)
+        {
+            return error;
+        }
+    }
+
+    if (strcmp(mnemonic, "OPT") == 0)
+    {
+        size_t p2 = pos + consumed;
+
+        p2 += assemble_skip_spaces(line + p2, line_length - p2);
+        if (p2 < line_length)
+        {
+            assemble_value_t value;
+
+            error = eval_expr(context, line + p2, line_length - p2, &value, &consumed);
+            if (error != NULL)
+            {
+                return error;
+            }
+            p2 += consumed;
+        }
+        return check_trailing(line, line_length, p2);
+    }
+
+    if (strcmp(mnemonic, "ALIGN") == 0)
+    {
+        size_t p2 = pos + consumed;
+
+        return assemble_align(context, line + p2, line_length - p2);
+    }
+
+    if (strcmp(mnemonic, "DCB") == 0 || strcmp(mnemonic, "DCW") == 0 || strcmp(mnemonic, "DCD") == 0)
+    {
+        size_t p2 = pos + consumed;
+
+        return assemble_dc(context, mnemonic, line + p2, line_length - p2);
+    }
+
+    {
+        const mnemonic_entry_t *matched_entry;
+        uint32_t cond;
+        int s_flag;
+
+        if (!match_mnemonic(mnemonic, &matched_entry, &cond, &s_flag))
+        {
+            return error_bad_mnemonic();
+        }
+        {
+            family_encoder_fn encoder = family_encoder(matched_entry->family);
+            uint32_t instr;
+            size_t p2 = pos + consumed;
+
+            if (encoder == NULL)
+            {
+                return error_bad_mnemonic();
+            }
+            error = encoder(context, matched_entry, cond, s_flag, line, line_length, p2, &instr);
+            if (error != NULL)
+            {
+                return error;
+            }
+            return assemble_emit_dword(context, ASSEMBLE_CPU_ARM32, instr);
+        }
+    }
+}

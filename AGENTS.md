@@ -13,13 +13,15 @@ is no BASIC integration yet — the library is designed to be callable from a
 future BASIC inline-assembler patch (or any other caller), one source line
 at a time, but nothing currently wires it into BASIC itself.
 
-Three backends exist today:
+Five backends exist today:
 
 | Backend      | Files                                    | Instruction set(s)              |
 |--------------|-------------------------------------------|----------------------------------|
 | 6502         | `h/assemble_6502`, `c/assemble_6502`       | 6502, 65C02, 65C816 (dialect via OPT bits) |
 | 6809         | `h/assemble_6809`, `c/assemble_6809`       | 6809 (single dialect)            |
 | x86-64       | `h/assemble_x86_64`, `c/assemble_x86_64`   | x86-64, limited (see below)      |
+| Z80          | `h/assemble_z80`, `c/assemble_z80`         | Z80, including common undocumented forms |
+| ARM32        | `h/assemble_arm32`, `c/assemble_arm32`     | base ARM (ARMv4-ARMv8 AArch32 subset); FPA/VFP are separate follow-on backends, not yet added (see below) |
 
 Shared infrastructure lives in `h/assemble_common` / `c/assemble_common`.
 
@@ -202,6 +204,37 @@ different feature, no runtime registry needed) still works.
   `DB 1,2,3` turned out to be *my* wrong assumptions, not bugs — always
   re-check against the true original source (`grep`/`sed`), not memory of
   it, before deciding which side is wrong.
+
+### ARM32 (`assemble_arm32`)
+
+**Ported**, not reverse-engineered, from `ROOLBASIC/s/Assembler` (BBC
+BASIC's own inline ARM assembler, itself written in ARM assembly — a
+self-hosted assembler assembling its own host CPU's instruction set).
+Unlike the other backends, base ARM32 encoding is standard, well-documented
+ARM architecture and was implemented directly from that knowledge, cross-
+checked against the original source for syntax conventions, error
+taxonomy, and the trickier ARMv6/v7 media instructions (parallel add/
+subtract family, SBFX/UBFX, SDIV/UDIV/USAD8/USADA8, RBIT, PKH, UMAAL,
+RFE/SRS/ERET/SETEND/SETPAN) where bit-level fidelity to the original
+mattered and was verified by tracing the actual handler code, not
+assumed from memory.
+
+A quirk worth remembering if this backend is extended: uniquely among ARM
+mnemonics, LDR/STR/LDM/STM/SWP/the long-multiply family (UMULL/UMLAL/
+SMULL/SMLAL)/CDP/MCR/MRC/LDC/STC all write their size or mode suffix
+**after** the condition code (`LDREQB`, not `LDRBEQ`), so they're matched
+on a fixed 3-character root and handed to a dedicated parser in
+`c/assemble_arm32` rather than going through the generic
+root+condition+[S] mnemonic table used for everything else.
+
+Known, deliberate gaps (not silently dropped — each raises "Mnemonic not
+recognised"): the ARMv5TE/v6 'xy' DSP multiply family (SMLABB/SMLAWx/
+SMUAD/SMLAD/SMLALD and friends) and SMMLA/SMMLS/SMMUL; MRRC/MCRR; the
+ARMv8 LDA/STL/LDAEX/STLEX load-acquire/store-release family; and the
+banked-register form of MSR/MRS used for hypervisor-mode register access.
+FPA and VFP/NEON support are separate follow-on backends layered on top
+of this one (not yet added), gated by `ASSEMBLE_ARM32_OPT_FPA`/
+`ASSEMBLE_ARM32_OPT_VFP` dialect bits once they land.
 
 ## Source material handling
 

@@ -20,6 +20,7 @@ interface is designed to make that straightforward for a future caller.
 | 6809    | `h.assemble_6809`  | `c.assemble_6809`     | 6809                                          |
 | x86-64  | `h.assemble_x86_64`| `c.assemble_x86_64`   | x86-64 (limited subset, see below)            |
 | Z80     | `h.assemble_z80`   | `c.assemble_z80`      | Z80 (including common undocumented forms)     |
+| ARM32   | `h.assemble_arm32` | `c.assemble_arm32`    | Base ARM (ARMv4 through the AArch32 subset of ARMv8); FPA and VFP/NEON are separate follow-on backends, not yet added |
 
 Shared infrastructure (the assembly context, error reporting, byte/word
 emission helpers) lives in `h.assemble_common` / `c.assemble_common`.
@@ -202,6 +203,24 @@ name`, resolving a BASIC/OS routine name to its address, needs a live
 runtime function registry this library has no equivalent of, and raises
 `ASSEMBLE_X86_64_ERR_SYSTEM_CALL_UNSUPPORTED` instead. Embedding a string
 literal's raw bytes as immediate data still works.
+
+### Known limitation: ARM32
+
+Only the base ARM instruction set is implemented so far; FPA and VFP/NEON
+mnemonics are planned as separate follow-on backends, gated by
+`ASSEMBLE_ARM32_OPT_FPA`/`ASSEMBLE_ARM32_OPT_VFP` dialect bits once added.
+Within base ARM32, the ARMv5TE/v6 'xy' DSP multiply family (`SMLABB`,
+`SMLAWx`, `SMUAD`, `SMLAD`, `SMLALD` and friends), `SMMLA`/`SMMLS`/`SMMUL`,
+`MRRC`/`MCRR`, the ARMv8 `LDA`/`STL`/`LDAEX`/`STLEX` load-acquire/store-
+release family, and the banked-register form of `MSR`/`MRS` (hypervisor-
+mode register access) are not yet implemented and raise "Mnemonic not
+recognised".
+
+A syntax quirk worth knowing: unlike every other ARM mnemonic, `LDR`,
+`STR`, `LDM`, `STM`, `SWP`, the long-multiply family (`UMULL`/`UMLAL`/
+`SMULL`/`SMLAL`) and the generic coprocessor instructions (`CDP`, `MCR`,
+`MRC`, `LDC`, `STC`) all write their size or addressing-mode suffix
+**after** the condition code — `LDREQB`, not `LDRBEQ`.
 
 ### Platform constraint: no 64-bit integer type
 

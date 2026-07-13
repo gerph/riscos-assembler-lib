@@ -21,6 +21,7 @@ int main(int argc, char *argv[])
     failed += run_tests_6809();
     failed += run_tests_x86_64();
     failed += run_tests_z80();
+    failed += run_tests_arm32();
 
     exit(failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE);
 }

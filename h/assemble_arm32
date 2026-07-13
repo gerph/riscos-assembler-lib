@@ -1,0 +1,69 @@
+/*******************************************************************
+ * File:        assemble_arm32
+ * Purpose:     Assembler backend for the 32-bit ARM instruction set
+ *              (ARMv4 through the AArch32 subset of ARMv8), ported
+ *              from ROOLBASIC's s/Assembler (BBC BASIC's inline ARM
+ *              assembler). FPA and VFP/NEON support are separate
+ *              follow-on backends layered on top of this one; see
+ *              ASSEMBLE_ARM32_OPT_FPA / ASSEMBLE_ARM32_OPT_VFP.
+ * Author:      Charles Ferguson (Gerph)
+ ******************************************************************/
+
+#ifndef ASSEMBLE_ARM32_H
+#define ASSEMBLE_ARM32_H
+
+#include <stdint.h>
+#include <stddef.h>
+
+#include "kernel.h"
+#include "assemble_common.h"
+
+/* CPU-specific detail for errors raised by this backend; see
+   ASSEMBLE_ERRNUM_VARIANT(). Unlike assemble_6502, the base ARM
+   instruction set itself has no dialect bits in context->opt -- every
+   mnemonic below is always available. (Dialect selection is reserved
+   for the separate FPA/VFP follow-on backends, which gate their own
+   mnemonics via ASSEMBLE_ARM32_OPT_FPA/ASSEMBLE_ARM32_OPT_VFP.) */
+typedef enum assemble_arm32_error_variant
+{
+    ASSEMBLE_ARM32_ERR_NONE = 0,
+    ASSEMBLE_ARM32_ERR_BAD_REGISTER,            /* Register name/number expected, or out of range 0-15 */
+    ASSEMBLE_ARM32_ERR_BAD_IMMEDIATE,           /* #imm cannot be encoded (data-processing 8-bit rotated form) */
+    ASSEMBLE_ARM32_ERR_BAD_ADDRESS_OFFSET,      /* LDR/STR/coprocessor transfer offset out of range */
+    ASSEMBLE_ARM32_ERR_BAD_SHIFT,               /* Shift type/amount invalid for this context */
+    ASSEMBLE_ARM32_ERR_BAD_COPROCESSOR_FIELD,   /* Coprocessor number/CRn/CRm/opcode field out of range */
+    ASSEMBLE_ARM32_ERR_DUPLICATE_REGISTER,      /* Same register used for two operands that must differ */
+    ASSEMBLE_ARM32_ERR_BAD_REGISTER_LIST,       /* LDM/STM/PUSH/POP register list syntax error */
+    ASSEMBLE_ARM32_ERR_NEED_LABEL_FOR_EQU,      /* EQU used without a preceding '.label' */
+    ASSEMBLE_ARM32_ERR_BAD_PSR_FIELD,           /* MSR/MRS PSR name or field mask invalid */
+    ASSEMBLE_ARM32_ERR_BAD_BIT_FIELD,           /* BFI/BFC/SBFX/UBFX/SSAT/USAT lsb/width out of range */
+    ASSEMBLE_ARM32_ERR_BRANCH_RANGE             /* B/BL/BLX/ADR target out of +-32MB (or ADR immediate) range */
+} assemble_arm32_error_variant_t;
+
+/*******************************************************************
+ Function:      assemble_arm32_line
+ Description:   Assembles one line of tokenised BASIC source as a
+                base ARM32 instruction, label definition or data
+                pseudo-op (EQU, DCB, DCW, DCD, ADR, ALIGN, OPT),
+                writing the result to context->buffer (or just
+                measuring it, if context->buffer_length is -1).
+                context->bytes_used is set to the number of bytes
+                written or that would have been written. All values
+                are little-endian, matching ARM's default byte order.
+
+                Only base ARM32 mnemonics are recognised here; FPA and
+                VFP/NEON mnemonics are handled by separate backends
+                layered on top (not yet implemented).
+ Parameters:    context = the assembly context; address, buffer,
+                          buffer_length and opt must be filled in
+                line = tokenised BASIC source for the line, not
+                       including the terminating CR/LF
+                line_length = number of bytes at 'line'
+ Returns:       NULL if successful, otherwise a pointer to a static
+                error block (see assemble_common.h)
+ ******************************************************************/
+_kernel_oserror *assemble_arm32_line(assemble_context_t *context,
+                                      const uint8_t *line,
+                                      size_t line_length);
+
+#endif
