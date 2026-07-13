@@ -720,6 +720,41 @@ static const char *const lines_neon_vld3_bad_align[] = { "VLD3.32 (D0,D1,D2),[R1
 static const char *const lines_neon_vld2_inconsistent_gap[] = { "VLD2.32 (D0,D1,D3),[R1]", NULL };
 static const char *const lines_neon_vld1_bad_shape[] = { "VLD1.32 (D0,D2),[R1]", NULL };
 
+static const char *const lines_vfp_vmaxnm[] = { "VMAXNM.F32 S0,S1,S2", NULL };
+static const uint8_t     bytes_vfp_vmaxnm[] = { 0x81, 0x0A, 0x80, 0xFE }; /* FE800A81 */
+
+static const char *const lines_neon_vminnm[] = { "VMINNM.F32 Q0,Q1,Q2", NULL };
+static const uint8_t     bytes_neon_vminnm[] = { 0x54, 0x0F, 0x22, 0xF3 }; /* F3220F54 */
+
+static const char *const lines_vfp_vselge[] = { "VSELGE.F64 D0,D1,D2", NULL };
+static const uint8_t     bytes_vfp_vselge[] = { 0x02, 0x0B, 0x21, 0xFE }; /* FE210B02 */
+
+static const char *const lines_vfp_vrintz[] = { "VRINTZ.F32.F32 S0,S1", NULL };
+static const uint8_t     bytes_vfp_vrintz[] = { 0xE0, 0x0A, 0xB6, 0xEE }; /* EEB60AE0 */
+
+static const char *const lines_neon_vrintz[] = { "VRINTZ.F32.F32 Q0,Q1", NULL };
+static const uint8_t     bytes_neon_vrintz[] = { 0xC2, 0x05, 0xBA, 0xF3 }; /* F3BA05C2 */
+
+static const char *const lines_vfp_vrinta[] = { "VRINTA.F64.F64 D0,D1", NULL };
+static const uint8_t     bytes_vfp_vrinta[] = { 0x41, 0x0B, 0xB8, 0xFE }; /* FEB80B41 */
+
+static const char *const lines_vfp_vcvta[] = { "VCVTA.S32.F32 S0,S1", NULL };
+static const uint8_t     bytes_vfp_vcvta[] = { 0xE0, 0x0A, 0xBC, 0xFE }; /* FEBC0AE0 */
+
+static const char *const lines_neon_vcvtm[] = { "VCVTM.U32.F32 Q0,Q1", NULL };
+static const uint8_t     bytes_neon_vcvtm[] = { 0xC2, 0x03, 0xBB, 0xF3 }; /* F3BB03C2 */
+
+static const char *const lines_vfp_vcvtb_widen[] = { "VCVTB.F32.F16 S0,S1", NULL };
+static const uint8_t     bytes_vfp_vcvtb_widen[] = { 0x60, 0x0A, 0xB2, 0xEE }; /* EEB20A60 */
+
+static const char *const lines_vfp_vcvtt_narrow_d[] = { "VCVTT.F16.F64 S0,D1", NULL };
+static const uint8_t     bytes_vfp_vcvtt_narrow_d[] = { 0xC1, 0x0B, 0xB3, 0xEE }; /* EEB30BC1 */
+
+static const char *const lines_vfp_vsel_mismatch[] = { "VSELGE.F32 S0,D1,D2", NULL };
+static const char *const lines_neon_vmaxnm_bad_f64[] = { "VMAXNM.F64 Q0,Q1,Q2", NULL };
+static const char *const lines_vfp_vcvtb_neither_half[] = { "VCVTB.F32.F64 S0,D1", NULL };
+static const char *const lines_neon_vrintr_no_neon_form[] = { "VRINTR.F32.F32 Q0,Q1", NULL };
+
 static const test_case_t tests[] = {
     { "MOV Rd,#imm",                   lines_mov_imm,          0, bytes_mov_imm,          sizeof(bytes_mov_imm),          0 },
     { "MOVS Rd,Rm",                    lines_mov_reg,          0, bytes_mov_reg,          sizeof(bytes_mov_reg),          0 },
@@ -877,7 +912,22 @@ static const test_case_t tests[] = {
     { "VST2.32 (Dd,Dd+1),[Rn],Rm",            lines_neon_vst2_rm,     0, bytes_neon_vst2_rm,     sizeof(bytes_neon_vst2_rm),     0, ASSEMBLE_ARM32_OPT_VFP },
     { "VLD3 only supports @64 alignment",     lines_neon_vld3_bad_align, 0, NULL, 0, 1, ASSEMBLE_ARM32_OPT_VFP },
     { "Register list gap must be consistent", lines_neon_vld2_inconsistent_gap, 0, NULL, 0, 1, ASSEMBLE_ARM32_OPT_VFP },
-    { "VLD1 does not support a gap-2 register list", lines_neon_vld1_bad_shape, 0, NULL, 0, 1, ASSEMBLE_ARM32_OPT_VFP }
+    { "VLD1 does not support a gap-2 register list", lines_neon_vld1_bad_shape, 0, NULL, 0, 1, ASSEMBLE_ARM32_OPT_VFP },
+
+    { "VMAXNM.F32 Sd,Sn,Sm (VFP scalar)",     lines_vfp_vmaxnm,       0, bytes_vfp_vmaxnm,       sizeof(bytes_vfp_vmaxnm),       0, ASSEMBLE_ARM32_OPT_VFP },
+    { "VMINNM.F32 Qd,Qn,Qm (NEON)",           lines_neon_vminnm,      0, bytes_neon_vminnm,      sizeof(bytes_neon_vminnm),      0, ASSEMBLE_ARM32_OPT_VFP },
+    { "VSELGE.F64 Dd,Dn,Dm",                  lines_vfp_vselge,       0, bytes_vfp_vselge,       sizeof(bytes_vfp_vselge),       0, ASSEMBLE_ARM32_OPT_VFP },
+    { "VRINTZ.F32.F32 Sd,Sm (VFP scalar, legacy conditional shape)", lines_vfp_vrintz, 0, bytes_vfp_vrintz, sizeof(bytes_vfp_vrintz), 0, ASSEMBLE_ARM32_OPT_VFP },
+    { "VRINTZ.F32.F32 Qd,Qm (NEON form of the same mnemonic)", lines_neon_vrintz, 0, bytes_neon_vrintz, sizeof(bytes_neon_vrintz), 0, ASSEMBLE_ARM32_OPT_VFP },
+    { "VRINTA.F64.F64 Dd,Dm (VFP scalar, ARMv8 unconditional shape)", lines_vfp_vrinta, 0, bytes_vfp_vrinta, sizeof(bytes_vfp_vrinta), 0, ASSEMBLE_ARM32_OPT_VFP },
+    { "VCVTA.S32.F32 Sd,Sm (VFP scalar convert, directed rounding)", lines_vfp_vcvta, 0, bytes_vfp_vcvta, sizeof(bytes_vfp_vcvta), 0, ASSEMBLE_ARM32_OPT_VFP },
+    { "VCVTM.U32.F32 Qd,Qm (NEON convert, op polarity reversed vs VFP)", lines_neon_vcvtm, 0, bytes_neon_vcvtm, sizeof(bytes_neon_vcvtm), 0, ASSEMBLE_ARM32_OPT_VFP },
+    { "VCVTB.F32.F16 Sd,Sm (half-precision widen)", lines_vfp_vcvtb_widen, 0, bytes_vfp_vcvtb_widen, sizeof(bytes_vfp_vcvtb_widen), 0, ASSEMBLE_ARM32_OPT_VFP },
+    { "VCVTT.F16.F64 Sd,Dm (half-precision narrow, double)", lines_vfp_vcvtt_narrow_d, 0, bytes_vfp_vcvtt_narrow_d, sizeof(bytes_vfp_vcvtt_narrow_d), 0, ASSEMBLE_ARM32_OPT_VFP },
+    { "VSEL operands must all be the same precision", lines_vfp_vsel_mismatch, 0, NULL, 0, 1, ASSEMBLE_ARM32_OPT_VFP },
+    { "VMAXNM NEON form does not accept F64",  lines_neon_vmaxnm_bad_f64, 0, NULL, 0, 1, ASSEMBLE_ARM32_OPT_VFP },
+    { "VCVTB requires one of the two dt tags to be F16", lines_vfp_vcvtb_neither_half, 0, NULL, 0, 1, ASSEMBLE_ARM32_OPT_VFP },
+    { "VRINTR has no NEON form",               lines_neon_vrintr_no_neon_form, 0, NULL, 0, 1, ASSEMBLE_ARM32_OPT_VFP }
 };
 
 int run_tests_arm32(void)

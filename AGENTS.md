@@ -656,10 +656,93 @@ under time pressure.
   boundary cases (which counts unlock `@128`/`@256`) are few enough to
   read as a couple of boolean expressions instead of another table.
 
-Everything else NEON — the "single lane" and "single all lanes"
-addressing forms of `VLD`/`VST` described above, and the convert/
-ARMv8-only additions (`VCVT` all forms, `VCVTB`/`VCVTT`, `VRINT*`,
-`VSEL*`, `VMAXNM`/`VMINNM`) — remain a follow-on.
+### ARMv8-only VFP/NEON additions
+
+`VMAXNM`/`VMINNM`, `VSELEQ`/`VSELGE`/`VSELGT`/`VSELVS`, the
+directed-rounding `VRINT*` and `VCVTA`/`VCVTN`/`VCVTP`/`VCVTM` families,
+and half-precision `VCVTB`/`VCVTT` are all implemented. General `VCVT`
+(the plain integer/fixed-point conversions, everything other than
+`VCVTB`/`VCVTT`) remains a deliberate gap, for the same reason given in
+the classic VFP scalar section above: its real encoding packs
+signedness and rounding-mode selection across non-adjacent bits in a
+way that needs the same VFPLib-source-reading rigour as the `VMOV`/
+`VMVN` cmode table, and this batch was already large and heterogeneous
+enough (nine distinct encoding shapes across VFP scalar and NEON)
+without adding a tenth.
+
+- Most of these mnemonics have *both* a VFP-scalar form and a NEON
+  form sharing one literal root: `VMAXNM`/`VMINNM`, and every
+  `VRINT*`/`VCVTA`-family member except `VRINTR`. `VSELEQ`/etc and
+  `VCVTB`/`VCVTT` are the exceptions — VFP-scalar only, no NEON form at
+  all. Where both forms exist, the dispatch technique is the same
+  peek-the-datatype-and-register-class trick as
+  `encode_vfp_or_neon_arith3` from phase 3a: an `S` register is
+  unambiguously scalar, an F64 datatype is unambiguously scalar (NEON
+  has no F64 element type), and everything else (`D` with F32, or any
+  `Q` register) is unambiguously NEON — no runtime ambiguity ever
+  actually exists, it just isn't resolvable from the mnemonic root
+  alone the way `match_mnemonic` normally works.
+- The VFP-scalar forms are *not* all the same shape. `VMAXNM`/`VMINNM`
+  and `VSEL*` and the `VRINTA`/`N`/`P`/`M`/`VCVTA`/`N`/`P`/`M` directed-
+  rounding families use a new-in-ARMv8 encoding with the condition
+  field forced to `1111` (genuinely unconditional, not just "always
+  encoded as AL") — `allows_cond=0` in the mnemonic table for these,
+  since there is no legacy conditional form to preserve. `VRINTR`,
+  `VRINTZ` and `VRINTX`, by contrast, reuse VFP's *original* conditional
+  encoding shape (they predate ARMv8 as conditional instructions and
+  gained NEON counterparts later without losing that), so their table
+  rows keep `allows_cond=1` and the encoder genuinely uses the parsed
+  condition — verified by checking that only these three, of the whole
+  batch, have a `cond[3:0]` field in VFPLib's raw encoding table rather
+  than a fixed `1111`.
+- `VRINTA`/`N`/`P`/`M`/`VCVTA`/`N`/`P`/`M`'s scalar and NEON syntax both
+  double the datatype tag (`"VRINTA.F32.F32 Sd,Sm"`, not
+  `"VRINTA.F32 Sd,Sm"`) — this looked like a documentation artefact of
+  the table-extraction script at first, since the repeated tag is
+  always redundant (both halves are always equal for `VRINT*`, and for
+  `VCVT*` the first half is always `S32`/`U32`), but it is real UAL
+  syntax for this instruction family specifically, confirmed by
+  checking VFPLib's own lookup-table syntax strings rather than
+  memory.
+- `VCVTA`/`N`/`P`/`M`'s "op" (signed/unsigned) bit has **opposite
+  polarity** between the VFP-scalar and NEON encodings — `S32` is
+  `op=1` in the scalar `A1` table entry but `op=0` in the NEON `A1`
+  entry (and `U32` the reverse). This is a real architectural quirk
+  (VFP's bit means "is signed", NEON's same-position bit means "is
+  unsigned"), not a typo in either this port or VFPLib's table; missing
+  it would have silently swapped `VCVTA.S32`/`VCVTA.U32` for every NEON
+  form while leaving the scalar form correct, so it was worth spelling
+  out explicitly (`encode_vfp_or_neon_cvt_dir` computes the scalar `op`
+  bit once and inverts it for the NEON branch, with a comment at the
+  point of inversion rather than leaving it implicit).
+- `VCVTB`/`VCVTT` (half-precision conversion) also double-tags, but
+  asymmetrically: one tag must be `F16` and the other `F32`/`F64`,
+  and which one is `F16` determines both the `op` bit (widening from
+  half vs narrowing to half) and which of the two operand registers is
+  constrained to always be single-precision (half-precision values
+  always live in the bottom 16 bits of an `S` register, regardless of
+  which "side" of the conversion they're on). This mnemonic has no
+  NEON form at all, so it's a plain conditional scalar encoder with no
+  dispatch needed.
+- `VRINTR` is the one mnemonic in this batch with no NEON counterpart
+  (real hardware only ever added `VRINTA`/`N`/`P`/`M`/`X`/`Z` to NEON,
+  not `R`); its mnemonic-table row still carries a NEON "op" field
+  slot for consistency with its `VRINTZ`/`VRINTX` siblings, set to the
+  sentinel `0xFFFFFFFF` and checked explicitly in
+  `encode_vfp_or_neon_rint` so writing `VRINTR.F32.F32 Qd,Qm` raises
+  "NEON datatype is invalid for this mnemonic" rather than silently
+  encoding something.
+- The NEON forms of `VMAXNM`/`VMINNM` needed no new low-level encoding
+  function at all — mechanically matching their raw bit-pattern
+  against `assemble_neon_three_same`'s existing parameter layout (the
+  same helper `VADD`/`VMAX`/etc already use) showed it was already
+  general enough to express `U=1, opcode4=0xF, opbit=1` (the exact bits
+  VFPLib's table uses for these two), so they're just two more
+  mnemonic-table rows through the existing `FAMILY_NEON_3SAME`/
+  `encode_neon_three_same` path. The `VRINT*`/`VCVTA`-family NEON forms
+  similarly reuse `assemble_neon_two_reg_misc` (the "two registers
+  misc" shape's existing low-level helper) rather than a new one --
+  only the *dispatch and double-dt-tag parsing* around them is new.
 
 ## Source material handling
 

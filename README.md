@@ -238,11 +238,15 @@ adding a new one); so far this covers:
 * structure load/store — `VLD1`/`VLD2`/`VLD3`/`VLD4`/`VST1`/`VST2`/
   `VST3`/`VST4`, "multiple" (register-list) addressing only — the
   "single lane" and "single all lanes" (replicate) addressing forms
-  are not implemented (see `AGENTS.md`).
+  are not implemented (see `AGENTS.md`);
+* ARMv8-only VFP/NEON additions — `VMAXNM`/`VMINNM`, `VSELEQ`/`VSELGE`/
+  `VSELGT`/`VSELVS`, the directed-rounding `VRINTA`/`VRINTN`/`VRINTP`/
+  `VRINTM`/`VRINTX`/`VRINTZ` and the legacy `VRINTR`, directed-rounding
+  float-to-integer `VCVTA`/`VCVTN`/`VCVTP`/`VCVTM`, and half-precision
+  `VCVTB`/`VCVTT`.
 
-Everything else NEON (the two structure load/store forms above, and
-convert/ARMv8-only additions such as `VRINT*`, `VSEL*`, `VMAXNM`/
-`VMINNM` and directed-rounding `VCVT`) remains a follow-on. Within
+General `VCVT` (the plain integer/fixed-point conversions, other than
+`VCVTB`/`VCVTT`) remains a deliberate gap — see `AGENTS.md`. Within
 base ARM32, the ARMv5TE/v6 'xy' DSP
 multiply family (`SMLABB`, `SMLAWx`, `SMUAD`, `SMLAD`, `SMLALD` and
 friends), `SMMLA`/`SMMLS`/`SMMUL`, `MRRC`/`MCRR`, the ARMv8 `LDA`/`STL`/
@@ -250,9 +254,9 @@ friends), `SMMLA`/`SMMLS`/`SMMUL`, `MRRC`/`MCRR`, the ARMv8 `LDA`/`STL`/
 form of `MSR`/`MRS` (hypervisor-mode register access) are not yet
 implemented and raise "Mnemonic not recognised". Within FPA, `LFM`/`SFM`
 (multiple-register stack transfer) are omitted for the same reason.
-Within VFP, `VCVT` (all forms) and the `VMOV`-immediate and two-core-
-register transfer forms are omitted — see `AGENTS.md` for detail on all
-of these.
+Within classic VFP scalar, the `VMOV`-immediate (float constant) and
+two-core-register transfer forms are omitted — see `AGENTS.md` for
+detail on all of these.
 
 A syntax quirk worth knowing: unlike every other ARM mnemonic, `LDR`,
 `STR`, `LDM`, `STM`, `SWP`, the long-multiply family (`UMULL`/`UMLAL`/

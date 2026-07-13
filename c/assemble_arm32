@@ -1018,6 +1018,25 @@ typedef enum instr_family
        single-all-lanes forms are not implemented; see AGENTS.md. */
     FAMILY_NEON_LDST_MULTIPLE,  /* VLD1 VLD2 VLD3 VLD4 VST1 VST2 VST3 VST4 */
 
+    /* ARMv8-only VFP/NEON additions. VMAXNM/VMINNM and the VRINT/VCVT
+       directed-rounding mnemonics each have both a VFP scalar form
+       (Sd/Dd, unconditional -- these are new ARMv8 encodings, not the
+       classic conditional VFP shape, except VRINTR/VRINTZ/VRINTX which
+       reuse the older conditional shape) and, other than VSEL and
+       VCVTA/N/P/M's own dest-is-always-S convert-to-integer scalar
+       form, a NEON Dd/Qd form (F32 only, unconditional); a D-register
+       operand is ambiguous between the two, so these dispatch on the
+       parsed datatype/register shape exactly like FAMILY_VFP_OR_NEON_ARITH3.
+       General VCVT (integer/fixed-point/half-precision conversions
+       other than VCVTB/VCVTT) remains a deliberate gap -- see the
+       comment above the classic VFP scalar section. */
+    FAMILY_VFP_OR_NEON_MAXNM,   /* VMAXNM VMINNM; see encode_vfp_or_neon_maxnm */
+    FAMILY_VFP_SEL,             /* VSELEQ VSELGE VSELGT VSELVS -- VFP scalar only, no NEON form */
+    FAMILY_VFP_OR_NEON_RINT,    /* VRINTR VRINTZ VRINTX VRINTA VRINTN VRINTP VRINTM; see encode_vfp_or_neon_rint */
+    FAMILY_VFP_OR_NEON_CVT_DIR, /* VCVTA VCVTN VCVTP VCVTM (float-to-integer, directed rounding);
+                                    see encode_vfp_or_neon_cvt_dir */
+    FAMILY_VFP_CVT_HALF,        /* VCVTB VCVTT -- half-precision <-> single/double, VFP scalar only */
+
     FAMILY_NONE         /* unreachable placeholder root, never dispatched */
 } instr_family_t;
 
@@ -1469,7 +1488,47 @@ static const mnemonic_entry_t mnemonic_table[] = {
     { "VLD3", FAMILY_NEON_LDST_MULTIPLE, 1u | (2u<<1), 0, 0, 0, ASSEMBLE_ARM32_OPT_VFP },
     { "VST3", FAMILY_NEON_LDST_MULTIPLE, 0u | (2u<<1), 0, 0, 0, ASSEMBLE_ARM32_OPT_VFP },
     { "VLD4", FAMILY_NEON_LDST_MULTIPLE, 1u | (3u<<1), 0, 0, 0, ASSEMBLE_ARM32_OPT_VFP },
-    { "VST4", FAMILY_NEON_LDST_MULTIPLE, 0u | (3u<<1), 0, 0, 0, ASSEMBLE_ARM32_OPT_VFP }
+    { "VST4", FAMILY_NEON_LDST_MULTIPLE, 0u | (3u<<1), 0, 0, 0, ASSEMBLE_ARM32_OPT_VFP },
+
+    /* param1: 0=VMAXNM, 1=VMINNM (the "op" bit; the same value selects
+       MAX/MIN in both the VFP-scalar and NEON encodings). */
+    { "VMAXNM", FAMILY_VFP_OR_NEON_MAXNM, 0u, 0, 0, 0, ASSEMBLE_ARM32_OPT_VFP },
+    { "VMINNM", FAMILY_VFP_OR_NEON_MAXNM, 1u, 0, 0, 0, ASSEMBLE_ARM32_OPT_VFP },
+
+    /* param1: 2-bit cc field (EQ=0, VS=1, GE=2, GT=3). */
+    { "VSELEQ", FAMILY_VFP_SEL, 0u, 0, 0, 0, ASSEMBLE_ARM32_OPT_VFP },
+    { "VSELVS", FAMILY_VFP_SEL, 1u, 0, 0, 0, ASSEMBLE_ARM32_OPT_VFP },
+    { "VSELGE", FAMILY_VFP_SEL, 2u, 0, 0, 0, ASSEMBLE_ARM32_OPT_VFP },
+    { "VSELGT", FAMILY_VFP_SEL, 3u, 0, 0, 0, ASSEMBLE_ARM32_OPT_VFP },
+
+    /* param1: bits7:4 = scalar shape (0=VRINTR/Z legacy conditional,
+       1=VRINTX legacy conditional, 2=VRINTA/N/P/M ARMv8 unconditional),
+       bits3:0 = op (shape 0) or rm (shape 2), unused for shape 1.
+       param2: NEON "op" field (0-7), or 0xFFFFFFFF if this mnemonic has
+       no NEON form (VRINTR only -- see encode_vfp_or_neon_rint). VRINTR/
+       VRINTZ/VRINTX allow a real condition code (the legacy shape they
+       share genuinely has a cond field); VRINTA/N/P/M do not (ARMv8
+       added them as unconditional-only). */
+    { "VRINTR", FAMILY_VFP_OR_NEON_RINT, (0u<<4) | 0u, 0xFFFFFFFFu, 1, 0, ASSEMBLE_ARM32_OPT_VFP },
+    { "VRINTZ", FAMILY_VFP_OR_NEON_RINT, (0u<<4) | 1u, 3u,          1, 0, ASSEMBLE_ARM32_OPT_VFP },
+    { "VRINTX", FAMILY_VFP_OR_NEON_RINT, (1u<<4) | 0u, 1u,          1, 0, ASSEMBLE_ARM32_OPT_VFP },
+    { "VRINTA", FAMILY_VFP_OR_NEON_RINT, (2u<<4) | 0u, 2u,          0, 0, ASSEMBLE_ARM32_OPT_VFP },
+    { "VRINTN", FAMILY_VFP_OR_NEON_RINT, (2u<<4) | 1u, 0u,          0, 0, ASSEMBLE_ARM32_OPT_VFP },
+    { "VRINTP", FAMILY_VFP_OR_NEON_RINT, (2u<<4) | 2u, 7u,          0, 0, ASSEMBLE_ARM32_OPT_VFP },
+    { "VRINTM", FAMILY_VFP_OR_NEON_RINT, (2u<<4) | 3u, 5u,          0, 0, ASSEMBLE_ARM32_OPT_VFP },
+
+    /* param1: 2-bit rm field (A=0, N=1, P=2, M=3), shared by both the
+       VFP-scalar (dest always Sd) and NEON forms; see
+       encode_vfp_or_neon_cvt_dir for the S32/U32 "op" bit polarity
+       reversal between the two encodings. */
+    { "VCVTA", FAMILY_VFP_OR_NEON_CVT_DIR, 0u, 0, 0, 0, ASSEMBLE_ARM32_OPT_VFP },
+    { "VCVTN", FAMILY_VFP_OR_NEON_CVT_DIR, 1u, 0, 0, 0, ASSEMBLE_ARM32_OPT_VFP },
+    { "VCVTP", FAMILY_VFP_OR_NEON_CVT_DIR, 2u, 0, 0, 0, ASSEMBLE_ARM32_OPT_VFP },
+    { "VCVTM", FAMILY_VFP_OR_NEON_CVT_DIR, 3u, 0, 0, 0, ASSEMBLE_ARM32_OPT_VFP },
+
+    /* param1: T bit (0=VCVTB, bottom half; 1=VCVTT, top half). */
+    { "VCVTB", FAMILY_VFP_CVT_HALF, 0u, 0, 1, 0, ASSEMBLE_ARM32_OPT_VFP },
+    { "VCVTT", FAMILY_VFP_CVT_HALF, 1u, 0, 1, 0, ASSEMBLE_ARM32_OPT_VFP }
 };
 #define NUM_MNEMONICS (sizeof(mnemonic_table) / sizeof(mnemonic_table[0]))
 
@@ -3792,6 +3851,16 @@ static _kernel_oserror *encode_neon_mov_mvn_imm_impl(assemble_context_t *, uint3
                                                       const uint8_t *, size_t, size_t, uint32_t *);
 static _kernel_oserror *encode_neon_ldst_multiple(assemble_context_t *, const mnemonic_entry_t *, uint32_t, int,
                                                    const uint8_t *, size_t, size_t, uint32_t *);
+static _kernel_oserror *encode_vfp_or_neon_maxnm(assemble_context_t *, const mnemonic_entry_t *, uint32_t, int,
+                                                  const uint8_t *, size_t, size_t, uint32_t *);
+static _kernel_oserror *encode_vfp_sel(assemble_context_t *, const mnemonic_entry_t *, uint32_t, int,
+                                        const uint8_t *, size_t, size_t, uint32_t *);
+static _kernel_oserror *encode_vfp_or_neon_rint(assemble_context_t *, const mnemonic_entry_t *, uint32_t, int,
+                                                 const uint8_t *, size_t, size_t, uint32_t *);
+static _kernel_oserror *encode_vfp_or_neon_cvt_dir(assemble_context_t *, const mnemonic_entry_t *, uint32_t, int,
+                                                    const uint8_t *, size_t, size_t, uint32_t *);
+static _kernel_oserror *encode_vfp_cvt_half(assemble_context_t *, const mnemonic_entry_t *, uint32_t, int,
+                                             const uint8_t *, size_t, size_t, uint32_t *);
 
 static family_encoder_fn family_encoder(instr_family_t family)
 {
@@ -3873,6 +3942,11 @@ static family_encoder_fn family_encoder(instr_family_t family)
         case FAMILY_NEON_VEXT:            return encode_neon_vext;
         case FAMILY_NEON_TBL:             return encode_neon_tbl;
         case FAMILY_NEON_LDST_MULTIPLE:   return encode_neon_ldst_multiple;
+        case FAMILY_VFP_OR_NEON_MAXNM:    return encode_vfp_or_neon_maxnm;
+        case FAMILY_VFP_SEL:              return encode_vfp_sel;
+        case FAMILY_VFP_OR_NEON_RINT:     return encode_vfp_or_neon_rint;
+        case FAMILY_VFP_OR_NEON_CVT_DIR:  return encode_vfp_or_neon_cvt_dir;
+        case FAMILY_VFP_CVT_HALF:         return encode_vfp_cvt_half;
         default:                  return NULL;
     }
 }
@@ -7537,5 +7611,396 @@ static _kernel_oserror *encode_neon_ldst_multiple(assemble_context_t *context, c
 
     *out_instr = (is_load ? 0xF4200000u : 0xF4000000u) | (dbit << 22) | (rn << 16) | (vd << 12) |
                  (type << 8) | (size2 << 6) | (align_code << 4) | vm_field;
+    return NULL;
+}
+
+/* ---------------------------------------------------------------
+ * ARMv8-only VFP/NEON additions: VMAXNM/VMINNM, VSEL, the VRINT*
+ * directed-rounding family and VCVTA/N/P/M (float-to-integer,
+ * directed rounding), plus VCVTB/VCVTT (half-precision). General
+ * VCVT (the plain integer/fixed-point/half-precision forms other
+ * than VCVTB/VCVTT) remains a deliberate gap -- see the comment
+ * above the classic VFP scalar section, near parse_vfp_register.
+ * --------------------------------------------------------------- */
+
+/* VMAXNM/VMINNM -- {S|D}d,{S|D}n,{S|D}m (VFP scalar, F32/F64, ARMv8
+   "A2" encoding -- unconditional, not the classic conditional VFP
+   shape) or Dd/Qd,Dn/Qn,Dm/Qm (NEON "A1" encoding, F32 only,
+   unconditional). A D-register operand is ambiguous between the two
+   (VFP's F64 form and NEON's F32 form both use D registers), so this
+   dispatches on the parsed datatype/register shape exactly like
+   FAMILY_VFP_OR_NEON_ARITH3's encode_vfp_or_neon_arith3. Both forms
+   use "op" (entry->param1: 0=MAX, 1=MIN) with the same polarity. */
+static _kernel_oserror *encode_vfp_or_neon_maxnm(assemble_context_t *context, const mnemonic_entry_t *entry,
+                                                  uint32_t cond, int s_flag,
+                                                  const uint8_t *text, size_t length, size_t pos,
+                                                  uint32_t *out_instr)
+{
+    size_t peek_pos = pos;
+    uint8_t regclass;
+    neon_dt_t dt;
+    uint32_t rd, rn, rm;
+    uint8_t cd, cn, cm;
+    uint32_t vd, dbit, vn, nbit, vm, mbit, q;
+    _kernel_oserror *error;
+
+    (void) s_flag;
+    if (cond != COND_AL) return error_neon_no_condition();
+
+    error = parse_neon_dt(text, length, &peek_pos, &dt);
+    if (error != NULL) return error;
+    if (dt.kind != 'F' || (dt.width != 32 && dt.width != 64)) return error_bad_datatype();
+    regclass = peek_neon_reg_class(text, length, peek_pos);
+
+    if (regclass == 'S' || (regclass == 'D' && dt.width == 64))
+    {
+        uint32_t sz = (dt.width == 64) ? 1u : 0u;
+        int is_double;
+        uint32_t vfpvd, vfpdd, vfpvn, vfpdn, vfpvm, vfpdm;
+
+        pos = peek_pos;
+        error = parse_vfp_register(context, text, length, &pos, &rd, &is_double);
+        if (error != NULL) return error;
+        if (is_double != (int) sz) return error_vfp_mismatched_precision();
+        error = expect_char(text, length, &pos, ',');
+        if (error != NULL) return error;
+        error = parse_vfp_register(context, text, length, &pos, &rn, &is_double);
+        if (error != NULL) return error;
+        if (is_double != (int) sz) return error_vfp_mismatched_precision();
+        error = expect_char(text, length, &pos, ',');
+        if (error != NULL) return error;
+        error = parse_vfp_register(context, text, length, &pos, &rm, &is_double);
+        if (error != NULL) return error;
+        if (is_double != (int) sz) return error_vfp_mismatched_precision();
+        error = check_trailing(text, length, pos);
+        if (error != NULL) return error;
+
+        split_vfp_register(rd, (int) sz, &vfpvd, &vfpdd);
+        split_vfp_register(rn, (int) sz, &vfpvn, &vfpdn);
+        split_vfp_register(rm, (int) sz, &vfpvm, &vfpdm);
+        *out_instr = 0xFE800A00u | (vfpdd << 22) | (vfpvn << 16) | (vfpvd << 12) | (sz << 8) |
+                     (vfpdn << 7) | (entry->param1 << 6) | (vfpdm << 5) | vfpvm;
+        return NULL;
+    }
+
+    if (dt.width != 32) return error_bad_datatype();
+    pos = peek_pos;
+    error = parse_neon_register(text, length, &pos, &rd, &cd);
+    if (error != NULL) return error;
+    error = expect_char(text, length, &pos, ',');
+    if (error != NULL) return error;
+    error = parse_neon_register(text, length, &pos, &rn, &cn);
+    if (error != NULL) return error;
+    error = expect_char(text, length, &pos, ',');
+    if (error != NULL) return error;
+    error = parse_neon_register(text, length, &pos, &rm, &cm);
+    if (error != NULL) return error;
+    error = check_trailing(text, length, pos);
+    if (error != NULL) return error;
+    if (cd != cn || cd != cm) return error_neon_mismatched_size();
+    q = (cd == 'Q') ? 1u : 0u;
+
+    split_neon_register(rn, cn, &vn, &nbit);
+    split_neon_register(rd, cd, &vd, &dbit);
+    split_neon_register(rm, cm, &vm, &mbit);
+    *out_instr = assemble_neon_three_same(1u, dbit, entry->param1, 0u, vn, vd, 0xFu, nbit, q, mbit, 1u, vm);
+    return NULL;
+}
+
+/* VSELEQ/VSELGE/VSELGT/VSELVS -- {S|D}d,{S|D}n,{S|D}m (ARMv8, VFP
+   scalar only, unconditional). The EQ/GE/GT/VS suffix selects which
+   APSR condition steers the run-time select and is encoded in a 2-bit
+   "cc" field -- it is not an ordinary condition-code suffix (VSEL is
+   always executed), so each combination is its own literal mnemonic
+   root with allows_cond=0 rather than going through the usual
+   root+cond grammar. entry->param1 is the 2-bit cc field. */
+static _kernel_oserror *encode_vfp_sel(assemble_context_t *context, const mnemonic_entry_t *entry,
+                                        uint32_t cond, int s_flag,
+                                        const uint8_t *text, size_t length, size_t pos,
+                                        uint32_t *out_instr)
+{
+    uint32_t sz, rd, rn, rm, vd, dd, vn, dn, vm, dm;
+    int is_double;
+    _kernel_oserror *error;
+
+    (void) cond; (void) s_flag;
+    error = parse_vfp_datatype(text, length, &pos, &sz);
+    if (error != NULL) return error;
+    error = parse_vfp_register(context, text, length, &pos, &rd, &is_double);
+    if (error != NULL) return error;
+    if (is_double != (int) sz) return error_vfp_mismatched_precision();
+    error = expect_char(text, length, &pos, ',');
+    if (error != NULL) return error;
+    error = parse_vfp_register(context, text, length, &pos, &rn, &is_double);
+    if (error != NULL) return error;
+    if (is_double != (int) sz) return error_vfp_mismatched_precision();
+    error = expect_char(text, length, &pos, ',');
+    if (error != NULL) return error;
+    error = parse_vfp_register(context, text, length, &pos, &rm, &is_double);
+    if (error != NULL) return error;
+    if (is_double != (int) sz) return error_vfp_mismatched_precision();
+    error = check_trailing(text, length, pos);
+    if (error != NULL) return error;
+
+    split_vfp_register(rd, (int) sz, &vd, &dd);
+    split_vfp_register(rn, (int) sz, &vn, &dn);
+    split_vfp_register(rm, (int) sz, &vm, &dm);
+
+    *out_instr = 0xFE000A00u | (dd << 22) | (entry->param1 << 20) | (vn << 16) | (vd << 12) | (sz << 8) |
+                 (dn << 7) | (dm << 5) | vm;
+    return NULL;
+}
+
+/* VRINTR/VRINTZ/VRINTX (VFP scalar, legacy conditional shape -- these
+   three, uniquely among this group, genuinely support a condition
+   code) and VRINTA/VRINTN/VRINTP/VRINTM (VFP scalar, ARMv8
+   unconditional-only shape) all also have a NEON Dd/Qd,Dm/Qm F32 form
+   (VRINTR is the only one that doesn't); dispatch on the parsed
+   datatype/register shape, same technique as encode_vfp_or_neon_maxnm
+   above. Syntax doubles the dt tag for every scalar form here (eg
+   "VRINTA.F32.F32 Sd,Sm", "VRINTZ.F64.F64 Dd,Dm") -- this mirrors the
+   real UAL assembly syntax for these mnemonics, confirmed against
+   VFPLib's own lookup table, not a guess.
+   entry->param1: bits7:4 = scalar shape (0=VRINTR/Z, 1=VRINTX,
+   2=VRINTA/N/P/M), bits3:0 = op (shape 0) or rm (shape 2), unused for
+   shape 1. entry->param2: NEON "op" field (0-7), or 0xFFFFFFFFu if
+   this mnemonic has no NEON form (VRINTR only). */
+static _kernel_oserror *encode_vfp_or_neon_rint(assemble_context_t *context, const mnemonic_entry_t *entry,
+                                                 uint32_t cond, int s_flag,
+                                                 const uint8_t *text, size_t length, size_t pos,
+                                                 uint32_t *out_instr)
+{
+    size_t peek_pos = pos;
+    uint8_t regclass;
+    neon_dt_t dt1, dt2;
+    uint32_t shape, val;
+    _kernel_oserror *error;
+
+    (void) context; (void) s_flag;
+    shape = (entry->param1 >> 4) & 0xFu;
+    val = entry->param1 & 0xFu;
+
+    error = parse_neon_dt(text, length, &peek_pos, &dt1);
+    if (error != NULL) return error;
+    error = parse_neon_dt(text, length, &peek_pos, &dt2);
+    if (error != NULL) return error;
+    if (dt1.kind != 'F' || dt2.kind != 'F' || dt1.width != dt2.width) return error_bad_datatype();
+    if (dt1.width != 32 && dt1.width != 64) return error_bad_datatype();
+    regclass = peek_neon_reg_class(text, length, peek_pos);
+
+    if (regclass == 'S' || (regclass == 'D' && dt1.width == 64))
+    {
+        uint32_t sz, rd, rm_reg, vd, dd, vm, dm;
+        int is_double;
+
+        sz = (dt1.width == 64) ? 1u : 0u;
+        pos = peek_pos;
+        error = parse_vfp_register(context, text, length, &pos, &rd, &is_double);
+        if (error != NULL) return error;
+        if (is_double != (int) sz) return error_vfp_mismatched_precision();
+        error = expect_char(text, length, &pos, ',');
+        if (error != NULL) return error;
+        error = parse_vfp_register(context, text, length, &pos, &rm_reg, &is_double);
+        if (error != NULL) return error;
+        if (is_double != (int) sz) return error_vfp_mismatched_precision();
+        error = check_trailing(text, length, pos);
+        if (error != NULL) return error;
+
+        split_vfp_register(rd, (int) sz, &vd, &dd);
+        split_vfp_register(rm_reg, (int) sz, &vm, &dm);
+
+        if (shape == 0u) /* VRINTR/VRINTZ */
+        {
+            *out_instr = (cond << 28) | 0x0EB60A40u | (dd << 22) | (vd << 12) | (sz << 8) |
+                         (val << 7) | (dm << 5) | vm;
+        }
+        else if (shape == 1u) /* VRINTX */
+        {
+            *out_instr = (cond << 28) | 0x0EB70A40u | (dd << 22) | (vd << 12) | (sz << 8) |
+                         (dm << 5) | vm;
+        }
+        else /* VRINTA/N/P/M */
+        {
+            *out_instr = 0xFEB80A40u | (dd << 22) | (val << 16) | (vd << 12) | (sz << 8) |
+                         (dm << 5) | vm;
+        }
+        return NULL;
+    }
+
+    if (entry->param2 == 0xFFFFFFFFu) return error_bad_datatype(); /* VRINTR has no NEON form */
+    if (cond != COND_AL) return error_neon_no_condition();
+    if (dt1.width != 32) return error_bad_datatype();
+    {
+        uint32_t rd, rm_reg;
+        uint8_t cd, cm;
+        uint32_t vd, dbit, vm, mbit, q;
+
+        pos = peek_pos;
+        error = parse_neon_register(text, length, &pos, &rd, &cd);
+        if (error != NULL) return error;
+        error = expect_char(text, length, &pos, ',');
+        if (error != NULL) return error;
+        error = parse_neon_register(text, length, &pos, &rm_reg, &cm);
+        if (error != NULL) return error;
+        error = check_trailing(text, length, pos);
+        if (error != NULL) return error;
+        if (cd != cm) return error_neon_mismatched_size();
+        q = (cd == 'Q') ? 1u : 0u;
+
+        split_neon_register(rd, cd, &vd, &dbit);
+        split_neon_register(rm_reg, cm, &vm, &mbit);
+        *out_instr = assemble_neon_two_reg_misc(dbit, 2u, 2u, vd, 8u | entry->param2, 0u, 0u, q, mbit, vm);
+    }
+    return NULL;
+}
+
+/* VCVTA/VCVTN/VCVTP/VCVTM -- Sd,{S|D}m (VFP scalar, ARMv8
+   unconditional, float-to-integer with directed rounding; the
+   destination is always a single-precision register holding the S32/
+   U32 result) or Dd/Qd,Dn/Qm (NEON, F32 source only, unconditional).
+   Unlike the dispatchers above, the destination register's class
+   alone disambiguates the two forms -- NEON never writes to an S
+   register -- so this parses both dt tags first (the same syntax
+   shape either way: "VCVTA.S32.F32 ..." or "VCVTA.U32.F64 ...", the
+   second tag restricted to F32 for the NEON form) and only then peeks
+   at Vd's class to decide the branch. The "op" (signed/unsigned) bit
+   has opposite polarity between the two real encodings -- S32 is
+   op=1 in the VFP scalar form but op=0 in the NEON form -- confirmed
+   against VFPLib's own lookup table entries for both forms, not
+   assumed.
+   entry->param1 is the 2-bit rm field (A=0, N=1, P=2, M=3), shared by
+   both encodings. */
+static _kernel_oserror *encode_vfp_or_neon_cvt_dir(assemble_context_t *context, const mnemonic_entry_t *entry,
+                                                     uint32_t cond, int s_flag,
+                                                     const uint8_t *text, size_t length, size_t pos,
+                                                     uint32_t *out_instr)
+{
+    neon_dt_t dt1, dt2;
+    uint32_t op_signed;
+    uint8_t regclass;
+    _kernel_oserror *error;
+
+    (void) s_flag;
+    error = parse_neon_dt(text, length, &pos, &dt1);
+    if (error != NULL) return error;
+    if (dt1.width != 32 || (dt1.kind != 'S' && dt1.kind != 'U')) return error_bad_datatype();
+    op_signed = (dt1.kind == 'S') ? 1u : 0u;
+    error = parse_neon_dt(text, length, &pos, &dt2);
+    if (error != NULL) return error;
+    if (dt2.kind != 'F') return error_bad_datatype();
+
+    regclass = peek_neon_reg_class(text, length, pos);
+
+    if (regclass == 'S')
+    {
+        uint32_t sz, rd, rm_reg, vd, dd, vm, dm;
+        int is_double;
+
+        if (dt2.width != 32 && dt2.width != 64) return error_bad_datatype();
+        sz = (dt2.width == 64) ? 1u : 0u;
+        error = parse_vfp_register(context, text, length, &pos, &rd, &is_double);
+        if (error != NULL) return error;
+        if (is_double) return error_vfp_mismatched_precision();
+        error = expect_char(text, length, &pos, ',');
+        if (error != NULL) return error;
+        error = parse_vfp_register(context, text, length, &pos, &rm_reg, &is_double);
+        if (error != NULL) return error;
+        if (is_double != (int) sz) return error_vfp_mismatched_precision();
+        error = check_trailing(text, length, pos);
+        if (error != NULL) return error;
+
+        split_vfp_register(rd, 0, &vd, &dd);
+        split_vfp_register(rm_reg, (int) sz, &vm, &dm);
+        *out_instr = 0xFEBC0A40u | (dd << 22) | (entry->param1 << 16) | (vd << 12) | (sz << 8) |
+                     (op_signed << 7) | (dm << 5) | vm;
+        return NULL;
+    }
+
+    if (cond != COND_AL) return error_neon_no_condition();
+    if (dt2.width != 32) return error_bad_datatype();
+    {
+        uint32_t rd, rm_reg, neon_u;
+        uint8_t cd, cm;
+        uint32_t vd, dbit, vm, mbit, q;
+
+        error = parse_neon_register(text, length, &pos, &rd, &cd);
+        if (error != NULL) return error;
+        error = expect_char(text, length, &pos, ',');
+        if (error != NULL) return error;
+        error = parse_neon_register(text, length, &pos, &rm_reg, &cm);
+        if (error != NULL) return error;
+        error = check_trailing(text, length, pos);
+        if (error != NULL) return error;
+        if (cd != cm) return error_neon_mismatched_size();
+        q = (cd == 'Q') ? 1u : 0u;
+
+        split_neon_register(rd, cd, &vd, &dbit);
+        split_neon_register(rm_reg, cm, &vm, &mbit);
+        neon_u = 1u - op_signed;
+        *out_instr = assemble_neon_two_reg_misc(dbit, 2u, 3u, vd, (entry->param1 << 1) | neon_u, 0u, 0u, q, mbit, vm);
+    }
+    return NULL;
+}
+
+/* VCVTB/VCVTT -- half-precision <-> single/double conversion (VFP
+   scalar, conditional; no NEON form). Syntax always pairs F16 with
+   F32 or F64 across two dt tags (eg "VCVTB.F32.F16 Sd,Sm"); which tag
+   is F16 selects widening (op=0, half->float) or narrowing (op=1,
+   float->half), and the non-F16 tag's width selects sz and, via op,
+   which of Vd/Vm is constrained to S (half-precision always lives in
+   the bottom 16 bits of a single-precision register) and which
+   follows sz.
+   entry->param1: T bit (0=VCVTB, bottom half; 1=VCVTT, top half). */
+static _kernel_oserror *encode_vfp_cvt_half(assemble_context_t *context, const mnemonic_entry_t *entry,
+                                             uint32_t cond, int s_flag,
+                                             const uint8_t *text, size_t length, size_t pos,
+                                             uint32_t *out_instr)
+{
+    neon_dt_t dt1, dt2;
+    uint32_t op, sz, rd, rm_reg, vd, dd, vm, dm;
+    int is_double, dst_is_double, src_is_double;
+    _kernel_oserror *error;
+
+    (void) s_flag;
+    error = parse_neon_dt(text, length, &pos, &dt1);
+    if (error != NULL) return error;
+    error = parse_neon_dt(text, length, &pos, &dt2);
+    if (error != NULL) return error;
+
+    if (dt1.kind == 'F' && dt1.width == 16 && dt2.kind == 'F' && (dt2.width == 32 || dt2.width == 64))
+    {
+        op = 1u;
+        sz = (dt2.width == 64) ? 1u : 0u;
+        dst_is_double = 0;
+        src_is_double = (int) sz;
+    }
+    else if (dt2.kind == 'F' && dt2.width == 16 && dt1.kind == 'F' && (dt1.width == 32 || dt1.width == 64))
+    {
+        op = 0u;
+        sz = (dt1.width == 64) ? 1u : 0u;
+        dst_is_double = (int) sz;
+        src_is_double = 0;
+    }
+    else
+    {
+        return error_bad_datatype();
+    }
+
+    error = parse_vfp_register(context, text, length, &pos, &rd, &is_double);
+    if (error != NULL) return error;
+    if (is_double != dst_is_double) return error_vfp_mismatched_precision();
+    error = expect_char(text, length, &pos, ',');
+    if (error != NULL) return error;
+    error = parse_vfp_register(context, text, length, &pos, &rm_reg, &is_double);
+    if (error != NULL) return error;
+    if (is_double != src_is_double) return error_vfp_mismatched_precision();
+    error = check_trailing(text, length, pos);
+    if (error != NULL) return error;
+
+    split_vfp_register(rd, dst_is_double, &vd, &dd);
+    split_vfp_register(rm_reg, src_is_double, &vm, &dm);
+
+    *out_instr = (cond << 28) | 0x0EB20A40u | (dd << 22) | (op << 16) | (vd << 12) | (sz << 8) |
+                 (entry->param1 << 7) | (dm << 5) | vm;
     return NULL;
 }
