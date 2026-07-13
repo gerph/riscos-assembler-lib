@@ -217,13 +217,15 @@ length" family (`VADD`, `VSUB`, `VMUL`, `VMLA`, `VMLS`, `VAND`, `VBIC`,
 `VACGT`, `VACLE`, `VACLT`, `VMAX`, `VMIN`, `VPMAX`, `VPMIN`, `VPADD`) and
 the "two registers misc" family (`VABS`, `VNEG`, `VCLS`, `VCLZ`, `VCNT`,
 `VMVN`, `VQABS`, `VQNEG`, `VRECPE`, `VRSQRTE`, `VREV16`, `VREV32`,
-`VREV64`, `VSWP`, `VTRN`, `VUZP`, `VZIP`), plus the `#0` comparison form
-of `VCEQ`/`VCGE`/`VCGT`/`VCLE`/`VCLT`. Everything else NEON (shifts by
-immediate, long/wide/narrow arithmetic, by-scalar multiply forms,
-move-immediate/duplicate/table-lookup/extract, load/store, and
-convert/ARMv8-only additions such as `VRINT*`, `VSEL*`, `VMAXNM`/
-`VMINNM` and directed-rounding `VCVT`) remains a follow-on. Within base
-ARM32, the ARMv5TE/v6 'xy' DSP
+`VREV64`, `VSWP`, `VTRN`, `VUZP`, `VZIP`), the `#0` comparison form of
+`VCEQ`/`VCGE`/`VCGT`/`VCLE`/`VCLT`, and shift-by-immediate (`VSHL`,
+`VSHR`, `VSRA`, `VRSHR`, `VRSRA`, `VSRI`, `VSLI`, `VQSHL`, `VQSHLU`,
+`VSHLL`, `VSHRN`, `VRSHRN`, `VQSHRN`, `VQSHRUN`, `VQRSHRN`,
+`VQRSHRUN`). Everything else NEON (long/wide/narrow arithmetic,
+by-scalar multiply forms, move-immediate/duplicate/table-lookup/extract,
+load/store, and convert/ARMv8-only additions such as `VRINT*`, `VSEL*`,
+`VMAXNM`/`VMINNM` and directed-rounding `VCVT`) remains a follow-on.
+Within base ARM32, the ARMv5TE/v6 'xy' DSP
 multiply family (`SMLABB`, `SMLAWx`, `SMUAD`, `SMLAD`, `SMLALD` and
 friends), `SMMLA`/`SMMLS`/`SMMUL`, `MRRC`/`MCRR`, the ARMv8 `LDA`/`STL`/
 `LDAEX`/`STLEX` load-acquire/store-release family, and the banked-register

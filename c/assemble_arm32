@@ -963,6 +963,18 @@ typedef enum instr_family
                                     encode_neon_two_reg_misc for the param1 bit layout */
     FAMILY_NEON_MVN_SWP,        /* VMVN(register)/VSWP -- Dd/Qd,Dm/Qm, optional ignored dt, size fixed 0 */
     FAMILY_NEON_UZP_ZIP,        /* VUZP/VZIP -- Dd/Qd,Dm/Qm; Dd,#32 aliases to VTRN's encoding */
+    FAMILY_NEON_VSHL_OR_REG,    /* VSHL VQSHL -- three-same register form or shift-immediate form,
+                                    selected by whether the third operand is a register or #imm;
+                                    see encode_neon_vshl_or_reg */
+    FAMILY_NEON_SHIFT_IMM,      /* Dd/Qd,Dn/Qn,#imm -- VSHR VSRA VRSHR VRSRA VSRI VSLI VQSHLU; see
+                                    encode_neon_shift_imm for the param1 bit layout and
+                                    assemble_neon_shift_imm for the encoded word shape */
+    FAMILY_NEON_SHIFT_NARROW,   /* Dd,Qm,#imm -- VSHRN VRSHRN (narrowing right shift, dest size
+                                    dt.width/2, no sign) */
+    FAMILY_NEON_SHIFT_QNARROW,  /* Dd,Qm,#imm -- VQSHRN VQSHRUN VQRSHRN VQRSHRUN (narrowing
+                                    saturating right shift, U fixed or S/U-derived) */
+    FAMILY_NEON_VSHLL,          /* Qd,Dm,#imm -- VSHLL (general A1 form, or the A2 "shift by exactly
+                                    the element size" form when the immediate equals dt.width) */
 
     FAMILY_NONE         /* unreachable placeholder root, never dispatched */
 } instr_family_t;
@@ -1243,7 +1255,8 @@ static const mnemonic_entry_t mnemonic_table[] = {
     { "VQADD",  FAMILY_NEON_3SAME, 0x80000000u | (1u<<25) | (0x0u<<8) | (1u<<4) | 2u, 0, 0, 0, ASSEMBLE_ARM32_OPT_VFP },
     { "VQSUB",  FAMILY_NEON_3SAME, 0x80000000u | (1u<<25) | (0x2u<<8) | (1u<<4) | 2u, 0, 0, 0, ASSEMBLE_ARM32_OPT_VFP },
     { "VRSHL",  FAMILY_NEON_3SAME, 0x80000000u | (1u<<25) | (0x5u<<8) | (0u<<4) | 2u, 0, 0, 0, ASSEMBLE_ARM32_OPT_VFP },
-    { "VQSHL",  FAMILY_NEON_3SAME, 0x80000000u | (1u<<25) | (0x4u<<8) | (1u<<4) | 2u, 0, 0, 0, ASSEMBLE_ARM32_OPT_VFP },
+    { "VSHL",   FAMILY_NEON_VSHL_OR_REG, (0x4u<<8) | (0u<<4), (0x5u<<8), 0, 0, ASSEMBLE_ARM32_OPT_VFP },
+    { "VQSHL",  FAMILY_NEON_VSHL_OR_REG, (0x4u<<8) | (1u<<4), (1u<<25) | (0x7u<<8), 0, 0, ASSEMBLE_ARM32_OPT_VFP },
     { "VQRSHL", FAMILY_NEON_3SAME, 0x80000000u | (1u<<25) | (0x5u<<8) | (1u<<4) | 2u, 0, 0, 0, ASSEMBLE_ARM32_OPT_VFP },
     { "VHADD",  FAMILY_NEON_3SAME, 0x80000000u | (1u<<25) | (0x0u<<8) | (0u<<4), 0, 0, 0, ASSEMBLE_ARM32_OPT_VFP },
     { "VHSUB",  FAMILY_NEON_3SAME, 0x80000000u | (1u<<25) | (0x2u<<8) | (0u<<4), 0, 0, 0, ASSEMBLE_ARM32_OPT_VFP },
@@ -1320,7 +1333,39 @@ static const mnemonic_entry_t mnemonic_table[] = {
     /* VUZP/VZIP: Dd,#32 (D-register, 32-bit lanes) is architecturally
        identical to VTRN and is encoded as such. param1 tag: 0=VUZP, 1=VZIP. */
     { "VUZP", FAMILY_NEON_UZP_ZIP, 0, 0, 0, 0, ASSEMBLE_ARM32_OPT_VFP },
-    { "VZIP", FAMILY_NEON_UZP_ZIP, 1, 0, 0, 0, ASSEMBLE_ARM32_OPT_VFP }
+    { "VZIP", FAMILY_NEON_UZP_ZIP, 1, 0, 0, 0, ASSEMBLE_ARM32_OPT_VFP },
+
+    /* Shift-by-immediate (ARM DDI 0406C A7.4.7/A7.4.9). param1:
+       bits3:0=opcode, bit4=u_derived (from S/U dt), bit5=u_fixed (when
+       not derived), bit6=is_left (selects the imm6 formula). See
+       encode_neon_shift_imm_generic. */
+    { "VSHR",   FAMILY_NEON_SHIFT_IMM, (0x0u<<0) | (1u<<4), 0, 0, 0, ASSEMBLE_ARM32_OPT_VFP },
+    { "VSRA",   FAMILY_NEON_SHIFT_IMM, (0x1u<<0) | (1u<<4), 0, 0, 0, ASSEMBLE_ARM32_OPT_VFP },
+    { "VRSHR",  FAMILY_NEON_SHIFT_IMM, (0x2u<<0) | (1u<<4), 0, 0, 0, ASSEMBLE_ARM32_OPT_VFP },
+    { "VRSRA",  FAMILY_NEON_SHIFT_IMM, (0x3u<<0) | (1u<<4), 0, 0, 0, ASSEMBLE_ARM32_OPT_VFP },
+    { "VSRI",   FAMILY_NEON_SHIFT_IMM, (0x4u<<0) | (1u<<5), 0, 0, 0, ASSEMBLE_ARM32_OPT_VFP },
+    { "VSLI",   FAMILY_NEON_SHIFT_IMM, (0x5u<<0) | (1u<<5) | (1u<<6), 0, 0, 0, ASSEMBLE_ARM32_OPT_VFP },
+    { "VQSHLU", FAMILY_NEON_SHIFT_IMM, (0x6u<<0) | (1u<<5) | (1u<<6), 0, 0, 0, ASSEMBLE_ARM32_OPT_VFP },
+
+    /* Narrowing shift-by-immediate (Dd,Qm,#imm, dest size dt.width/2).
+       param1: bits3:0=opcode, bit4=qbit_fixed (the plain-vs-rounded
+       selector, at the bit position a D/Q choice would otherwise use).
+       See encode_neon_shift_narrow. */
+    { "VSHRN",  FAMILY_NEON_SHIFT_NARROW, (0x8u<<0) | (0u<<4), 0, 0, 0, ASSEMBLE_ARM32_OPT_VFP },
+    { "VRSHRN", FAMILY_NEON_SHIFT_NARROW, (0x8u<<0) | (1u<<4), 0, 0, 0, ASSEMBLE_ARM32_OPT_VFP },
+
+    /* Narrowing saturating shift-by-immediate. param1: bits3:0=opcode,
+       bit4=qbit_fixed (plain-vs-rounded), bit6=u_derived, bit7=u_fixed
+       (when not derived). See encode_neon_shift_qnarrow. */
+    { "VQSHRN",   FAMILY_NEON_SHIFT_QNARROW, (0x9u<<0) | (0u<<4) | (1u<<6), 0, 0, 0, ASSEMBLE_ARM32_OPT_VFP },
+    { "VQSHRUN",  FAMILY_NEON_SHIFT_QNARROW, (0x8u<<0) | (0u<<4) | (1u<<7), 0, 0, 0, ASSEMBLE_ARM32_OPT_VFP },
+    { "VQRSHRN",  FAMILY_NEON_SHIFT_QNARROW, (0x9u<<0) | (1u<<4) | (1u<<6), 0, 0, 0, ASSEMBLE_ARM32_OPT_VFP },
+    { "VQRSHRUN", FAMILY_NEON_SHIFT_QNARROW, (0x8u<<0) | (1u<<4) | (1u<<7), 0, 0, 0, ASSEMBLE_ARM32_OPT_VFP },
+
+    /* VSHLL Qd,Dm,#imm -- general form (imm < dt.width) or the dedicated
+       "shift by exactly the element size" A2 form (imm == dt.width);
+       no per-mnemonic param needed, see encode_neon_vshll. */
+    { "VSHLL", FAMILY_NEON_VSHLL, 0, 0, 0, 0, ASSEMBLE_ARM32_OPT_VFP }
 };
 #define NUM_MNEMONICS (sizeof(mnemonic_table) / sizeof(mnemonic_table[0]))
 
@@ -3609,6 +3654,16 @@ static _kernel_oserror *encode_neon_mvn_swp(assemble_context_t *, const mnemonic
                                              const uint8_t *, size_t, size_t, uint32_t *);
 static _kernel_oserror *encode_neon_uzp_zip(assemble_context_t *, const mnemonic_entry_t *, uint32_t, int,
                                              const uint8_t *, size_t, size_t, uint32_t *);
+static _kernel_oserror *encode_neon_vshl_or_reg(assemble_context_t *, const mnemonic_entry_t *, uint32_t, int,
+                                                 const uint8_t *, size_t, size_t, uint32_t *);
+static _kernel_oserror *encode_neon_shift_imm_generic(assemble_context_t *, const mnemonic_entry_t *, uint32_t, int,
+                                                       const uint8_t *, size_t, size_t, uint32_t *);
+static _kernel_oserror *encode_neon_shift_narrow(assemble_context_t *, const mnemonic_entry_t *, uint32_t, int,
+                                                  const uint8_t *, size_t, size_t, uint32_t *);
+static _kernel_oserror *encode_neon_shift_qnarrow(assemble_context_t *, const mnemonic_entry_t *, uint32_t, int,
+                                                   const uint8_t *, size_t, size_t, uint32_t *);
+static _kernel_oserror *encode_neon_vshll(assemble_context_t *, const mnemonic_entry_t *, uint32_t, int,
+                                           const uint8_t *, size_t, size_t, uint32_t *);
 
 static family_encoder_fn family_encoder(instr_family_t family)
 {
@@ -3674,6 +3729,11 @@ static family_encoder_fn family_encoder(instr_family_t family)
         case FAMILY_NEON_2REG_MISC:       return encode_neon_two_reg_misc;
         case FAMILY_NEON_MVN_SWP:         return encode_neon_mvn_swp;
         case FAMILY_NEON_UZP_ZIP:         return encode_neon_uzp_zip;
+        case FAMILY_NEON_VSHL_OR_REG:     return encode_neon_vshl_or_reg;
+        case FAMILY_NEON_SHIFT_IMM:       return encode_neon_shift_imm_generic;
+        case FAMILY_NEON_SHIFT_NARROW:    return encode_neon_shift_narrow;
+        case FAMILY_NEON_SHIFT_QNARROW:   return encode_neon_shift_qnarrow;
+        case FAMILY_NEON_VSHLL:           return encode_neon_vshll;
         default:                  return NULL;
     }
 }
@@ -5821,4 +5881,409 @@ static _kernel_oserror *encode_neon_uzp_zip(assemble_context_t *context, const m
     *out_instr = assemble_neon_two_reg_misc(dbit, neon_dt_size2(dt.width), 2u /* group10 */, vd,
                                              opcode4, 0u, 0u, q, mbit, vm);
     return NULL;
+}
+
+/* ---------------------------------------------------------------
+ * NEON/Advanced SIMD -- shift by immediate (ARM DDI 0406C
+ * A7.4.7/A7.4.9). The shift amount and element size share one 6-bit
+ * (or, for the D/Q-choice family, 7-bit L:imm6) field: for a LEFT
+ * shift the encoded value is <element size> + <shift amount>; for a
+ * RIGHT shift it is 2*<element size> - <shift amount>. Both formulas
+ * give the same field range [size, 2*size-1], which is how hardware
+ * recovers the element size from the position of the field's leading
+ * 1 bit. This piece was flagged as higher-risk during reconnaissance
+ * (2026-07) precisely because of this formula, so every constant
+ * below was cross-checked against VFPLib/VFPLib's bitstrings rather
+ * than derived from memory.
+ * --------------------------------------------------------------- */
+
+/* Assembles a shift-by-immediate word (skeleton with bit23=1, distinct
+   from the three-same family's bit23=0). lbit is the size-extension
+   bit (bit7); for families with no D/Q register-class choice at that
+   bit position (the narrowing/VSHLL forms), pass the appropriate
+   fixed value in place of a genuine Q selector. */
+static uint32_t assemble_neon_shift_imm(uint32_t u, uint32_t dbit, uint32_t imm6, uint32_t vd,
+                                         uint32_t opcode4, uint32_t lbit, uint32_t q, uint32_t mbit,
+                                         uint32_t vm)
+{
+    return 0xF2800010u | (u << 24) | (dbit << 22) | (imm6 << 16) | (vd << 12) |
+           (opcode4 << 8) | (lbit << 7) | (q << 6) | (mbit << 5) | vm;
+}
+
+/* VSHR/VSRA/VRSHR/VRSRA/VSRI/VSLI/VQSHLU -- {Dd|Qd},{Dn|Qn},#imm, the
+   "D/Q-choice" shift-immediate shape. See FAMILY_NEON_SHIFT_IMM in the
+   mnemonic table for the param1 layout. */
+static _kernel_oserror *encode_neon_shift_imm_generic(assemble_context_t *context, const mnemonic_entry_t *entry,
+                                                        uint32_t cond, int s_flag,
+                                                        const uint8_t *text, size_t length, size_t pos,
+                                                        uint32_t *out_instr)
+{
+    neon_dt_t dt;
+    uint32_t rd, rm;
+    uint8_t cd, cm;
+    assemble_value_t value;
+    size_t consumed;
+    int32_t shift_amt;
+    uint32_t vd, dbit, vm, mbit, q, u, opcode4, is_left, l, imm6, field;
+    _kernel_oserror *error;
+
+    (void) s_flag;
+    if (cond != COND_AL) return error_neon_no_condition();
+
+    error = parse_neon_dt(text, length, &pos, &dt);
+    if (error != NULL) return error;
+    error = parse_neon_register(text, length, &pos, &rd, &cd);
+    if (error != NULL) return error;
+    error = expect_char(text, length, &pos, ',');
+    if (error != NULL) return error;
+    error = parse_neon_register(text, length, &pos, &rm, &cm);
+    if (error != NULL) return error;
+    error = expect_char(text, length, &pos, ',');
+    if (error != NULL) return error;
+    error = expect_char(text, length, &pos, '#');
+    if (error != NULL) return error;
+    error = eval_expr(context, text + pos, length - pos, &value, &consumed);
+    if (error != NULL) return error;
+    pos += consumed;
+    error = check_trailing(text, length, pos);
+    if (error != NULL) return error;
+    if (cd != cm) return error_neon_mismatched_size();
+    q = (cd == 'Q') ? 1u : 0u;
+
+    is_left = (entry->param1 >> 6) & 1u;
+    shift_amt = value_to_integer(&value);
+    if (is_left)
+    {
+        if (shift_amt < 0 || (uint32_t) shift_amt >= dt.width) return error_bad_shift();
+    }
+    else
+    {
+        if (shift_amt < 1 || (uint32_t) shift_amt > dt.width) return error_bad_shift();
+    }
+
+    opcode4 = entry->param1 & 0xFu;
+    if (entry->param1 & (1u << 4)) /* u_derived */
+    {
+        if (dt.kind == 'S') u = 0u;
+        else if (dt.kind == 'U') u = 1u;
+        else return error_bad_datatype();
+    }
+    else
+    {
+        if (dt.kind != 0 && dt.kind != 'I' && dt.kind != 'S' && dt.kind != 'U') return error_bad_datatype();
+        u = (entry->param1 >> 5) & 1u;
+    }
+
+    field = is_left ? (dt.width + (uint32_t) shift_amt) : (2u * dt.width - (uint32_t) shift_amt);
+    l = (field >> 6) & 1u;
+    imm6 = field & 0x3Fu;
+
+    split_neon_register(rd, cd, &vd, &dbit);
+    split_neon_register(rm, cm, &vm, &mbit);
+    *out_instr = assemble_neon_shift_imm(u, dbit, imm6, vd, opcode4, l, q, mbit, vm);
+    return NULL;
+}
+
+/* VSHRN/VRSHRN -- Dd,Qm,#imm (narrowing right shift; destination
+   element size is dt.width/2, so the field formula uses dt.width
+   directly: 2*(dt.width/2) - shift = dt.width - shift). U is always 0
+   -- these have no signed/unsigned distinction. */
+static _kernel_oserror *encode_neon_shift_narrow(assemble_context_t *context, const mnemonic_entry_t *entry,
+                                                   uint32_t cond, int s_flag,
+                                                   const uint8_t *text, size_t length, size_t pos,
+                                                   uint32_t *out_instr)
+{
+    neon_dt_t dt;
+    uint32_t rd, rm;
+    uint8_t cd, cm;
+    assemble_value_t value;
+    size_t consumed;
+    int32_t shift_amt;
+    uint32_t vd, dbit, vm, mbit, imm6, field, opcode4, qbit_fixed;
+    _kernel_oserror *error;
+
+    (void) s_flag;
+    if (cond != COND_AL) return error_neon_no_condition();
+
+    error = parse_neon_dt(text, length, &pos, &dt);
+    if (error != NULL) return error;
+    if (dt.kind != 0 && dt.kind != 'I') return error_bad_datatype();
+    if (dt.width != 16 && dt.width != 32 && dt.width != 64) return error_bad_datatype();
+    error = parse_neon_register(text, length, &pos, &rd, &cd);
+    if (error != NULL) return error;
+    if (cd != 'D') return error_neon_mismatched_size();
+    error = expect_char(text, length, &pos, ',');
+    if (error != NULL) return error;
+    error = parse_neon_register(text, length, &pos, &rm, &cm);
+    if (error != NULL) return error;
+    if (cm != 'Q') return error_neon_mismatched_size();
+    error = expect_char(text, length, &pos, ',');
+    if (error != NULL) return error;
+    error = expect_char(text, length, &pos, '#');
+    if (error != NULL) return error;
+    error = eval_expr(context, text + pos, length - pos, &value, &consumed);
+    if (error != NULL) return error;
+    pos += consumed;
+    error = check_trailing(text, length, pos);
+    if (error != NULL) return error;
+
+    shift_amt = value_to_integer(&value);
+    if (shift_amt < 1 || (uint32_t) shift_amt > dt.width / 2u) return error_bad_shift();
+
+    field = dt.width - (uint32_t) shift_amt;
+    imm6 = field & 0x3Fu; /* L is always 0 here (destination size is never 64) */
+    opcode4 = entry->param1 & 0xFu;
+    qbit_fixed = (entry->param1 >> 4) & 1u;
+
+    split_neon_register(rd, cd, &vd, &dbit);
+    split_neon_register(rm, cm, &vm, &mbit);
+    *out_instr = assemble_neon_shift_imm(0u, dbit, imm6, vd, opcode4, 0u, qbit_fixed, mbit, vm);
+    return NULL;
+}
+
+/* VQSHRN/VQSHRUN/VQRSHRN/VQRSHRUN -- Dd,Qm,#imm (narrowing saturating
+   right shift); like encode_neon_shift_narrow but with a genuine
+   signed/unsigned distinction (derived from dt for VQSHRN/VQRSHRN,
+   fixed for the "unsigned result from signed source" VQSHRUN/
+   VQRSHRUN). */
+static _kernel_oserror *encode_neon_shift_qnarrow(assemble_context_t *context, const mnemonic_entry_t *entry,
+                                                    uint32_t cond, int s_flag,
+                                                    const uint8_t *text, size_t length, size_t pos,
+                                                    uint32_t *out_instr)
+{
+    neon_dt_t dt;
+    uint32_t rd, rm;
+    uint8_t cd, cm;
+    assemble_value_t value;
+    size_t consumed;
+    int32_t shift_amt;
+    uint32_t vd, dbit, vm, mbit, imm6, field, opcode4, qbit_fixed, u;
+    _kernel_oserror *error;
+
+    (void) s_flag;
+    if (cond != COND_AL) return error_neon_no_condition();
+
+    error = parse_neon_dt(text, length, &pos, &dt);
+    if (error != NULL) return error;
+    if (dt.width != 16 && dt.width != 32 && dt.width != 64) return error_bad_datatype();
+    error = parse_neon_register(text, length, &pos, &rd, &cd);
+    if (error != NULL) return error;
+    if (cd != 'D') return error_neon_mismatched_size();
+    error = expect_char(text, length, &pos, ',');
+    if (error != NULL) return error;
+    error = parse_neon_register(text, length, &pos, &rm, &cm);
+    if (error != NULL) return error;
+    if (cm != 'Q') return error_neon_mismatched_size();
+    error = expect_char(text, length, &pos, ',');
+    if (error != NULL) return error;
+    error = expect_char(text, length, &pos, '#');
+    if (error != NULL) return error;
+    error = eval_expr(context, text + pos, length - pos, &value, &consumed);
+    if (error != NULL) return error;
+    pos += consumed;
+    error = check_trailing(text, length, pos);
+    if (error != NULL) return error;
+
+    shift_amt = value_to_integer(&value);
+    if (shift_amt < 1 || (uint32_t) shift_amt > dt.width / 2u) return error_bad_shift();
+
+    if (entry->param1 & (1u << 6)) /* u_derived */
+    {
+        if (dt.kind == 'S') u = 0u;
+        else if (dt.kind == 'U') u = 1u;
+        else return error_bad_datatype();
+    }
+    else
+    {
+        if (dt.kind != 0 && dt.kind != 'I' && dt.kind != 'S' && dt.kind != 'U') return error_bad_datatype();
+        u = (entry->param1 >> 7) & 1u;
+    }
+
+    field = dt.width - (uint32_t) shift_amt;
+    imm6 = field & 0x3Fu;
+    opcode4 = entry->param1 & 0xFu;
+    qbit_fixed = (entry->param1 >> 4) & 1u;
+
+    split_neon_register(rd, cd, &vd, &dbit);
+    split_neon_register(rm, cm, &vm, &mbit);
+    *out_instr = assemble_neon_shift_imm(u, dbit, imm6, vd, opcode4, 0u, qbit_fixed, mbit, vm);
+    return NULL;
+}
+
+/* VSHLL Qd,Dm,#imm -- widening shift left. When the immediate equals
+   the element size exactly, real syntax and hardware both use a
+   dedicated, simpler "A2" encoding (no imm6 field at all, just a
+   2-bit size); anything less uses the general A1 imm6 form (which,
+   since the source is always <=32 bits wide here, never needs the L
+   size-extension bit). Vd is always Q and Vm always D -- unlike every
+   other shift-immediate mnemonic there is no D/Q choice to encode, so
+   this doesn't go through encode_neon_shift_imm_generic. */
+static _kernel_oserror *encode_neon_vshll(assemble_context_t *context, const mnemonic_entry_t *entry,
+                                           uint32_t cond, int s_flag,
+                                           const uint8_t *text, size_t length, size_t pos,
+                                           uint32_t *out_instr)
+{
+    neon_dt_t dt;
+    uint32_t rd, rm;
+    uint8_t cd, cm;
+    assemble_value_t value;
+    size_t consumed;
+    int32_t shift_amt;
+    uint32_t vd, dbit, vm, mbit, u;
+    _kernel_oserror *error;
+
+    (void) entry; (void) s_flag;
+    if (cond != COND_AL) return error_neon_no_condition();
+
+    error = parse_neon_dt(text, length, &pos, &dt);
+    if (error != NULL) return error;
+    if (dt.width != 8 && dt.width != 16 && dt.width != 32) return error_bad_datatype();
+    error = parse_neon_register(text, length, &pos, &rd, &cd);
+    if (error != NULL) return error;
+    if (cd != 'Q') return error_neon_mismatched_size();
+    error = expect_char(text, length, &pos, ',');
+    if (error != NULL) return error;
+    error = parse_neon_register(text, length, &pos, &rm, &cm);
+    if (error != NULL) return error;
+    if (cm != 'D') return error_neon_mismatched_size();
+    error = expect_char(text, length, &pos, ',');
+    if (error != NULL) return error;
+    error = expect_char(text, length, &pos, '#');
+    if (error != NULL) return error;
+    error = eval_expr(context, text + pos, length - pos, &value, &consumed);
+    if (error != NULL) return error;
+    pos += consumed;
+    error = check_trailing(text, length, pos);
+    if (error != NULL) return error;
+
+    shift_amt = value_to_integer(&value);
+    split_neon_register(rd, cd, &vd, &dbit);
+    split_neon_register(rm, cm, &vm, &mbit);
+
+    if (shift_amt >= 0 && (uint32_t) shift_amt == dt.width)
+    {
+        *out_instr = 0xF3B20300u | (dbit << 22) | (neon_dt_size2(dt.width) << 18) | (vd << 12) |
+                     (mbit << 5) | vm;
+        return NULL;
+    }
+
+    if (shift_amt < 0 || (uint32_t) shift_amt >= dt.width) return error_bad_shift();
+    if (dt.kind == 'S') u = 0u;
+    else if (dt.kind == 'U') u = 1u;
+    else return error_bad_datatype();
+    {
+        uint32_t field = dt.width + (uint32_t) shift_amt;
+        uint32_t l = (field >> 6) & 1u;
+        uint32_t imm6 = field & 0x3Fu;
+
+        *out_instr = assemble_neon_shift_imm(u, dbit, imm6, vd, 0xAu /* opcode 1010 */, l, 0u /* Q fixed 0 */,
+                                              mbit, vm);
+    }
+    return NULL;
+}
+
+/* VSHL/VQSHL -- three-same register form ({Dd|Qd},{Dn|Qn},{Dm|Qm}) or
+   shift-immediate form ({Dd|Qd},{Dn|Qn},#imm), selected by whether the
+   third operand is a register or an immediate; both share one root
+   the same way VADD etc do (see encode_vfp_or_neon_arith3), just with
+   a NEON-vs-NEON choice instead of scalar-vs-NEON.
+   param1 (register form): bits11:8=opcode, bit4=opbit (both always
+   S/U-derived, same convention as FAMILY_NEON_3SAME's param1).
+   param2 (immediate form): bits11:8=opcode, bit25=u_derived, bit24=
+   u_fixed (when not derived). */
+static _kernel_oserror *encode_neon_vshl_or_reg(assemble_context_t *context, const mnemonic_entry_t *entry,
+                                                  uint32_t cond, int s_flag,
+                                                  const uint8_t *text, size_t length, size_t pos,
+                                                  uint32_t *out_instr)
+{
+    neon_dt_t dt;
+    uint32_t rd, rn;
+    uint8_t cd, cn;
+    size_t peek_pos;
+    _kernel_oserror *error;
+
+    (void) s_flag;
+    if (cond != COND_AL) return error_neon_no_condition();
+
+    error = parse_neon_dt(text, length, &pos, &dt);
+    if (error != NULL) return error;
+    error = parse_neon_register(text, length, &pos, &rd, &cd);
+    if (error != NULL) return error;
+    error = expect_char(text, length, &pos, ',');
+    if (error != NULL) return error;
+    error = parse_neon_register(text, length, &pos, &rn, &cn);
+    if (error != NULL) return error;
+    error = expect_char(text, length, &pos, ',');
+    if (error != NULL) return error;
+
+    peek_pos = pos + assemble_skip_spaces(text + pos, length - pos);
+    if (peek_pos < length && text[peek_pos] == '#')
+    {
+        assemble_value_t value;
+        size_t consumed;
+        int32_t shift_amt;
+        uint32_t vd, dbit, vm, mbit, q, u, opcode4, l, imm6, field;
+
+        pos = peek_pos + 1;
+        error = eval_expr(context, text + pos, length - pos, &value, &consumed);
+        if (error != NULL) return error;
+        pos += consumed;
+        error = check_trailing(text, length, pos);
+        if (error != NULL) return error;
+        if (cd != cn) return error_neon_mismatched_size();
+        q = (cd == 'Q') ? 1u : 0u;
+
+        shift_amt = value_to_integer(&value);
+        if (shift_amt < 0 || (uint32_t) shift_amt >= dt.width) return error_bad_shift();
+
+        opcode4 = (entry->param2 >> 8) & 0xFu;
+        if (entry->param2 & (1u << 25)) /* u_derived */
+        {
+            if (dt.kind == 'S') u = 0u;
+            else if (dt.kind == 'U') u = 1u;
+            else return error_bad_datatype();
+        }
+        else
+        {
+            if (dt.kind != 0 && dt.kind != 'I') return error_bad_datatype();
+            u = (entry->param2 >> 24) & 1u;
+        }
+
+        field = dt.width + (uint32_t) shift_amt;
+        l = (field >> 6) & 1u;
+        imm6 = field & 0x3Fu;
+
+        split_neon_register(rd, cd, &vd, &dbit);
+        split_neon_register(rn, cn, &vm, &mbit);
+        *out_instr = assemble_neon_shift_imm(u, dbit, imm6, vd, opcode4, l, q, mbit, vm);
+        return NULL;
+    }
+    else
+    {
+        uint32_t rm;
+        uint8_t cm;
+        uint32_t vd, dbit, vn, nbit, vm, mbit, q, u, opcode4, opbit, size2;
+
+        pos = peek_pos;
+        error = parse_neon_register(text, length, &pos, &rm, &cm);
+        if (error != NULL) return error;
+        error = check_trailing(text, length, pos);
+        if (error != NULL) return error;
+        if (cd != cn || cd != cm) return error_neon_mismatched_size();
+        q = (cd == 'Q') ? 1u : 0u;
+
+        if (dt.kind == 'S') u = 0u;
+        else if (dt.kind == 'U') u = 1u;
+        else return error_bad_datatype();
+        opcode4 = (entry->param1 >> 8) & 0xFu;
+        opbit = (entry->param1 >> 4) & 1u;
+        size2 = neon_dt_size2(dt.width);
+
+        split_neon_register(rn, cn, &vn, &nbit);
+        split_neon_register(rd, cd, &vd, &dbit);
+        split_neon_register(rm, cm, &vm, &mbit);
+        *out_instr = assemble_neon_three_same(u, dbit, size2 >> 1, size2 & 1u, vn, vd, opcode4, nbit, q, mbit,
+                                               opbit, vm);
+        return NULL;
+    }
 }

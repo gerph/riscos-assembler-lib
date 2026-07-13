@@ -385,19 +385,70 @@ operand instead of a third register). More design notes:
   leniency already documented for the three-same family, to keep this
   port's scope bounded without producing incorrect encodings.
 
-Everything else NEON — shift-by-immediate (`VSHL`/`VSHR`/`VSRA`/`VSLI`/
-`VSRI`/`VQSHL`-immediate/`VSHLL`/`VSHRN`/...), long/wide/narrow
-arithmetic (`VADDL`/`VMLAL`/`VMULL`/`VQDMULL`/`VMOVL`/`VMOVN`/...),
-by-scalar multiply forms (`VMUL`/`VMLA`/`VMLAL`/... with a `Dm[x]`
-indexed operand), move-immediate/duplicate/table-lookup/extract
-(`VMOV`/`VMVN` immediate, `VDUP`, `VEXT`, `VTBL`/`VTBX`), load/store
-(`VLD1`-`VLD4`/`VST1`-`VST4`, all alignment/lane/multiple-structure
-forms), and the convert/ARMv8-only additions (`VCVT` all forms,
-`VCVTB`/`VCVTT`, `VRINT*`, `VSEL*`, `VMAXNM`/`VMINNM`) remain a follow-on
-— several of those (the shift-immediate bitfield-width formulas,
-`VMOV`/`VMVN`'s immediate `cmode` table, datatype-conditional
-structure-load alignment) are meaningfully higher-risk to get bit-exact
-than anything ported so far.
+The third batch covers shift-by-immediate (ARM DDI 0406C A7.4.7/A7.4.9)
+— `VSHR`, `VSRA`, `VRSHR`, `VRSRA`, `VSRI`, `VSLI`, `VQSHLU`, `VSHRN`,
+`VRSHRN`, `VQSHRN`, `VQSHRUN`, `VQRSHRN`, `VQRSHRUN`, `VSHLL`, plus
+`VSHL`/`VQSHL` (which, like `VADD` etc, need merged dispatch — here
+between two *different NEON* shapes rather than scalar-vs-NEON, since
+each has both a three-same register form, already covered in batch one,
+and a shift-immediate form). This was flagged during reconnaissance as
+the highest-risk piece so far, because of how the shift amount and
+element size share one bitfield:
+
+- For a shift instruction, the element size (8/16/32/64) and the shift
+  amount are encoded together in a single 6-bit (`imm6`) or 7-bit
+  (`L:imm6`) field, recovered by hardware from the position of the
+  field's *leading 1 bit* — not two separate subfields. The encoding
+  formula is `element_size + shift_amount` for a left shift, or
+  `2*element_size - shift_amount` for a right shift; both give the same
+  field range `[size, 2*size-1]`, which is what makes the leading-bit
+  trick work for either direction. `assemble_neon_shift_imm` takes the
+  final `imm6`/`L` values already computed by the caller rather than
+  trying to encapsulate the formula itself, since narrowing shifts (see
+  below) use the same field but a different effective size.
+- Narrowing shifts (`VSHRN`, `VRSHRN`, `VQSHRN`, `VQSHRUN`, `VQRSHRN`,
+  `VQRSHRUN`) take a datatype describing the *source* (e.g. `I16` for a
+  16-to-8-bit narrow), but the field formula uses the *destination*
+  size (`dt.width/2`) — which, conveniently, is exactly
+  `dt.width - shift_amount` (i.e. the general right-shift formula
+  `2*(dt.width/2) - shift_amount` simplifies to that), so no separate
+  "compute the destination width" step is needed.
+- `VSHLL` has two forms sharing one root but *not* needing merged
+  dispatch the way `VADD`/`VSHL` do: a general immediate form, and a
+  dedicated "shift by exactly the element size" form with a completely
+  different, simpler encoding (no `imm6` field at all, just a 2-bit
+  size) that real syntax and hardware both use when the shift amount
+  happens to equal the width — `encode_neon_vshll` just checks
+  `shift_amount == dt.width` and picks the matching encoding, no
+  mnemonic-table dispatch needed.
+- Not every mnemonic in this family has a genuine Q-vs-D register-class
+  choice at the bit position that would normally hold it: narrowing
+  shifts are always `Dd,Qm` (fixed shape) and `VSHLL` is always
+  `Qd,Dm`, so that bit position is repurposed as a fixed 0/1
+  discriminator between mnemonic pairs (`VSHRN` vs `VRSHRN`, `VQSHRN`
+  vs `VQRSHRN`) rather than a real register-class selector —
+  `assemble_neon_shift_imm`'s `q` parameter is passed that fixed value
+  in those cases rather than an actual derived Q bit.
+- The `,#0` collapses to `VMOV`/`VMOVN`/`VQMOVN`/`VQMOVUN` that VFPLib's
+  syntax table documents for `VSHR`/`VRSHR`/`VSHRN`/`VRSHRN`/`VQSHRN`-
+  family mnemonics with a zero shift amount are deliberately **not**
+  implemented yet — those target mnemonics don't exist in this backend
+  until batches four/six land, so a shift amount of 0 on a right-shift
+  mnemonic currently just raises the ordinary "bad shift" range error
+  rather than being silently accepted or mis-encoded. Revisit once
+  `VMOV`(register)/`VMOVN`/`VQMOVN`/`VQMOVUN` exist.
+
+Everything else NEON — long/wide/narrow arithmetic (`VADDL`/`VMLAL`/
+`VMULL`/`VQDMULL`/`VMOVL`/`VMOVN`/...), by-scalar multiply forms
+(`VMUL`/`VMLA`/`VMLAL`/... with a `Dm[x]` indexed operand), move-
+immediate/duplicate/table-lookup/extract (`VMOV`/`VMVN` immediate,
+`VDUP`, `VEXT`, `VTBL`/`VTBX`), load/store (`VLD1`-`VLD4`/`VST1`-
+`VST4`, all alignment/lane/multiple-structure forms), and the convert/
+ARMv8-only additions (`VCVT` all forms, `VCVTB`/`VCVTT`, `VRINT*`,
+`VSEL*`, `VMAXNM`/`VMINNM`) remain a follow-on — `VMOV`/`VMVN`'s
+immediate `cmode` table and datatype-conditional structure-load
+alignment are meaningfully higher-risk to get bit-exact than anything
+ported so far.
 
 ## Source material handling
 
