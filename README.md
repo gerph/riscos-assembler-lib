@@ -209,23 +209,31 @@ literal's raw bytes as immediate data still works.
 Base ARM32, legacy FPA and classic VFP scalar are implemented. NEON/SIMD
 is being added incrementally, gated by the same `ASSEMBLE_ARM32_OPT_VFP`
 bit as classic VFP scalar (NEON extends the same dialect rather than
-adding a new one); so far this covers the "three registers of the same
-length" family (`VADD`, `VSUB`, `VMUL`, `VMLA`, `VMLS`, `VAND`, `VBIC`,
-`VORR`, `VORN`, `VEOR`, `VBSL`, `VBIT`, `VBIF`, `VQADD`, `VQSUB`, `VRSHL`,
-`VQSHL`, `VQRSHL`, `VHADD`, `VHSUB`, `VRHADD`, `VABA`, `VABD`, `VCEQ`,
-`VCGE`, `VCGT`, `VCLE`, `VCLT`, `VTST`, `VQDMULH`, `VQRDMULH`, `VACGE`,
-`VACGT`, `VACLE`, `VACLT`, `VMAX`, `VMIN`, `VPMAX`, `VPMIN`, `VPADD`) and
-the "two registers misc" family (`VABS`, `VNEG`, `VCLS`, `VCLZ`, `VCNT`,
-`VMVN`, `VQABS`, `VQNEG`, `VRECPE`, `VRSQRTE`, `VREV16`, `VREV32`,
-`VREV64`, `VSWP`, `VTRN`, `VUZP`, `VZIP`), the `#0` comparison form of
-`VCEQ`/`VCGE`/`VCGT`/`VCLE`/`VCLT`, and shift-by-immediate (`VSHL`,
-`VSHR`, `VSRA`, `VRSHR`, `VRSRA`, `VSRI`, `VSLI`, `VQSHL`, `VQSHLU`,
-`VSHLL`, `VSHRN`, `VRSHRN`, `VQSHRN`, `VQSHRUN`, `VQRSHRN`,
-`VQRSHRUN`). Everything else NEON (long/wide/narrow arithmetic,
-by-scalar multiply forms, move-immediate/duplicate/table-lookup/extract,
-load/store, and convert/ARMv8-only additions such as `VRINT*`, `VSEL*`,
-`VMAXNM`/`VMINNM` and directed-rounding `VCVT`) remains a follow-on.
-Within base ARM32, the ARMv5TE/v6 'xy' DSP
+adding a new one); so far this covers:
+
+* the "three registers of the same length" family — `VADD`, `VSUB`,
+  `VMUL`, `VMLA`, `VMLS`, `VAND`, `VBIC`, `VORR`, `VORN`, `VEOR`, `VBSL`,
+  `VBIT`, `VBIF`, `VQADD`, `VQSUB`, `VRSHL`, `VQSHL`, `VQRSHL`, `VHADD`,
+  `VHSUB`, `VRHADD`, `VABA`, `VABD`, `VCEQ`, `VCGE`, `VCGT`, `VCLE`,
+  `VCLT`, `VTST`, `VQDMULH`, `VQRDMULH`, `VACGE`, `VACGT`, `VACLE`,
+  `VACLT`, `VMAX`, `VMIN`, `VPMAX`, `VPMIN`, `VPADD`;
+* the "two registers misc" family — `VABS`, `VNEG`, `VCLS`, `VCLZ`,
+  `VCNT`, `VMVN`, `VQABS`, `VQNEG`, `VRECPE`, `VRSQRTE`, `VREV16`,
+  `VREV32`, `VREV64`, `VSWP`, `VTRN`, `VUZP`, `VZIP`, plus the `#0`
+  comparison form of `VCEQ`/`VCGE`/`VCGT`/`VCLE`/`VCLT`;
+* shift-by-immediate — `VSHL`, `VSHR`, `VSRA`, `VRSHR`, `VRSRA`, `VSRI`,
+  `VSLI`, `VQSHL`, `VQSHLU`, `VSHLL`, `VSHRN`, `VRSHRN`, `VQSHRN`,
+  `VQSHRUN`, `VQRSHRN`, `VQRSHRUN`;
+* long/wide/narrow arithmetic — `VADDL`, `VADDW`, `VSUBL`, `VSUBW`,
+  `VADDHN`, `VSUBHN`, `VRADDHN`, `VRSUBHN`, `VABAL`, `VABDL`, `VMLAL`,
+  `VMLSL`, `VMULL`, `VQDMLAL`, `VQDMLSL`, `VQDMULL`, `VMOVL`, `VMOVN`,
+  `VQMOVN`, `VQMOVUN`, `VPADAL`, `VPADDL`.
+
+Everything else NEON (by-scalar multiply forms, move-immediate/
+duplicate/table-lookup/extract, load/store, and convert/ARMv8-only
+additions such as `VRINT*`, `VSEL*`, `VMAXNM`/`VMINNM` and
+directed-rounding `VCVT`) remains a follow-on. Within base ARM32, the
+ARMv5TE/v6 'xy' DSP
 multiply family (`SMLABB`, `SMLAWx`, `SMUAD`, `SMLAD`, `SMLALD` and
 friends), `SMMLA`/`SMMLS`/`SMMUL`, `MRRC`/`MCRR`, the ARMv8 `LDA`/`STL`/
 `LDAEX`/`STLEX` load-acquire/store-release family, and the banked-register

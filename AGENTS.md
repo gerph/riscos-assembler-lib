@@ -432,23 +432,69 @@ element size share one bitfield:
 - The `,#0` collapses to `VMOV`/`VMOVN`/`VQMOVN`/`VQMOVUN` that VFPLib's
   syntax table documents for `VSHR`/`VRSHR`/`VSHRN`/`VRSHRN`/`VQSHRN`-
   family mnemonics with a zero shift amount are deliberately **not**
-  implemented yet — those target mnemonics don't exist in this backend
-  until batches four/six land, so a shift amount of 0 on a right-shift
-  mnemonic currently just raises the ordinary "bad shift" range error
-  rather than being silently accepted or mis-encoded. Revisit once
-  `VMOV`(register)/`VMOVN`/`VQMOVN`/`VQMOVUN` exist.
+  implemented yet — a shift amount of 0 on a right-shift mnemonic
+  currently just raises the ordinary "bad shift" range error rather
+  than being silently accepted or mis-encoded. `VMOVN`/`VQMOVN`/
+  `VQMOVUN` now exist (fourth batch, below) so writing them out
+  directly works; only the register form of plain `VMOV` (an alias for
+  `VORR Vd,Vm,Vm`) is still missing, needed for `VSHR`/`VRSHR ,#0`.
 
-Everything else NEON — long/wide/narrow arithmetic (`VADDL`/`VMLAL`/
-`VMULL`/`VQDMULL`/`VMOVL`/`VMOVN`/...), by-scalar multiply forms
-(`VMUL`/`VMLA`/`VMLAL`/... with a `Dm[x]` indexed operand), move-
-immediate/duplicate/table-lookup/extract (`VMOV`/`VMVN` immediate,
-`VDUP`, `VEXT`, `VTBL`/`VTBX`), load/store (`VLD1`-`VLD4`/`VST1`-
-`VST4`, all alignment/lane/multiple-structure forms), and the convert/
-ARMv8-only additions (`VCVT` all forms, `VCVTB`/`VCVTT`, `VRINT*`,
-`VSEL*`, `VMAXNM`/`VMINNM`) remain a follow-on — `VMOV`/`VMVN`'s
-immediate `cmode` table and datatype-conditional structure-load
-alignment are meaningfully higher-risk to get bit-exact than anything
-ported so far.
+The fourth batch covers long/wide/narrow arithmetic (ARM DDI 0406C
+A7.4.3/A7.4.4/A7.4.5) — `VADDL`, `VADDW`, `VSUBL`, `VSUBW`, `VADDHN`,
+`VSUBHN`, `VRADDHN`, `VRSUBHN`, `VABAL`, `VABDL`, `VMLAL`, `VMLSL`,
+`VMULL`, `VQDMLAL`, `VQDMLSL`, `VQDMULL`, `VMOVL`, `VMOVN`, `VQMOVN`,
+`VQMOVUN`, `VPADAL`, `VPADDL`. More design notes:
+
+- This family has three distinct operand shapes sharing closely related
+  encodings: "long"/widening ops are `Qd,Dn,Dm` (`VADDL` etc) except
+  `VADDW`/`VSUBW`, which are `Qd,Qn,Dm` (one operand already wide) —
+  `encode_neon_long` validates `Vn`'s register class from a param1 flag
+  rather than assuming it; "halving narrow" ops are `Dd,Qn,Qm` (both
+  sources wide, `VADDHN` etc); the various move forms are two-operand
+  (`VMOVL` widens `Dm` to `Qd`, `VMOVN`/`VQMOVN`/`VQMOVUN` narrow `Qm`
+  to `Dd`).
+- VFPLib's own variable names distinguish `size` (the plain 2-bit
+  0..3 encoding of 8/16/32/64) from `size1`, defined in its header
+  comment as `size1 = size - 1` — used by the halving-narrow and
+  narrowing-move mnemonics, whose *source* datatype (e.g. `I16` for a
+  16-to-8-bit narrow) needs that adjustment to land in the right field.
+  Conflating the two would silently shift every encoding by one lane
+  size, so `neon_dt_size2(dt.width) - 1u` appears explicitly at each
+  call site that needs it rather than being folded into a shared helper
+  that might get reused somewhere `size` (unadjusted) is wanted instead.
+- `VMULL` is deliberately its own dedicated encoder rather than a
+  `FAMILY_NEON_LONG` table entry like its siblings, because of the P8
+  (polynomial) special case: opcode/`U`/size are all fixed constants
+  for `VMULL.P8`, not derived from an S/U datatype the way every other
+  `FAMILY_NEON_LONG` mnemonic works — trying to force that through the
+  generic derivation logic would have made the shared path harder to
+  follow for no real code reuse (the P8 branch and the normal branch
+  share nothing but the final `assemble_neon_long` call).
+- `VPADAL`/`VPADDL` looked at first glance like they'd fit the existing
+  `encode_neon_two_reg_misc` helper (two operands, same register class,
+  a real `U`/`Q` pair) but don't: their opcode field sits one bit
+  higher (bits 11:8, not 10:7) and `U` occupies the position
+  `encode_neon_two_reg_misc` treats as an always-0 literal. Cross-
+  checking the exact bit offsets against VFPLib's bitstring (rather
+  than assuming "this looks like the same shape as X") caught the
+  mismatch before it became a wrong encoding — see `encode_neon_padal`,
+  which packs the *entire* fixed skeleton into `param1` per mnemonic
+  instead of trying to share a skeleton constant that turned out not to
+  be shared.
+
+Everything else NEON — by-scalar multiply forms (`VMUL`/`VMLA`/
+`VMLAL`/... with a `Dm[x]` indexed operand), move-immediate/duplicate/
+table-lookup/extract (`VMOV`/`VMVN` immediate, `VDUP`, `VEXT`,
+`VTBL`/`VTBX`), load/store (`VLD1`-`VLD4`/`VST1`-`VST4`, all
+alignment/lane/multiple-structure forms), and the convert/ARMv8-only
+additions (`VCVT` all forms, `VCVTB`/`VCVTT`, `VRINT*`, `VSEL*`,
+`VMAXNM`/`VMINNM`) remain a follow-on — `VMOV`/`VMVN`'s immediate
+`cmode` table and datatype-conditional structure-load alignment are
+meaningfully higher-risk to get bit-exact than anything ported so far.
+Note also that `VMULL`/`VMLAL`/`VMLSL`/`VQDMULL`/`VQDMLAL`/`VQDMLSL`
+will need merged dispatch (like `VSHL`/`VQSHL`) once their by-scalar
+forms are added, since a `Dm[x]` indexed third operand shares each of
+those roots with the plain-register form implemented here.
 
 ## Source material handling
 

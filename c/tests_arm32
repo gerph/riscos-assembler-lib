@@ -607,6 +607,46 @@ static const uint8_t     bytes_neon_vshll_gen[] = { 0x11, 0x0A, 0x8B, 0xF2 }; /*
 static const char *const lines_neon_vshr_zero_rejected[] = { "VSHR.S32 D0,D1,#0", NULL };
 static const char *const lines_neon_vshll_overshift_rejected[] = { "VSHLL.S8 Q0,D1,#9", NULL };
 
+static const char *const lines_neon_vaddl[] = { "VADDL.S16 Q0,D1,D2", NULL };
+static const uint8_t     bytes_neon_vaddl[] = { 0x02, 0x00, 0x91, 0xF2 }; /* F2910002 */
+
+static const char *const lines_neon_vaddw[] = { "VADDW.S16 Q0,Q1,D2", NULL };
+static const uint8_t     bytes_neon_vaddw[] = { 0x02, 0x01, 0x92, 0xF2 }; /* F2920102 */
+
+static const char *const lines_neon_vmull[] = { "VMULL.S16 Q0,D1,D2", NULL };
+static const uint8_t     bytes_neon_vmull[] = { 0x02, 0x0C, 0x91, 0xF2 }; /* F2910C02 */
+
+static const char *const lines_neon_vqdmull[] = { "VQDMULL.S16 Q0,D1,D2", NULL };
+static const uint8_t     bytes_neon_vqdmull[] = { 0x02, 0x0D, 0x91, 0xF2 }; /* F2910D02 */
+
+static const char *const lines_neon_vaddhn[] = { "VADDHN.I32 D0,Q1,Q2", NULL };
+static const uint8_t     bytes_neon_vaddhn[] = { 0x04, 0x04, 0x92, 0xF2 }; /* F2920404 */
+
+static const char *const lines_neon_vraddhn[] = { "VRADDHN.I32 D0,Q1,Q2", NULL };
+static const uint8_t     bytes_neon_vraddhn[] = { 0x04, 0x04, 0x92, 0xF3 }; /* F3920404 */
+
+static const char *const lines_neon_vmovl[] = { "VMOVL.S16 Q0,D1", NULL };
+static const uint8_t     bytes_neon_vmovl[] = { 0x11, 0x0A, 0x90, 0xF2 }; /* F2900A11 */
+
+static const char *const lines_neon_vmovn[] = { "VMOVN.I32 D0,Q1", NULL };
+static const uint8_t     bytes_neon_vmovn[] = { 0x02, 0x02, 0xB6, 0xF3 }; /* F3B60202 */
+
+static const char *const lines_neon_vqmovn[] = { "VQMOVN.S32 D0,Q1", NULL };
+static const uint8_t     bytes_neon_vqmovn[] = { 0x82, 0x02, 0xB6, 0xF3 }; /* F3B60282 */
+
+static const char *const lines_neon_vqmovun[] = { "VQMOVUN.S32 D0,Q1", NULL };
+static const uint8_t     bytes_neon_vqmovun[] = { 0x42, 0x02, 0xB6, 0xF3 }; /* F3B60242 */
+
+static const char *const lines_neon_vpadal[] = { "VPADAL.S16 D0,D1", NULL };
+static const uint8_t     bytes_neon_vpadal[] = { 0x01, 0x06, 0xB4, 0xF3 }; /* F3B40601 */
+
+static const char *const lines_neon_vpaddl[] = { "VPADDL.U8 Q0,Q1", NULL };
+static const uint8_t     bytes_neon_vpaddl[] = { 0xC2, 0x02, 0xB0, 0xF3 }; /* F3B002C2 */
+
+static const char *const lines_neon_vaddw_bad_class[] = { "VADDW.S16 Q0,D1,D2", NULL };
+static const char *const lines_neon_vaddl_bad_width[] = { "VADDL.S64 Q0,D1,D2", NULL };
+static const char *const lines_neon_vmull_bad_poly[] = { "VMULL.P16 Q0,D1,D2", NULL };
+
 static const test_case_t tests[] = {
     { "MOV Rd,#imm",                   lines_mov_imm,          0, bytes_mov_imm,          sizeof(bytes_mov_imm),          0 },
     { "MOVS Rd,Rm",                    lines_mov_reg,          0, bytes_mov_reg,          sizeof(bytes_mov_reg),          0 },
@@ -715,7 +755,23 @@ static const test_case_t tests[] = {
     { "VSHLL.S8 Qd,Dm,#8 (max shift, A2 form)", lines_neon_vshll_max, 0, bytes_neon_vshll_max, sizeof(bytes_neon_vshll_max), 0, ASSEMBLE_ARM32_OPT_VFP },
     { "VSHLL.S8 Qd,Dm,#3 (general A1 form)", lines_neon_vshll_gen, 0, bytes_neon_vshll_gen, sizeof(bytes_neon_vshll_gen), 0, ASSEMBLE_ARM32_OPT_VFP },
     { "VSHR shift amount must be at least 1", lines_neon_vshr_zero_rejected, 0, NULL, 0, 1, ASSEMBLE_ARM32_OPT_VFP },
-    { "VSHLL shift amount must not exceed the element size", lines_neon_vshll_overshift_rejected, 0, NULL, 0, 1, ASSEMBLE_ARM32_OPT_VFP }
+    { "VSHLL shift amount must not exceed the element size", lines_neon_vshll_overshift_rejected, 0, NULL, 0, 1, ASSEMBLE_ARM32_OPT_VFP },
+
+    { "VADDL.S16 Qd,Dn,Dm",             lines_neon_vaddl,   0, bytes_neon_vaddl,   sizeof(bytes_neon_vaddl),   0, ASSEMBLE_ARM32_OPT_VFP },
+    { "VADDW.S16 Qd,Qn,Dm",             lines_neon_vaddw,   0, bytes_neon_vaddw,   sizeof(bytes_neon_vaddw),   0, ASSEMBLE_ARM32_OPT_VFP },
+    { "VMULL.S16 Qd,Dn,Dm",             lines_neon_vmull,   0, bytes_neon_vmull,   sizeof(bytes_neon_vmull),   0, ASSEMBLE_ARM32_OPT_VFP },
+    { "VQDMULL.S16 Qd,Dn,Dm",           lines_neon_vqdmull, 0, bytes_neon_vqdmull, sizeof(bytes_neon_vqdmull), 0, ASSEMBLE_ARM32_OPT_VFP },
+    { "VADDHN.I32 Dd,Qn,Qm",            lines_neon_vaddhn,  0, bytes_neon_vaddhn,  sizeof(bytes_neon_vaddhn),  0, ASSEMBLE_ARM32_OPT_VFP },
+    { "VRADDHN.I32 Dd,Qn,Qm",           lines_neon_vraddhn, 0, bytes_neon_vraddhn, sizeof(bytes_neon_vraddhn), 0, ASSEMBLE_ARM32_OPT_VFP },
+    { "VMOVL.S16 Qd,Dm",                lines_neon_vmovl,   0, bytes_neon_vmovl,   sizeof(bytes_neon_vmovl),   0, ASSEMBLE_ARM32_OPT_VFP },
+    { "VMOVN.I32 Dd,Qm",                lines_neon_vmovn,   0, bytes_neon_vmovn,   sizeof(bytes_neon_vmovn),   0, ASSEMBLE_ARM32_OPT_VFP },
+    { "VQMOVN.S32 Dd,Qm",               lines_neon_vqmovn,  0, bytes_neon_vqmovn,  sizeof(bytes_neon_vqmovn),  0, ASSEMBLE_ARM32_OPT_VFP },
+    { "VQMOVUN.S32 Dd,Qm",              lines_neon_vqmovun, 0, bytes_neon_vqmovun, sizeof(bytes_neon_vqmovun), 0, ASSEMBLE_ARM32_OPT_VFP },
+    { "VPADAL.S16 Dd,Dm",               lines_neon_vpadal,  0, bytes_neon_vpadal,  sizeof(bytes_neon_vpadal),  0, ASSEMBLE_ARM32_OPT_VFP },
+    { "VPADDL.U8 Qd,Qm",                lines_neon_vpaddl,  0, bytes_neon_vpaddl,  sizeof(bytes_neon_vpaddl),  0, ASSEMBLE_ARM32_OPT_VFP },
+    { "VADDW requires a Qn source",     lines_neon_vaddw_bad_class, 0, NULL, 0, 1, ASSEMBLE_ARM32_OPT_VFP },
+    { "VADDL does not support 64-bit elements", lines_neon_vaddl_bad_width, 0, NULL, 0, 1, ASSEMBLE_ARM32_OPT_VFP },
+    { "VMULL poly form is P8 only",     lines_neon_vmull_bad_poly, 0, NULL, 0, 1, ASSEMBLE_ARM32_OPT_VFP }
 };
 
 int run_tests_arm32(void)
