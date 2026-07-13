@@ -227,13 +227,15 @@ adding a new one); so far this covers:
 * long/wide/narrow arithmetic — `VADDL`, `VADDW`, `VSUBL`, `VSUBW`,
   `VADDHN`, `VSUBHN`, `VRADDHN`, `VRSUBHN`, `VABAL`, `VABDL`, `VMLAL`,
   `VMLSL`, `VMULL`, `VQDMLAL`, `VQDMLSL`, `VQDMULL`, `VMOVL`, `VMOVN`,
-  `VQMOVN`, `VQMOVUN`, `VPADAL`, `VPADDL`.
+  `VQMOVN`, `VQMOVUN`, `VPADAL`, `VPADDL`;
+* the "by scalar" `Dm[x]` operand form of `VMUL`, `VMLA`, `VMLS`,
+  `VMLAL`, `VMLSL`, `VMULL`, `VQDMULH`, `VQRDMULH`, `VQDMULL`,
+  `VQDMLAL` and `VQDMLSL`.
 
-Everything else NEON (by-scalar multiply forms, move-immediate/
-duplicate/table-lookup/extract, load/store, and convert/ARMv8-only
-additions such as `VRINT*`, `VSEL*`, `VMAXNM`/`VMINNM` and
-directed-rounding `VCVT`) remains a follow-on. Within base ARM32, the
-ARMv5TE/v6 'xy' DSP
+Everything else NEON (move-immediate/duplicate/table-lookup/extract,
+load/store, and convert/ARMv8-only additions such as `VRINT*`, `VSEL*`,
+`VMAXNM`/`VMINNM` and directed-rounding `VCVT`) remains a follow-on.
+Within base ARM32, the ARMv5TE/v6 'xy' DSP
 multiply family (`SMLABB`, `SMLAWx`, `SMUAD`, `SMLAD`, `SMLALD` and
 friends), `SMMLA`/`SMMLS`/`SMMUL`, `MRRC`/`MCRR`, the ARMv8 `LDA`/`STL`/
 `LDAEX`/`STLEX` load-acquire/store-release family, and the banked-register

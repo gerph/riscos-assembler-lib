@@ -482,19 +482,59 @@ A7.4.3/A7.4.4/A7.4.5) — `VADDL`, `VADDW`, `VSUBL`, `VSUBW`, `VADDHN`,
   instead of trying to share a skeleton constant that turned out not to
   be shared.
 
-Everything else NEON — by-scalar multiply forms (`VMUL`/`VMLA`/
-`VMLAL`/... with a `Dm[x]` indexed operand), move-immediate/duplicate/
-table-lookup/extract (`VMOV`/`VMVN` immediate, `VDUP`, `VEXT`,
-`VTBL`/`VTBX`), load/store (`VLD1`-`VLD4`/`VST1`-`VST4`, all
-alignment/lane/multiple-structure forms), and the convert/ARMv8-only
-additions (`VCVT` all forms, `VCVTB`/`VCVTT`, `VRINT*`, `VSEL*`,
-`VMAXNM`/`VMINNM`) remain a follow-on — `VMOV`/`VMVN`'s immediate
-`cmode` table and datatype-conditional structure-load alignment are
-meaningfully higher-risk to get bit-exact than anything ported so far.
-Note also that `VMULL`/`VMLAL`/`VMLSL`/`VQDMULL`/`VQDMLAL`/`VQDMLSL`
-will need merged dispatch (like `VSHL`/`VQSHL`) once their by-scalar
-forms are added, since a `Dm[x]` indexed third operand shares each of
-those roots with the plain-register form implemented here.
+The fifth batch covers the "by scalar" `Dm[x]` operand form (ARM DDI
+0406C A7.3, A7.4.2, A7.4.4) of `VMUL`, `VMLA`, `VMLS`, `VMLAL`, `VMLSL`,
+`VMULL`, `VQDMULH`, `VQRDMULH`, `VQDMULL`, `VQDMLAL` and `VQDMLSL` —
+not new mnemonic roots, but a third (or second) operand shape bolted
+onto ten mnemonics already implemented in earlier batches, each
+requiring its own bit of dispatch surgery:
+
+- The physical register+index encoding is genuinely interleaved, not
+  two clean subfields: for a 16-bit element the scalar register is
+  limited to `D0`-`D7` (3 bits) and the 2-bit lane index occupies the
+  register's own would-be bit 3 plus the `M` extension bit; for a
+  32-bit element the register uses the full 4-bit field and the 1-bit
+  index occupies `M` alone. `neon_scalar_vmx` implements this once;
+  every dispatch site calls it rather than re-deriving the bit split.
+- Every mnemonic in this batch already had a working plain-register (or
+  scalar-VFP) encoder from an earlier batch, so this piece is entirely
+  about adding a peek-ahead branch to *existing* functions rather than
+  writing new ones: `peek_neon_scalar_operand` (does the upcoming
+  operand look like `Dm[` rather than a bare register?) gates a new
+  branch in `encode_vfp_or_neon_arith3` (for `VMUL`/`VMLA`/`VMLS`,
+  guarded to exclude `VADD`/`VSUB`, which have no by-scalar form),
+  `encode_neon_three_same` (for `VQDMULH`/`VQRDMULH`), `encode_neon_long`
+  (for `VMLAL`/`VMLSL`/`VQDMLAL`/`VQDMLSL`/`VQDMULL`) and
+  `encode_neon_vmull` (for `VMULL`, excluding its P8 case, which has no
+  by-scalar form either).
+- The same-width mnemonics (`VMUL`/`VMLA`/`VMLS`/`VQDMULH`/`VQRDMULH`)
+  and the "long"/widening ones (`VMULL`/`VMLAL`/`VMLSL`/`VQDMULL`/
+  `VQDMLAL`/`VQDMLSL`) share one word shape but differ in what bit 24
+  means: a genuine Q/D register-class selector for the former (since
+  `Vd`/`Vn` can be either both `Q` or both `D`) versus the `U` sign bit
+  for the latter (destination is always `Q`, so there's no register
+  class left to select) — `assemble_neon_by_scalar`'s `topbit` parameter
+  is deliberately generic about which meaning the caller is using it
+  for, since the bit position is identical either way.
+- Retrofitting `param1`/`param2` on already-shipped mnemonic-table rows
+  (rather than only ever adding brand new rows) needed care to avoid
+  reusing a bit a family's generic encoder already reads with a
+  different meaning: `VQDMULH`/`VQRDMULH`'s new `param2` "has scalar
+  form" flag and opcode deliberately went in bits 30/19:16 rather than
+  reusing `FAMILY_NEON_3SAME`'s existing `param2` bit 31 (`has_float`)
+  and bits 11:8 (float opcode) — those two mnemonics have no float
+  three-same form, but setting `has_float` anyway to steal its opcode
+  bits would have made `VQDMULH.F32 ...` silently attempt (and
+  mis-encode) a float three-same read instead of being rejected.
+
+Everything else NEON — move-immediate/duplicate/table-lookup/extract
+(`VMOV`/`VMVN` immediate, `VDUP`, `VEXT`, `VTBL`/`VTBX`), load/store
+(`VLD1`-`VLD4`/`VST1`-`VST4`, all alignment/lane/multiple-structure
+forms), and the convert/ARMv8-only additions (`VCVT` all forms,
+`VCVTB`/`VCVTT`, `VRINT*`, `VSEL*`, `VMAXNM`/`VMINNM`) remain a
+follow-on — `VMOV`/`VMVN`'s immediate `cmode` table and
+datatype-conditional structure-load alignment are meaningfully
+higher-risk to get bit-exact than anything ported so far.
 
 ## Source material handling
 

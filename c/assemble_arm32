@@ -1263,7 +1263,9 @@ static const mnemonic_entry_t mnemonic_table[] = {
        VACGT -- applies to whichever of the int/float forms below is
        selected), bit1=allow64, bit0=d_only (no Qd form).
        param2: bit31=has_float, bit24=float U, bit21=float op, bits11:8=
-       float opcode, bit4=float opbit. */
+       float opcode, bit4=float opbit; bit30=has_scalar (a "by scalar"
+       Dm[x] third-operand form also exists), bits19:16=scalar opcode
+       (VQDMULH/VQRDMULH only -- see encode_neon_three_same). */
     { "VQADD",  FAMILY_NEON_3SAME, 0x80000000u | (1u<<25) | (0x0u<<8) | (1u<<4) | 2u, 0, 0, 0, ASSEMBLE_ARM32_OPT_VFP },
     { "VQSUB",  FAMILY_NEON_3SAME, 0x80000000u | (1u<<25) | (0x2u<<8) | (1u<<4) | 2u, 0, 0, 0, ASSEMBLE_ARM32_OPT_VFP },
     { "VRSHL",  FAMILY_NEON_3SAME, 0x80000000u | (1u<<25) | (0x5u<<8) | (0u<<4) | 2u, 0, 0, 0, ASSEMBLE_ARM32_OPT_VFP },
@@ -1287,8 +1289,10 @@ static const mnemonic_entry_t mnemonic_table[] = {
     { "VTST",   FAMILY_NEON_3SAME, 0x80000000u | (0u<<24) | (0x8u<<8) | (1u<<4), 0, 0, 0, ASSEMBLE_ARM32_OPT_VFP },
     { "VCEQ",   FAMILY_NEON_3SAME, 0x80000000u | (1u<<24) | (0x8u<<8) | (1u<<4) | (1u<<20) | (0x2u<<16),
                                     0x80000000u | (0u<<24) | (0u<<21) | (0xEu<<8) | (0u<<4), 0, 0, ASSEMBLE_ARM32_OPT_VFP },
-    { "VQDMULH",  FAMILY_NEON_3SAME, 0x80000000u | (0u<<24) | (0xBu<<8) | (0u<<4), 0, 0, 0, ASSEMBLE_ARM32_OPT_VFP },
-    { "VQRDMULH", FAMILY_NEON_3SAME, 0x80000000u | (1u<<24) | (0xBu<<8) | (0u<<4), 0, 0, 0, ASSEMBLE_ARM32_OPT_VFP },
+    { "VQDMULH",  FAMILY_NEON_3SAME, 0x80000000u | (0u<<24) | (0xBu<<8) | (0u<<4),
+                                      (1u<<30) | (0xCu<<16), 0, 0, ASSEMBLE_ARM32_OPT_VFP },
+    { "VQRDMULH", FAMILY_NEON_3SAME, 0x80000000u | (1u<<24) | (0xBu<<8) | (0u<<4),
+                                      (1u<<30) | (0xDu<<16), 0, 0, ASSEMBLE_ARM32_OPT_VFP },
     { "VACGE",  FAMILY_NEON_3SAME, 0,
                                     0x80000000u | (1u<<24) | (0u<<21) | (0xEu<<8) | (1u<<4), 0, 0, ASSEMBLE_ARM32_OPT_VFP },
     { "VACGT",  FAMILY_NEON_3SAME, 0,
@@ -1381,18 +1385,20 @@ static const mnemonic_entry_t mnemonic_table[] = {
 
     /* Long/widening arithmetic. param1: bits3:0=opcode, bit4=u_derived
        (from S/U dt), bit5=u_fixed (when not derived), bit6=vn_is_q
-       (1 = Vn must be Qn not Dn, for VADDW/VSUBW). */
+       (1 = Vn must be Qn not Dn, for VADDW/VSUBW), bit7=has_scalar (a
+       "by scalar" Dm[x] third-operand form also exists), bits11:8=
+       scalar opcode. */
     { "VADDL",   FAMILY_NEON_LONG, (0x0u<<0) | (1u<<4), 0, 0, 0, ASSEMBLE_ARM32_OPT_VFP },
     { "VADDW",   FAMILY_NEON_LONG, (0x1u<<0) | (1u<<4) | (1u<<6), 0, 0, 0, ASSEMBLE_ARM32_OPT_VFP },
     { "VSUBL",   FAMILY_NEON_LONG, (0x2u<<0) | (1u<<4), 0, 0, 0, ASSEMBLE_ARM32_OPT_VFP },
     { "VSUBW",   FAMILY_NEON_LONG, (0x3u<<0) | (1u<<4) | (1u<<6), 0, 0, 0, ASSEMBLE_ARM32_OPT_VFP },
     { "VABAL",   FAMILY_NEON_LONG, (0x5u<<0) | (1u<<4), 0, 0, 0, ASSEMBLE_ARM32_OPT_VFP },
     { "VABDL",   FAMILY_NEON_LONG, (0x7u<<0) | (1u<<4), 0, 0, 0, ASSEMBLE_ARM32_OPT_VFP },
-    { "VMLAL",   FAMILY_NEON_LONG, (0x8u<<0) | (1u<<4), 0, 0, 0, ASSEMBLE_ARM32_OPT_VFP },
-    { "VMLSL",   FAMILY_NEON_LONG, (0x9u<<0) | (1u<<4), 0, 0, 0, ASSEMBLE_ARM32_OPT_VFP },
-    { "VQDMLAL", FAMILY_NEON_LONG, 0x9u, 0, 0, 0, ASSEMBLE_ARM32_OPT_VFP },
-    { "VQDMLSL", FAMILY_NEON_LONG, 0xBu, 0, 0, 0, ASSEMBLE_ARM32_OPT_VFP },
-    { "VQDMULL", FAMILY_NEON_LONG, 0xDu, 0, 0, 0, ASSEMBLE_ARM32_OPT_VFP },
+    { "VMLAL",   FAMILY_NEON_LONG, (0x8u<<0) | (1u<<4) | (1u<<7) | (0x2u<<8), 0, 0, 0, ASSEMBLE_ARM32_OPT_VFP },
+    { "VMLSL",   FAMILY_NEON_LONG, (0x9u<<0) | (1u<<4) | (1u<<7) | (0x6u<<8), 0, 0, 0, ASSEMBLE_ARM32_OPT_VFP },
+    { "VQDMLAL", FAMILY_NEON_LONG, 0x9u | (1u<<7) | (0x3u<<8), 0, 0, 0, ASSEMBLE_ARM32_OPT_VFP },
+    { "VQDMLSL", FAMILY_NEON_LONG, 0xBu | (1u<<7) | (0x7u<<8), 0, 0, 0, ASSEMBLE_ARM32_OPT_VFP },
+    { "VQDMULL", FAMILY_NEON_LONG, 0xDu | (1u<<7) | (0xBu<<8), 0, 0, 0, ASSEMBLE_ARM32_OPT_VFP },
     { "VMULL",   FAMILY_NEON_VMULL, 0, 0, 0, 0, ASSEMBLE_ARM32_OPT_VFP },
 
     /* Halving narrow. param1: bit0=fixed U/R("rounded") flag, bits4:1=opcode. */
@@ -5433,6 +5439,98 @@ static void split_neon_register(uint32_t regnum, uint8_t reg_class, uint32_t *ou
     split_vfp_register((reg_class == 'Q') ? (regnum * 2u) : regnum, 1, out_vx, out_ext);
 }
 
+/* Parses a "by scalar" operand, "Dm[x]" -- a D register together with
+   a lane index. The optional hex register-count limit VFPLib's syntax
+   table writes (eg the '7' in "Dm[x]7") is documentation only and
+   isn't part of the actual syntax, so isn't parsed here. */
+static _kernel_oserror *parse_neon_scalar_operand(assemble_context_t *context, const uint8_t *text, size_t length,
+                                                   size_t *pos_inout, uint32_t *out_reg, uint32_t *out_index)
+{
+    size_t pos = *pos_inout;
+    uint32_t reg;
+    uint8_t regclass;
+    assemble_value_t value;
+    size_t consumed;
+    _kernel_oserror *error;
+
+    error = parse_neon_register(text, length, &pos, &reg, &regclass);
+    if (error != NULL) return error;
+    if (regclass != 'D') return error_neon_mismatched_size();
+    pos += assemble_skip_spaces(text + pos, length - pos);
+    if (pos >= length || text[pos] != '[') return error_bad_datatype();
+    pos += 1;
+    error = eval_expr(context, text + pos, length - pos, &value, &consumed);
+    if (error != NULL) return error;
+    pos += consumed;
+    pos += assemble_skip_spaces(text + pos, length - pos);
+    if (pos >= length || text[pos] != ']') return error_bad_datatype();
+    pos += 1;
+
+    *out_reg = reg;
+    *out_index = (uint32_t) value_to_integer(&value);
+    *pos_inout = pos;
+    return NULL;
+}
+
+/* Non-consuming peek: is the upcoming operand a "by scalar" Dm[x]
+   rather than a plain register? Used to dispatch between the two
+   forms of mnemonics that support both (eg VMUL/VMLA/VMLAL/...). */
+static int peek_neon_scalar_operand(const uint8_t *text, size_t length, size_t pos)
+{
+    size_t p = pos + assemble_skip_spaces(text + pos, length - pos);
+    uint8_t c;
+
+    if (p >= length || toupper((int) text[p]) != 'D' || !(text[p + 1] >= '0' && text[p + 1] <= '9')) return 0;
+    p += 1;
+    while (p < length && text[p] >= '0' && text[p] <= '9') p += 1;
+    p += assemble_skip_spaces(text + p, length - p);
+    c = (p < length) ? text[p] : 0;
+    return c == '[';
+}
+
+/* Splits a by-scalar Dm[x] operand into the physical 5-bit M:Vm field
+   ("Vmx" in VFPLib's own naming), per ARM DDI 0406C A7.3: for a
+   16-bit element the register is limited to D0-D7 (Vm<2:0>) and the
+   2-bit index occupies the register's own would-be bit 3 plus the M
+   extension bit; for a 32-bit element the register uses the full
+   Vm<3:0> and the 1-bit index occupies M alone. */
+static _kernel_oserror *neon_scalar_vmx(uint32_t width, uint32_t reg, uint32_t index,
+                                         uint32_t *out_mbit, uint32_t *out_vm)
+{
+    if (width == 16)
+    {
+        if (reg > 7 || index > 3) return error_bad_datatype();
+        *out_mbit = (index >> 1) & 1u;
+        *out_vm = ((index & 1u) << 3) | (reg & 0x7u);
+    }
+    else if (width == 32)
+    {
+        if (reg > 15 || index > 1) return error_bad_datatype();
+        *out_mbit = index & 1u;
+        *out_vm = reg & 0xFu;
+    }
+    else
+    {
+        return error_bad_datatype();
+    }
+    return NULL;
+}
+
+/* Assembles a "by scalar" word (ARM DDI 0406C A7.4.2/A7.4.4):
+   unconditional, bit23=1, bit6=1 (both fixed -- bit6=1 is what
+   distinguishes this shape from the "long" family's bit6=0). topbit
+   is bit24: a genuine Q/D register-class selector for same-width
+   mnemonics (VMUL/VMLA/VMLS/VQDMULH/VQRDMULH by scalar), or the U
+   sign bit for the "long"/widening ones (VMULL/VMLAL/VMLSL/VQDMULL/
+   VQDMLAL/VQDMLSL by scalar), which have no register-class choice
+   (destination is always Q). */
+static uint32_t assemble_neon_by_scalar(uint32_t topbit, uint32_t dbit, uint32_t size2, uint32_t vn, uint32_t vd,
+                                         uint32_t opcode4, uint32_t nbit, uint32_t mbit, uint32_t vmx)
+{
+    return 0xF2800040u | (topbit << 24) | (dbit << 22) | (size2 << 20) | (vn << 16) | (vd << 12) |
+           (opcode4 << 8) | (nbit << 7) | (mbit << 5) | vmx;
+}
+
 /* Assembles a "three registers of the same length" word from its
    already-split fields. cond is fixed to 0xF (unconditional) and
    bit23 to 0, matching every encoding in this family. */
@@ -5514,6 +5612,46 @@ static _kernel_oserror *encode_vfp_or_neon_arith3(assemble_context_t *context, c
     if (error != NULL) return error;
     error = expect_char(text, length, &pos, ',');
     if (error != NULL) return error;
+
+    /* VMUL/VMLA/VMLS (not VADD/VSUB, which have no by-scalar form)
+       also accept a "by scalar" third operand, Dm[x], instead of a
+       plain register. */
+    if (entry->param1 >= 2u && peek_neon_scalar_operand(text, length, pos))
+    {
+        uint32_t reg, index, vmx_mbit, vmx_vm, opcode4, size2, f;
+        static const uint32_t BASE[5] = { 0, 0, 8, 0, 4 }; /* MUL=8, MLA=0, MLS=4 (ADD/SUB unreachable) */
+
+        error = parse_neon_scalar_operand(context, text, length, &pos, &reg, &index);
+        if (error != NULL) return error;
+        error = check_trailing(text, length, pos);
+        if (error != NULL) return error;
+        if (cd != cn) return error_neon_mismatched_size();
+        q = (cd == 'Q') ? 1u : 0u;
+
+        if (dt.kind == 'F')
+        {
+            if (dt.width != 32) return error_bad_datatype();
+            error = neon_scalar_vmx(32u, reg, index, &vmx_mbit, &vmx_vm);
+            if (error != NULL) return error;
+            size2 = 2u;
+        }
+        else
+        {
+            if (dt.kind != 0 && dt.kind != 'I') return error_bad_datatype();
+            if (dt.width != 16 && dt.width != 32) return error_bad_datatype();
+            error = neon_scalar_vmx(dt.width, reg, index, &vmx_mbit, &vmx_vm);
+            if (error != NULL) return error;
+            size2 = neon_dt_size2(dt.width);
+        }
+        f = (dt.kind == 'F') ? 1u : 0u;
+        opcode4 = BASE[entry->param1] + f;
+
+        split_neon_register(rn, cn, &vn, &nbit);
+        split_neon_register(rd, cd, &vd, &dbit);
+        *out_instr = assemble_neon_by_scalar(q, dbit, size2, vn, vd, opcode4, nbit, vmx_mbit, vmx_vm);
+        return NULL;
+    }
+
     error = parse_neon_register(text, length, &pos, &rm, &cm);
     if (error != NULL) return error;
     error = check_trailing(text, length, pos);
@@ -5638,6 +5776,31 @@ static _kernel_oserror *encode_neon_three_same(assemble_context_t *context, cons
                                                      opcode4, f, 10u, q, nbit, vn);
             return NULL;
         }
+    }
+
+    /* VQDMULH/VQRDMULH also have a "by scalar" third operand, Dm[x]. */
+    if ((entry->param2 & (1u << 30)) != 0 && peek_neon_scalar_operand(text, length, pos))
+    {
+        uint32_t reg, index, vmx_mbit, vmx_vm, size2;
+
+        error = parse_neon_scalar_operand(context, text, length, &pos, &reg, &index);
+        if (error != NULL) return error;
+        error = check_trailing(text, length, pos);
+        if (error != NULL) return error;
+        if (cd != cn) return error_neon_mismatched_size();
+        q = (cd == 'Q') ? 1u : 0u;
+
+        if (dt.kind != 'S') return error_bad_datatype();
+        if (dt.width != 16 && dt.width != 32) return error_bad_datatype();
+        error = neon_scalar_vmx(dt.width, reg, index, &vmx_mbit, &vmx_vm);
+        if (error != NULL) return error;
+        size2 = neon_dt_size2(dt.width);
+
+        split_neon_register(rn, cn, &vn, &nbit);
+        split_neon_register(rd, cd, &vd, &dbit);
+        *out_instr = assemble_neon_by_scalar(q, dbit, size2, vn, vd, (entry->param2 >> 16) & 0xFu,
+                                              nbit, vmx_mbit, vmx_vm);
+        return NULL;
     }
 
     error = parse_neon_register(text, length, &pos, &rm, &cm);
@@ -6407,6 +6570,31 @@ static _kernel_oserror *encode_neon_long(assemble_context_t *context, const mnem
     if (cn != vn_class) return error_neon_mismatched_size();
     error = expect_char(text, length, &pos, ',');
     if (error != NULL) return error;
+
+    if ((entry->param1 & (1u << 7)) != 0 && peek_neon_scalar_operand(text, length, pos))
+    {
+        uint32_t reg, index, vmx_mbit, vmx_vm;
+
+        error = parse_neon_scalar_operand(context, text, length, &pos, &reg, &index);
+        if (error != NULL) return error;
+        error = check_trailing(text, length, pos);
+        if (error != NULL) return error;
+
+        if (dt.kind == 'S') u = 0u;
+        else if (dt.kind == 'U') u = 1u;
+        else return error_bad_datatype();
+        if (dt.width != 16 && dt.width != 32) return error_bad_datatype();
+        error = neon_scalar_vmx(dt.width, reg, index, &vmx_mbit, &vmx_vm);
+        if (error != NULL) return error;
+        size2 = neon_dt_size2(dt.width);
+
+        split_neon_register(rd, cd, &vd, &dbit);
+        split_neon_register(rn, cn, &vn, &nbit);
+        *out_instr = assemble_neon_by_scalar(u, dbit, size2, vn, vd, (entry->param1 >> 8) & 0xFu,
+                                              nbit, vmx_mbit, vmx_vm);
+        return NULL;
+    }
+
     error = parse_neon_register(text, length, &pos, &rm, &cm);
     if (error != NULL) return error;
     if (cm != 'D') return error_neon_mismatched_size();
@@ -6463,6 +6651,29 @@ static _kernel_oserror *encode_neon_vmull(assemble_context_t *context, const mne
     if (cn != 'D') return error_neon_mismatched_size();
     error = expect_char(text, length, &pos, ',');
     if (error != NULL) return error;
+
+    /* The by-scalar form exists for S16/U16/S32/U32 but not P8. */
+    if (dt.kind != 'P' && peek_neon_scalar_operand(text, length, pos))
+    {
+        uint32_t reg, index, vmx_mbit, vmx_vm;
+
+        error = parse_neon_scalar_operand(context, text, length, &pos, &reg, &index);
+        if (error != NULL) return error;
+        error = check_trailing(text, length, pos);
+        if (error != NULL) return error;
+
+        if ((dt.kind != 'S' && dt.kind != 'U') || (dt.width != 16 && dt.width != 32)) return error_bad_datatype();
+        u = (dt.kind == 'U') ? 1u : 0u;
+        error = neon_scalar_vmx(dt.width, reg, index, &vmx_mbit, &vmx_vm);
+        if (error != NULL) return error;
+        size2 = neon_dt_size2(dt.width);
+
+        split_neon_register(rd, cd, &vd, &dbit);
+        split_neon_register(rn, cn, &vn, &nbit);
+        *out_instr = assemble_neon_by_scalar(u, dbit, size2, vn, vd, 0xAu, nbit, vmx_mbit, vmx_vm);
+        return NULL;
+    }
+
     error = parse_neon_register(text, length, &pos, &rm, &cm);
     if (error != NULL) return error;
     if (cm != 'D') return error_neon_mismatched_size();
