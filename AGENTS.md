@@ -348,19 +348,56 @@ design points worth knowing before extending this further:
   types; fixed by using a plain `uint32_t [5][N]` array indexed
   directly instead of a struct pointer.
 
+The second batch covers the "two registers misc" shape (ARM DDI 0406C
+A7.4.6, `{Dd|Qd},{Dm|Qm}`) — `VCLS`, `VCLZ`, `VCNT`, `VMVN`, `VQABS`,
+`VQNEG`, `VRECPE`, `VRSQRTE`, `VREV16`/`VREV32`/`VREV64`, `VSWP`, `VTRN`,
+`VUZP`, `VZIP` — plus `VABS`/`VNEG` (which, like the arith3 group, have
+both a scalar and a NEON form and need the same merged-dispatch
+treatment via `encode_vfp_or_neon_monadic2`) and the `,#0` comparison
+form of `VCEQ`/`VCGE`/`VCGT`/`VCLE`/`VCLT` (a *different* encoding shape
+to those mnemonics' three-same register form covered in batch one, but
+sharing the same mnemonic-table row, so it's handled as a third branch
+inside `encode_neon_three_same` that fires when a `#` follows the second
+operand instead of a third register). More design notes:
+
+- The F32-vs-integer selector bit in this shape isn't always at the same
+  bit position (`VABS`/`VNEG`/the `#0` comparisons put it at bit 10;
+  `VRECPE`/`VRSQRTE` put it at bit 8) — `assemble_neon_two_reg_misc`
+  takes an explicit `f_bit_pos` parameter (0 meaning "this mnemonic has
+  no F32 form at all") rather than assuming one fixed position.
+- `VUZP`/`VZIP` with D-register (not Q) operands and 32-bit lanes are
+  architecturally identical to `VTRN` and are encoded using `VTRN`'s
+  opcode — `encode_neon_uzp_zip` checks for that specific combination
+  and substitutes the opcode; every other width/register-class
+  combination uses the mnemonic's own encoding.
+- `VMVN`/`VSWP`'s `{.<size>}` suffix is optional and, when present, is
+  parsed but has no effect on the encoding (the size field is always 0)
+  — real syntax like `VMVN.I32 Qd,Qm` is accepted, just ignored.
+- Throughout this backend's NEON pieces, the datatype *kind* letter
+  (`I`/`S`/`U`/bare) is validated only where it changes the encoding
+  (deriving the sign bit for `VQADD`-style "either S or U" mnemonics,
+  or selecting the scalar-vs-NEON/int-vs-float branch); where the
+  architecture restricts a mnemonic to a narrower kind set than what's
+  accepted here (e.g. `VRECPE` is architecturally `U32`/`F32` only, but
+  `S32`/`I32`/bare `32` are also accepted since the encoding is
+  identical), that narrower restriction isn't separately enforced — a
+  deliberate simplification in the same spirit as the width/kind
+  leniency already documented for the three-same family, to keep this
+  port's scope bounded without producing incorrect encodings.
+
 Everything else NEON — shift-by-immediate (`VSHL`/`VSHR`/`VSRA`/`VSLI`/
 `VSRI`/`VQSHL`-immediate/`VSHLL`/`VSHRN`/...), long/wide/narrow
 arithmetic (`VADDL`/`VMLAL`/`VMULL`/`VQDMULL`/`VMOVL`/`VMOVN`/...),
 by-scalar multiply forms (`VMUL`/`VMLA`/`VMLAL`/... with a `Dm[x]`
-indexed operand), move/duplicate/table/permute (`VMOV`-immediate,
-`VMVN`, `VDUP`, `VEXT`, `VTBL`/`VTBX`, `VSWP`, `VTRN`/`VUZP`/`VZIP`,
-`VREV16`/`VREV32`/`VREV64`), load/store (`VLD1`-`VLD4`/`VST1`-`VST4`,
-all alignment/lane/multiple-structure forms), and the convert/ARMv8-only
-additions (`VCVT` all forms, `VCVTB`/`VCVTT`, `VRINT*`, `VSEL*`,
-`VMAXNM`/`VMINNM`) remain a follow-on — several of those (the shift-
-immediate bitfield-width formulas, `VMOV`/`VMVN`'s immediate `cmode`
-table, datatype-conditional structure-load alignment) are meaningfully
-higher-risk to get bit-exact than anything ported so far.
+indexed operand), move-immediate/duplicate/table-lookup/extract
+(`VMOV`/`VMVN` immediate, `VDUP`, `VEXT`, `VTBL`/`VTBX`), load/store
+(`VLD1`-`VLD4`/`VST1`-`VST4`, all alignment/lane/multiple-structure
+forms), and the convert/ARMv8-only additions (`VCVT` all forms,
+`VCVTB`/`VCVTT`, `VRINT*`, `VSEL*`, `VMAXNM`/`VMINNM`) remain a follow-on
+— several of those (the shift-immediate bitfield-width formulas,
+`VMOV`/`VMVN`'s immediate `cmode` table, datatype-conditional
+structure-load alignment) are meaningfully higher-risk to get bit-exact
+than anything ported so far.
 
 ## Source material handling
 

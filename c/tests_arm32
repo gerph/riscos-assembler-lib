@@ -543,6 +543,46 @@ static const char *const lines_neon_cond_rejected[] = { "VADDEQ.I32 Q0,Q1,Q2", N
 static const char *const lines_neon_size_mismatch[] = { "VADD.I32 Q0,D1,D2", NULL };
 static const char *const lines_neon_disabled[] = { "VQADD.S32 D0,D1,D2", NULL };
 
+static const char *const lines_neon_vabs_s32[] = { "VABS.S32 D0,D1", NULL };
+static const uint8_t     bytes_neon_vabs_s32[] = { 0x01, 0x03, 0xB9, 0xF3 }; /* F3B90301 */
+
+static const char *const lines_neon_vabs_f32[] = { "VABS.F32 Q0,Q1", NULL };
+static const uint8_t     bytes_neon_vabs_f32[] = { 0x42, 0x07, 0xB9, 0xF3 }; /* F3B90742 */
+
+static const char *const lines_neon_vcls_s16[] = { "VCLS.S16 D0,D1", NULL };
+static const uint8_t     bytes_neon_vcls_s16[] = { 0x01, 0x04, 0xB4, 0xF3 }; /* F3B40401 */
+
+static const char *const lines_neon_vrecpe_u32[] = { "VRECPE.U32 D0,D1", NULL };
+static const uint8_t     bytes_neon_vrecpe_u32[] = { 0x01, 0x04, 0xBB, 0xF3 }; /* F3BB0401 */
+
+static const char *const lines_neon_vmvn[] = { "VMVN D0,D1", NULL };
+static const uint8_t     bytes_neon_vmvn[] = { 0x81, 0x05, 0xB0, 0xF3 }; /* F3B00581 */
+
+static const char *const lines_neon_vswp[] = { "VSWP D0,D1", NULL };
+static const uint8_t     bytes_neon_vswp[] = { 0x01, 0x00, 0xB2, 0xF3 }; /* F3B20001 */
+
+static const char *const lines_neon_vtrn_i16[] = { "VTRN.I16 D0,D1", NULL };
+static const uint8_t     bytes_neon_vtrn_i16[] = { 0x81, 0x00, 0xB6, 0xF3 }; /* F3B60081 */
+
+/* VUZP.I32 with D registers is architecturally identical to VTRN and
+   is encoded as such (opcode 0001, not VUZP's own 0010). */
+static const char *const lines_neon_vuzp_i32_d[] = { "VUZP.I32 D0,D1", NULL };
+static const uint8_t     bytes_neon_vuzp_i32_d[] = { 0x81, 0x00, 0xBA, 0xF3 }; /* F3BA0081 */
+
+static const char *const lines_neon_vuzp_i32_q[] = { "VUZP.I32 Q0,Q1", NULL };
+static const uint8_t     bytes_neon_vuzp_i32_q[] = { 0x42, 0x01, 0xBA, 0xF3 }; /* F3BA0142 */
+
+static const char *const lines_neon_vceq_zero[] = { "VCEQ.I32 D0,D1,#0", NULL };
+static const uint8_t     bytes_neon_vceq_zero[] = { 0x01, 0x01, 0xB9, 0xF3 }; /* F3B90101 */
+
+static const char *const lines_neon_vcgt_zero_f32[] = { "VCGT.F32 Q0,Q1,#0", NULL };
+static const uint8_t     bytes_neon_vcgt_zero_f32[] = { 0x42, 0x04, 0xB9, 0xF3 }; /* F3B90442 */
+
+static const char *const lines_neon_vacge_zero_rejected[] = { "VACGE.F32 D0,D1,#0", NULL };
+static const char *const lines_neon_vrecpe_bad_width[] = { "VRECPE.U16 D0,D1", NULL };
+static const char *const lines_neon_vuzp_bad_width[] = { "VUZP.I64 D0,D1", NULL };
+static const char *const lines_neon_vabs_cond_rejected[] = { "VABSEQ.S32 D0,D1", NULL };
+
 static const test_case_t tests[] = {
     { "MOV Rd,#imm",                   lines_mov_imm,          0, bytes_mov_imm,          sizeof(bytes_mov_imm),          0 },
     { "MOVS Rd,Rm",                    lines_mov_reg,          0, bytes_mov_reg,          sizeof(bytes_mov_reg),          0 },
@@ -625,7 +665,23 @@ static const test_case_t tests[] = {
     { "VPADD Qd form is rejected (D-only)", lines_neon_vpadd_q_rejected, 0, NULL, 0, 1, ASSEMBLE_ARM32_OPT_VFP },
     { "NEON mnemonics reject a condition code", lines_neon_cond_rejected, 0, NULL, 0, 1, ASSEMBLE_ARM32_OPT_VFP },
     { "NEON operands must all be the same width", lines_neon_size_mismatch, 0, NULL, 0, 1, ASSEMBLE_ARM32_OPT_VFP },
-    { "NEON-only mnemonic without OPT_VFP is rejected", lines_neon_disabled, 0, NULL, 0, 1, 0 }
+    { "NEON-only mnemonic without OPT_VFP is rejected", lines_neon_disabled, 0, NULL, 0, 1, 0 },
+
+    { "VABS.S32 Dd,Dm (NEON)",         lines_neon_vabs_s32,    0, bytes_neon_vabs_s32,    sizeof(bytes_neon_vabs_s32),    0, ASSEMBLE_ARM32_OPT_VFP },
+    { "VABS.F32 Qd,Qm (NEON)",         lines_neon_vabs_f32,    0, bytes_neon_vabs_f32,    sizeof(bytes_neon_vabs_f32),    0, ASSEMBLE_ARM32_OPT_VFP },
+    { "VCLS.S16 Dd,Dm",                lines_neon_vcls_s16,    0, bytes_neon_vcls_s16,    sizeof(bytes_neon_vcls_s16),    0, ASSEMBLE_ARM32_OPT_VFP },
+    { "VRECPE.U32 Dd,Dm",              lines_neon_vrecpe_u32,  0, bytes_neon_vrecpe_u32,  sizeof(bytes_neon_vrecpe_u32),  0, ASSEMBLE_ARM32_OPT_VFP },
+    { "VMVN Dd,Dm",                    lines_neon_vmvn,        0, bytes_neon_vmvn,        sizeof(bytes_neon_vmvn),        0, ASSEMBLE_ARM32_OPT_VFP },
+    { "VSWP Dd,Dm",                    lines_neon_vswp,        0, bytes_neon_vswp,        sizeof(bytes_neon_vswp),        0, ASSEMBLE_ARM32_OPT_VFP },
+    { "VTRN.I16 Dd,Dm",                lines_neon_vtrn_i16,    0, bytes_neon_vtrn_i16,    sizeof(bytes_neon_vtrn_i16),    0, ASSEMBLE_ARM32_OPT_VFP },
+    { "VUZP.I32 Dd,Dm (aliases VTRN)", lines_neon_vuzp_i32_d,  0, bytes_neon_vuzp_i32_d,  sizeof(bytes_neon_vuzp_i32_d),  0, ASSEMBLE_ARM32_OPT_VFP },
+    { "VUZP.I32 Qd,Qm (own encoding)", lines_neon_vuzp_i32_q,  0, bytes_neon_vuzp_i32_q,  sizeof(bytes_neon_vuzp_i32_q),  0, ASSEMBLE_ARM32_OPT_VFP },
+    { "VCEQ.I32 Dd,Dm,#0",             lines_neon_vceq_zero,   0, bytes_neon_vceq_zero,   sizeof(bytes_neon_vceq_zero),   0, ASSEMBLE_ARM32_OPT_VFP },
+    { "VCGT.F32 Qd,Qm,#0",             lines_neon_vcgt_zero_f32, 0, bytes_neon_vcgt_zero_f32, sizeof(bytes_neon_vcgt_zero_f32), 0, ASSEMBLE_ARM32_OPT_VFP },
+    { "VACGE has no #0 comparison form", lines_neon_vacge_zero_rejected, 0, NULL, 0, 1, ASSEMBLE_ARM32_OPT_VFP },
+    { "VRECPE width must be 32",       lines_neon_vrecpe_bad_width, 0, NULL, 0, 1, ASSEMBLE_ARM32_OPT_VFP },
+    { "VUZP width must not be 64",     lines_neon_vuzp_bad_width, 0, NULL, 0, 1, ASSEMBLE_ARM32_OPT_VFP },
+    { "VABS/VNEG NEON form rejects a condition code", lines_neon_vabs_cond_rejected, 0, NULL, 0, 1, ASSEMBLE_ARM32_OPT_VFP }
 };
 
 int run_tests_arm32(void)

@@ -214,9 +214,13 @@ length" family (`VADD`, `VSUB`, `VMUL`, `VMLA`, `VMLS`, `VAND`, `VBIC`,
 `VORR`, `VORN`, `VEOR`, `VBSL`, `VBIT`, `VBIF`, `VQADD`, `VQSUB`, `VRSHL`,
 `VQSHL`, `VQRSHL`, `VHADD`, `VHSUB`, `VRHADD`, `VABA`, `VABD`, `VCEQ`,
 `VCGE`, `VCGT`, `VCLE`, `VCLT`, `VTST`, `VQDMULH`, `VQRDMULH`, `VACGE`,
-`VACGT`, `VACLE`, `VACLT`, `VMAX`, `VMIN`, `VPMAX`, `VPMIN`, `VPADD`).
-Everything else NEON (shifts by immediate, long/wide/narrow arithmetic,
-by-scalar multiply forms, move/duplicate/table/permute, load/store, and
+`VACGT`, `VACLE`, `VACLT`, `VMAX`, `VMIN`, `VPMAX`, `VPMIN`, `VPADD`) and
+the "two registers misc" family (`VABS`, `VNEG`, `VCLS`, `VCLZ`, `VCNT`,
+`VMVN`, `VQABS`, `VQNEG`, `VRECPE`, `VRSQRTE`, `VREV16`, `VREV32`,
+`VREV64`, `VSWP`, `VTRN`, `VUZP`, `VZIP`), plus the `#0` comparison form
+of `VCEQ`/`VCGE`/`VCGT`/`VCLE`/`VCLT`. Everything else NEON (shifts by
+immediate, long/wide/narrow arithmetic, by-scalar multiply forms,
+move-immediate/duplicate/table-lookup/extract, load/store, and
 convert/ARMv8-only additions such as `VRINT*`, `VSEL*`, `VMAXNM`/
 `VMINNM` and directed-rounding `VCVT`) remains a follow-on. Within base
 ARM32, the ARMv5TE/v6 'xy' DSP
