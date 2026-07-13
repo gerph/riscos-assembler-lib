@@ -1,0 +1,5 @@
+ ORG &8000
+start: LDA #target-start ; semicolon comment
+ DCB 1,2 // slash comment
+target EQU start+(2*2)
+ BNE start
