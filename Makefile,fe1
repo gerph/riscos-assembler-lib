@@ -38,9 +38,11 @@ OBJS       = o.main \
              o.assemble_6502 \
              o.assemble_6809 \
              o.assemble_x86_64 \
+             o.assemble_z80 \
              o.tests \
              o.tests_6809 \
-             o.tests_x86_64
+             o.tests_x86_64 \
+             o.tests_z80
 
 # Space separated list of XML files for building documentation.
 #DOCSRC = <prm-in-xml-sources>

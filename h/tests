@@ -1,7 +1,7 @@
 /*******************************************************************
  * File:        tests
- * Purpose:     Self-tests for the assemble_6502, assemble_6809 and
- *              assemble_x86_64 libraries.
+ * Purpose:     Self-tests for the assemble_6502, assemble_6809,
+ *              assemble_x86_64 and assemble_z80 libraries.
  * Author:      Charles Ferguson (Gerph)
  ******************************************************************/
 
@@ -34,5 +34,14 @@ int run_tests_6809(void);
  Returns:       the number of failing tests (0 if all passed)
  ******************************************************************/
 int run_tests_x86_64(void);
+
+/*******************************************************************
+ Function:      run_tests_z80
+ Description:   Runs all assemble_z80 self-tests, printing a line
+                per failure and a summary at the end.
+ Parameters:    none
+ Returns:       the number of failing tests (0 if all passed)
+ ******************************************************************/
+int run_tests_z80(void);
 
 #endif

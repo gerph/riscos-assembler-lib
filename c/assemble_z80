@@ -1,0 +1,2173 @@
+/*******************************************************************
+ * File:        assemble_z80
+ * Purpose:     Assembler backend for the Z80 instruction set.
+ *              Parses one tokenised BASIC source line at a time into
+ *              machine code, using the callbacks in the assembly
+ *              context to evaluate expressions and to assign labels.
+ *              All multi-byte values are little-endian, matching the
+ *              Z80 itself. Ported from the real BBC BASIC (Z80)
+ *              "ASMB" module (BBCZ80/src/ASMB.Z80), extended with the
+ *              well-known undocumented Z80 instructions (see
+ *              AGENTS.md).
+ * Author:      Charles Ferguson (Gerph)
+ ******************************************************************/
+
+#include <string.h>
+#include <ctype.h>
+
+#include "assemble_z80.h"
+
+/* BASIC tokenises AND/OR as single bytes; both are also Z80 mnemonic
+   spellings (unlike 6809, no BASIC-token/mnemonic spelling clashes
+   need remapping to a *different* spelling here). CALL is also a
+   BASIC statement keyword tokenised to a single byte, coincident with
+   the Z80 CALL mnemonic; DEF is tokenised similarly and precedes the
+   literal 'B'/'M'/'W' of DEFB/DEFM/DEFW. */
+#define TOKEN_AND  0x80
+#define TOKEN_OR   0x84
+#define TOKEN_CALL 0xD6
+#define TOKEN_DEF  0xDD
+
+#define PREFIX_NONE 0x00
+#define PREFIX_IX   0xDD
+#define PREFIX_IY   0xFD
+
+typedef struct z80_reg8
+{
+    int     code;      /* 0=B,1=C,2=D,3=E,4=H,5=L,6=(HL)/(IX+d)/(IY+d),7=A */
+    int     is_half;   /* 1 if spelled IXH/IXL/IYH/IYL (undocumented) */
+    int     is_indirect; /* 1 if (HL)/(IX+d)/(IY+d) */
+    int     prefix;    /* PREFIX_NONE/PREFIX_IX/PREFIX_IY; meaningful when is_half or is_indirect */
+    int32_t disp;       /* displacement, only when is_indirect && prefix != PREFIX_NONE */
+} z80_reg8_t;
+
+typedef struct z80_reg16
+{
+    int code;   /* 0=BC,1=DE,2=HL(or IX/IY),3=SP */
+    int prefix; /* PREFIX_NONE/PREFIX_IX/PREFIX_IY */
+} z80_reg16_t;
+
+static int is_char_ci(uint8_t byte, char ch)
+{
+    return toupper((int) byte) == toupper((int) ch);
+}
+
+static int at_word_boundary(const uint8_t *text, size_t length, size_t pos)
+{
+    return !(pos < length && assemble_is_ident_char(text[pos]));
+}
+
+static int32_t value_to_integer(const assemble_value_t *value)
+{
+    switch (value->type)
+    {
+        case ASSEMBLE_VALUE_FLOAT:
+            return (int32_t) value->value.as_float;
+        case ASSEMBLE_VALUE_INTEGER:
+        default:
+            return value->value.as_integer;
+    }
+}
+
+static _kernel_oserror *eval_expr(assemble_context_t *context,
+                                   const uint8_t *text, size_t length,
+                                   assemble_value_t *value, size_t *consumed)
+{
+    _kernel_oserror *error = NULL;
+
+    if (context->resolve_expr(context->user_data, text, length, value, consumed, &error) != ASSEMBLE_RESULT_OK)
+    {
+        if (error != NULL)
+        {
+            return error;
+        }
+        return assemble_set_error(ASSEMBLE_CPU_Z80, ASSEMBLE_ERROR_TYPE_EXPRESSION, ASSEMBLE_Z80_ERR_NONE,
+                                   "Expression could not be evaluated");
+    }
+    if (value->type == ASSEMBLE_VALUE_STRING)
+    {
+        return assemble_set_error(ASSEMBLE_CPU_Z80, ASSEMBLE_ERROR_TYPE_EXPRESSION, ASSEMBLE_Z80_ERR_NONE,
+                                   "Expected a numeric value");
+    }
+    return NULL;
+}
+
+static _kernel_oserror *eval_numeric(assemble_context_t *context,
+                                      const uint8_t *text, size_t length,
+                                      size_t *pos_inout, int32_t *out_value)
+{
+    assemble_value_t value;
+    size_t consumed;
+    _kernel_oserror *error;
+
+    error = eval_expr(context, text + *pos_inout, length - *pos_inout, &value, &consumed);
+    if (error != NULL)
+    {
+        return error;
+    }
+    *pos_inout += consumed;
+    *out_value = value_to_integer(&value);
+    return NULL;
+}
+
+static _kernel_oserror *check_trailing(const uint8_t *text, size_t length, size_t pos)
+{
+    pos += assemble_skip_spaces(text + pos, length - pos);
+    if (pos != length)
+    {
+        return assemble_set_error(ASSEMBLE_CPU_Z80, ASSEMBLE_ERROR_TYPE_SYNTAX, ASSEMBLE_Z80_ERR_NONE,
+                                   "Unexpected text after operand");
+    }
+    return NULL;
+}
+
+static _kernel_oserror *expect_comma(const uint8_t *text, size_t length, size_t *pos_inout)
+{
+    size_t pos = *pos_inout;
+
+    pos += assemble_skip_spaces(text + pos, length - pos);
+    if (!(pos < length && text[pos] == ','))
+    {
+        return assemble_set_error(ASSEMBLE_CPU_Z80, ASSEMBLE_ERROR_TYPE_SYNTAX, ASSEMBLE_Z80_ERR_EXPECT_COMMA,
+                                   "Expected ,");
+    }
+    pos += 1;
+    pos += assemble_skip_spaces(text + pos, length - pos);
+    *pos_inout = pos;
+    return NULL;
+}
+
+static _kernel_oserror *emit_prefix(assemble_context_t *context, int prefix)
+{
+    if (prefix == PREFIX_NONE)
+    {
+        return NULL;
+    }
+    return assemble_emit_byte(context, ASSEMBLE_CPU_Z80, (uint8_t) prefix);
+}
+
+/*******************************************************************
+ Function:      try_reg8
+ Description:   Attempts to parse an 8-bit register operand: B, C, D,
+                E, H, L, A, (HL), (IX+d), (IY+d), or the undocumented
+                halves IXH/IXL/IYH/IYL. Does not skip leading spaces.
+ Parameters:    context = the assembly context (for displacement
+                          expression evaluation)
+                text/length = the operand text
+                pos_inout = current position; advanced past the
+                            register on a match
+                out = filled in on a match
+                out_error = set if '(' committed to (IX+d)/(IY+d) but
+                            the displacement or ')' was malformed
+ Returns:       1 if matched (out_error may still be non-NULL, which
+                the caller must treat as a hard failure), 0 if this
+                text is not an 8-bit register operand at all (pos
+                unchanged, out_error is NULL)
+ ******************************************************************/
+static int try_reg8(assemble_context_t *context, const uint8_t *text, size_t length, size_t *pos_inout,
+                     z80_reg8_t *out, _kernel_oserror **out_error)
+{
+    size_t pos = *pos_inout;
+    size_t save = pos;
+
+    *out_error = NULL;
+
+    if (pos < length && text[pos] == '(')
+    {
+        size_t p = pos + 1;
+
+        p += assemble_skip_spaces(text + p, length - p);
+
+        if (p + 1 < length && is_char_ci(text[p], 'H') && is_char_ci(text[p + 1], 'L') &&
+            at_word_boundary(text, length, p + 2))
+        {
+            size_t p2 = p + 2;
+
+            p2 += assemble_skip_spaces(text + p2, length - p2);
+            if (p2 < length && text[p2] == ')')
+            {
+                out->code = 6;
+                out->is_half = 0;
+                out->is_indirect = 1;
+                out->prefix = PREFIX_NONE;
+                out->disp = 0;
+                *pos_inout = p2 + 1;
+                return 1;
+            }
+            return 0;
+        }
+
+        if (p + 1 < length && is_char_ci(text[p], 'I') &&
+            (is_char_ci(text[p + 1], 'X') || is_char_ci(text[p + 1], 'Y')))
+        {
+            int prefix = is_char_ci(text[p + 1], 'X') ? PREFIX_IX : PREFIX_IY;
+            int32_t disp = 0;
+
+            p += 2;
+            p += assemble_skip_spaces(text + p, length - p);
+
+            if (p < length && text[p] == ')')
+            {
+                out->code = 6;
+                out->is_half = 0;
+                out->is_indirect = 1;
+                out->prefix = prefix;
+                out->disp = 0;
+                *pos_inout = p + 1;
+                return 1;
+            }
+
+            if (p < length && (text[p] == '+' || text[p] == '-'))
+            {
+                /* '+' is separator punctuation, not a unary operator:
+                   consume it and evaluate the expression after it.
+                   A leading '-' is passed through as part of the
+                   expression itself, matching how signed offsets are
+                   parsed elsewhere in this library (eg 6809). */
+                if (text[p] == '+')
+                {
+                    p += 1;
+                    p += assemble_skip_spaces(text + p, length - p);
+                }
+                *out_error = eval_numeric(context, text, length, &p, &disp);
+                if (*out_error != NULL)
+                {
+                    return 1;
+                }
+                p += assemble_skip_spaces(text + p, length - p);
+                if (!(p < length && text[p] == ')'))
+                {
+                    *out_error = assemble_set_error(ASSEMBLE_CPU_Z80, ASSEMBLE_ERROR_TYPE_SYNTAX,
+                                                      ASSEMBLE_Z80_ERR_EXPECT_RPAREN,
+                                                      "Indexed addressing: expected )");
+                    return 1;
+                }
+                if (disp < -128 || disp > 127)
+                {
+                    *out_error = assemble_set_error(ASSEMBLE_CPU_Z80, ASSEMBLE_ERROR_TYPE_RANGE,
+                                                      ASSEMBLE_Z80_ERR_OFFSET_OUT_OF_RANGE,
+                                                      "(IX+d)/(IY+d) displacement out of range [-128..127]");
+                    return 1;
+                }
+                out->code = 6;
+                out->is_half = 0;
+                out->is_indirect = 1;
+                out->prefix = prefix;
+                out->disp = disp;
+                *pos_inout = p + 1;
+                return 1;
+            }
+
+            *out_error = assemble_set_error(ASSEMBLE_CPU_Z80, ASSEMBLE_ERROR_TYPE_SYNTAX,
+                                              ASSEMBLE_Z80_ERR_EXPECT_RPAREN,
+                                              "Indexed addressing: expected + d, - d or )");
+            return 1;
+        }
+
+        return 0;
+    }
+
+    if (pos + 2 < length && is_char_ci(text[pos], 'I') &&
+        (is_char_ci(text[pos + 1], 'X') || is_char_ci(text[pos + 1], 'Y')) &&
+        (is_char_ci(text[pos + 2], 'H') || is_char_ci(text[pos + 2], 'L')) &&
+        at_word_boundary(text, length, pos + 3))
+    {
+        out->code = is_char_ci(text[pos + 2], 'H') ? 4 : 5;
+        out->is_half = 1;
+        out->is_indirect = 0;
+        out->prefix = is_char_ci(text[pos + 1], 'X') ? PREFIX_IX : PREFIX_IY;
+        out->disp = 0;
+        *pos_inout = pos + 3;
+        return 1;
+    }
+
+    if (pos < length && at_word_boundary(text, length, pos + 1))
+    {
+        int code = -1;
+
+        switch (toupper((int) text[pos]))
+        {
+            case 'B': code = 0; break;
+            case 'C': code = 1; break;
+            case 'D': code = 2; break;
+            case 'E': code = 3; break;
+            case 'H': code = 4; break;
+            case 'L': code = 5; break;
+            case 'A': code = 7; break;
+            default: break;
+        }
+        if (code >= 0)
+        {
+            out->code = code;
+            out->is_half = 0;
+            out->is_indirect = 0;
+            out->prefix = PREFIX_NONE;
+            out->disp = 0;
+            *pos_inout = pos + 1;
+            return 1;
+        }
+    }
+
+    *pos_inout = save;
+    return 0;
+}
+
+/*******************************************************************
+ Function:      reg8_combine_prefix
+ Description:   Validates that two 8-bit register operands of the
+                same instruction (eg the two sides of LD r,r') can be
+                combined, and returns the instruction's overall
+                DD/FD prefix (0 if neither uses one). Combining an
+                indexed memory operand with a plain H/L or with a
+                differently-prefixed half is rejected, as is
+                combining two halves from different index registers,
+                since neither has a well-defined encoding here.
+ Parameters:    a, b = the two operands (order does not matter)
+ Returns:       the combined prefix, or -1 if the combination is not
+                representable
+ ******************************************************************/
+static int reg8_combine_prefix(const z80_reg8_t *a, const z80_reg8_t *b)
+{
+    if (a->prefix == PREFIX_NONE && b->prefix == PREFIX_NONE)
+    {
+        return PREFIX_NONE;
+    }
+    if (a->prefix != PREFIX_NONE && b->prefix != PREFIX_NONE)
+    {
+        if (a->prefix != b->prefix)
+        {
+            return -1;
+        }
+        if (a->is_indirect && b->is_indirect)
+        {
+            return -1;
+        }
+        return a->prefix;
+    }
+
+    {
+        const z80_reg8_t *plain = (a->prefix == PREFIX_NONE) ? a : b;
+        const z80_reg8_t *special = (a->prefix == PREFIX_NONE) ? b : a;
+
+        if (plain->code == 4 || plain->code == 5)
+        {
+            /* Ambiguous: ordinary H/L combined with an indexed operand
+               of the other side has no well-defined single encoding. */
+            return -1;
+        }
+        return special->prefix;
+    }
+}
+
+static int try_reg16(const uint8_t *text, size_t length, size_t *pos_inout, z80_reg16_t *out)
+{
+    size_t pos = *pos_inout;
+
+    if (pos + 1 < length && at_word_boundary(text, length, pos + 2))
+    {
+        if (is_char_ci(text[pos], 'B') && is_char_ci(text[pos + 1], 'C'))
+        {
+            out->code = 0; out->prefix = PREFIX_NONE; *pos_inout = pos + 2; return 1;
+        }
+        if (is_char_ci(text[pos], 'D') && is_char_ci(text[pos + 1], 'E'))
+        {
+            out->code = 1; out->prefix = PREFIX_NONE; *pos_inout = pos + 2; return 1;
+        }
+        if (is_char_ci(text[pos], 'H') && is_char_ci(text[pos + 1], 'L'))
+        {
+            out->code = 2; out->prefix = PREFIX_NONE; *pos_inout = pos + 2; return 1;
+        }
+        if (is_char_ci(text[pos], 'S') && is_char_ci(text[pos + 1], 'P'))
+        {
+            out->code = 3; out->prefix = PREFIX_NONE; *pos_inout = pos + 2; return 1;
+        }
+        if (is_char_ci(text[pos], 'I') && is_char_ci(text[pos + 1], 'X'))
+        {
+            out->code = 2; out->prefix = PREFIX_IX; *pos_inout = pos + 2; return 1;
+        }
+        if (is_char_ci(text[pos], 'I') && is_char_ci(text[pos + 1], 'Y'))
+        {
+            out->code = 2; out->prefix = PREFIX_IY; *pos_inout = pos + 2; return 1;
+        }
+    }
+    return 0;
+}
+
+static int try_reg16_stack(const uint8_t *text, size_t length, size_t *pos_inout, z80_reg16_t *out)
+{
+    size_t pos = *pos_inout;
+
+    if (pos + 1 < length && at_word_boundary(text, length, pos + 2))
+    {
+        if (is_char_ci(text[pos], 'B') && is_char_ci(text[pos + 1], 'C'))
+        {
+            out->code = 0; out->prefix = PREFIX_NONE; *pos_inout = pos + 2; return 1;
+        }
+        if (is_char_ci(text[pos], 'D') && is_char_ci(text[pos + 1], 'E'))
+        {
+            out->code = 1; out->prefix = PREFIX_NONE; *pos_inout = pos + 2; return 1;
+        }
+        if (is_char_ci(text[pos], 'H') && is_char_ci(text[pos + 1], 'L'))
+        {
+            out->code = 2; out->prefix = PREFIX_NONE; *pos_inout = pos + 2; return 1;
+        }
+        if (is_char_ci(text[pos], 'A') && is_char_ci(text[pos + 1], 'F'))
+        {
+            out->code = 3; out->prefix = PREFIX_NONE; *pos_inout = pos + 2; return 1;
+        }
+        if (is_char_ci(text[pos], 'I') && is_char_ci(text[pos + 1], 'X'))
+        {
+            out->code = 2; out->prefix = PREFIX_IX; *pos_inout = pos + 2; return 1;
+        }
+        if (is_char_ci(text[pos], 'I') && is_char_ci(text[pos + 1], 'Y'))
+        {
+            out->code = 2; out->prefix = PREFIX_IY; *pos_inout = pos + 2; return 1;
+        }
+    }
+    return 0;
+}
+
+/* NZ/Z/NC/C/PO/PE/P/M -> 0..7. Checked longest-first so 'N'+'C' isn't
+   swallowed as bare 'C' etc. */
+static int try_condition(const uint8_t *text, size_t length, size_t *pos_inout, int *out_code)
+{
+    size_t pos = *pos_inout;
+
+    if (pos + 1 < length && at_word_boundary(text, length, pos + 2))
+    {
+        if (is_char_ci(text[pos], 'N') && is_char_ci(text[pos + 1], 'Z')) { *out_code = 0; *pos_inout = pos + 2; return 1; }
+        if (is_char_ci(text[pos], 'N') && is_char_ci(text[pos + 1], 'C')) { *out_code = 2; *pos_inout = pos + 2; return 1; }
+        if (is_char_ci(text[pos], 'P') && is_char_ci(text[pos + 1], 'O')) { *out_code = 4; *pos_inout = pos + 2; return 1; }
+        if (is_char_ci(text[pos], 'P') && is_char_ci(text[pos + 1], 'E')) { *out_code = 5; *pos_inout = pos + 2; return 1; }
+    }
+    if (pos < length && at_word_boundary(text, length, pos + 1))
+    {
+        if (is_char_ci(text[pos], 'Z')) { *out_code = 1; *pos_inout = pos + 1; return 1; }
+        if (is_char_ci(text[pos], 'C')) { *out_code = 3; *pos_inout = pos + 1; return 1; }
+        if (is_char_ci(text[pos], 'P')) { *out_code = 6; *pos_inout = pos + 1; return 1; }
+        if (is_char_ci(text[pos], 'M')) { *out_code = 7; *pos_inout = pos + 1; return 1; }
+    }
+    return 0;
+}
+
+static _kernel_oserror *error_bad_addressing(void)
+{
+    return assemble_set_error(ASSEMBLE_CPU_Z80, ASSEMBLE_ERROR_TYPE_BAD_OPERAND, ASSEMBLE_Z80_ERR_BAD_ADDRESSING,
+                               "Instruction does not support this combination of operands");
+}
+
+/*******************************************************************
+ Function:      emit_reg8_extra
+ Description:   Emits the prefix (if any) and, for an indexed
+                operand, the displacement byte that must follow the
+                opcode byte(s) of an instruction using a z80_reg8_t.
+                The opcode byte itself is the caller's responsibility.
+ Parameters:    context = the assembly context
+                reg = the operand as returned by try_reg8()
+ Returns:       NULL if successful, otherwise a static error block
+ ******************************************************************/
+static _kernel_oserror *emit_reg8_disp(assemble_context_t *context, const z80_reg8_t *reg)
+{
+    if (reg->is_indirect && reg->prefix != PREFIX_NONE)
+    {
+        return assemble_emit_byte(context, ASSEMBLE_CPU_Z80, (uint8_t) (reg->disp & 0xFF));
+    }
+    return NULL;
+}
+
+/* ---- LD --------------------------------------------------------- */
+
+typedef enum ld_operand_kind
+{
+    LD_REG8,
+    LD_REG16,
+    LD_IND_BC,
+    LD_IND_DE,
+    LD_IND_NN,
+    LD_REG_I,
+    LD_REG_R,
+    LD_IMM
+} ld_operand_kind_t;
+
+typedef struct ld_operand
+{
+    ld_operand_kind_t kind;
+    z80_reg8_t         reg8;
+    z80_reg16_t        reg16;
+    int32_t             value; /* LD_IND_NN address, or LD_IMM value */
+} ld_operand_t;
+
+/*******************************************************************
+ Function:      parse_ld_operand
+ Description:   Parses one side of an LD instruction's operand pair.
+ Parameters:    context = the assembly context
+                text/length = the operand text
+                pos_inout = current position; advanced past the
+                            operand on success
+                out = filled in on success
+ Returns:       NULL if successful, otherwise a static error block
+ ******************************************************************/
+static _kernel_oserror *parse_ld_operand(assemble_context_t *context, const uint8_t *text, size_t length,
+                                          size_t *pos_inout, ld_operand_t *out)
+{
+    size_t pos = *pos_inout;
+    _kernel_oserror *error;
+    int matched;
+
+    pos += assemble_skip_spaces(text + pos, length - pos);
+
+    matched = try_reg8(context, text, length, &pos, &out->reg8, &error);
+    if (matched)
+    {
+        if (error != NULL)
+        {
+            return error;
+        }
+        out->kind = LD_REG8;
+        *pos_inout = pos;
+        return NULL;
+    }
+
+    if (pos < length && text[pos] == '(')
+    {
+        size_t p = pos + 1;
+
+        p += assemble_skip_spaces(text + p, length - p);
+        if (p + 1 < length && is_char_ci(text[p], 'B') && is_char_ci(text[p + 1], 'C') &&
+            at_word_boundary(text, length, p + 2))
+        {
+            size_t p2 = p + 2;
+
+            p2 += assemble_skip_spaces(text + p2, length - p2);
+            if (p2 < length && text[p2] == ')')
+            {
+                out->kind = LD_IND_BC;
+                *pos_inout = p2 + 1;
+                return NULL;
+            }
+        }
+        if (p + 1 < length && is_char_ci(text[p], 'D') && is_char_ci(text[p + 1], 'E') &&
+            at_word_boundary(text, length, p + 2))
+        {
+            size_t p2 = p + 2;
+
+            p2 += assemble_skip_spaces(text + p2, length - p2);
+            if (p2 < length && text[p2] == ')')
+            {
+                out->kind = LD_IND_DE;
+                *pos_inout = p2 + 1;
+                return NULL;
+            }
+        }
+
+        pos = p;
+        error = eval_numeric(context, text, length, &pos, &out->value);
+        if (error != NULL)
+        {
+            return error;
+        }
+        pos += assemble_skip_spaces(text + pos, length - pos);
+        if (!(pos < length && text[pos] == ')'))
+        {
+            return assemble_set_error(ASSEMBLE_CPU_Z80, ASSEMBLE_ERROR_TYPE_SYNTAX, ASSEMBLE_Z80_ERR_EXPECT_RPAREN,
+                                       "Expected )");
+        }
+        out->kind = LD_IND_NN;
+        *pos_inout = pos + 1;
+        return NULL;
+    }
+
+    if (pos < length && at_word_boundary(text, length, pos + 1))
+    {
+        if (is_char_ci(text[pos], 'I'))
+        {
+            out->kind = LD_REG_I;
+            *pos_inout = pos + 1;
+            return NULL;
+        }
+        if (is_char_ci(text[pos], 'R'))
+        {
+            out->kind = LD_REG_R;
+            *pos_inout = pos + 1;
+            return NULL;
+        }
+    }
+
+    if (try_reg16(text, length, &pos, &out->reg16))
+    {
+        out->kind = LD_REG16;
+        *pos_inout = pos;
+        return NULL;
+    }
+
+    error = eval_numeric(context, text, length, &pos, &out->value);
+    if (error != NULL)
+    {
+        return error;
+    }
+    out->kind = LD_IMM;
+    *pos_inout = pos;
+    return NULL;
+}
+
+/*******************************************************************
+ Function:      assemble_ld
+ Description:   Parses and encodes an LD instruction, covering the
+                8-bit and 16-bit register forms, (HL)/(IX+d)/(IY+d),
+                (BC)/(DE)/(nn) memory forms, I/R, and SP,HL/IX/IY.
+ Parameters:    context = the assembly context
+                text/length = the operand text following "LD"
+ Returns:       NULL if successful, otherwise a static error block
+ ******************************************************************/
+static _kernel_oserror *assemble_ld(assemble_context_t *context, const uint8_t *text, size_t length)
+{
+    size_t pos = 0;
+    ld_operand_t lhs, rhs;
+    _kernel_oserror *error;
+
+    error = parse_ld_operand(context, text, length, &pos, &lhs);
+    if (error != NULL)
+    {
+        return error;
+    }
+    error = expect_comma(text, length, &pos);
+    if (error != NULL)
+    {
+        return error;
+    }
+    error = parse_ld_operand(context, text, length, &pos, &rhs);
+    if (error != NULL)
+    {
+        return error;
+    }
+    error = check_trailing(text, length, pos);
+    if (error != NULL)
+    {
+        return error;
+    }
+
+    if (lhs.kind == LD_REG8 && rhs.kind == LD_REG8)
+    {
+        int prefix;
+        uint8_t opcode;
+
+        if (lhs.reg8.is_indirect && rhs.reg8.is_indirect)
+        {
+            return assemble_set_error(ASSEMBLE_CPU_Z80, ASSEMBLE_ERROR_TYPE_BAD_OPERAND,
+                                       ASSEMBLE_Z80_ERR_BAD_HL_HL,
+                                       "LD (HL),(HL) is not a valid instruction (that encoding is HALT)");
+        }
+        prefix = reg8_combine_prefix(&lhs.reg8, &rhs.reg8);
+        if (prefix < 0)
+        {
+            return error_bad_addressing();
+        }
+        opcode = (uint8_t) (0x40 | (lhs.reg8.code << 3) | rhs.reg8.code);
+        error = emit_prefix(context, prefix);
+        if (error != NULL) { return error; }
+        error = assemble_emit_byte(context, ASSEMBLE_CPU_Z80, opcode);
+        if (error != NULL) { return error; }
+        return lhs.reg8.is_indirect ? emit_reg8_disp(context, &lhs.reg8) : emit_reg8_disp(context, &rhs.reg8);
+    }
+
+    if (lhs.kind == LD_REG8 && rhs.kind == LD_IMM)
+    {
+        uint8_t opcode;
+
+        if (rhs.value < -128 || rhs.value > 255)
+        {
+            return assemble_set_error(ASSEMBLE_CPU_Z80, ASSEMBLE_ERROR_TYPE_RANGE,
+                                       ASSEMBLE_Z80_ERR_CONST_OVERFLOW_BYTE, "Immediate value out of range");
+        }
+        opcode = lhs.reg8.is_indirect ? 0x36 : (uint8_t) (0x06 | (lhs.reg8.code << 3));
+        error = emit_prefix(context, lhs.reg8.prefix);
+        if (error != NULL) { return error; }
+        error = assemble_emit_byte(context, ASSEMBLE_CPU_Z80, opcode);
+        if (error != NULL) { return error; }
+        error = emit_reg8_disp(context, &lhs.reg8);
+        if (error != NULL) { return error; }
+        return assemble_emit_byte(context, ASSEMBLE_CPU_Z80, (uint8_t) (rhs.value & 0xFF));
+    }
+
+    if (lhs.kind == LD_REG8 && !lhs.reg8.is_indirect && !lhs.reg8.is_half && lhs.reg8.code == 7)
+    {
+        if (rhs.kind == LD_IND_BC)
+        {
+            return assemble_emit_byte(context, ASSEMBLE_CPU_Z80, 0x0A);
+        }
+        if (rhs.kind == LD_IND_DE)
+        {
+            return assemble_emit_byte(context, ASSEMBLE_CPU_Z80, 0x1A);
+        }
+        if (rhs.kind == LD_IND_NN)
+        {
+            error = assemble_emit_byte(context, ASSEMBLE_CPU_Z80, 0x3A);
+            if (error != NULL) { return error; }
+            return assemble_emit_word(context, ASSEMBLE_CPU_Z80, (uint16_t) (rhs.value & 0xFFFF));
+        }
+        if (rhs.kind == LD_REG_I)
+        {
+            error = assemble_emit_byte(context, ASSEMBLE_CPU_Z80, 0xED);
+            if (error != NULL) { return error; }
+            return assemble_emit_byte(context, ASSEMBLE_CPU_Z80, 0x57);
+        }
+        if (rhs.kind == LD_REG_R)
+        {
+            error = assemble_emit_byte(context, ASSEMBLE_CPU_Z80, 0xED);
+            if (error != NULL) { return error; }
+            return assemble_emit_byte(context, ASSEMBLE_CPU_Z80, 0x5F);
+        }
+    }
+
+    if (rhs.kind == LD_REG8 && !rhs.reg8.is_indirect && !rhs.reg8.is_half && rhs.reg8.code == 7)
+    {
+        if (lhs.kind == LD_IND_BC)
+        {
+            return assemble_emit_byte(context, ASSEMBLE_CPU_Z80, 0x02);
+        }
+        if (lhs.kind == LD_IND_DE)
+        {
+            return assemble_emit_byte(context, ASSEMBLE_CPU_Z80, 0x12);
+        }
+        if (lhs.kind == LD_IND_NN)
+        {
+            error = assemble_emit_byte(context, ASSEMBLE_CPU_Z80, 0x32);
+            if (error != NULL) { return error; }
+            return assemble_emit_word(context, ASSEMBLE_CPU_Z80, (uint16_t) (lhs.value & 0xFFFF));
+        }
+    }
+
+    if (lhs.kind == LD_REG_I && rhs.kind == LD_REG8 && rhs.reg8.code == 7 && !rhs.reg8.is_indirect && !rhs.reg8.is_half)
+    {
+        error = assemble_emit_byte(context, ASSEMBLE_CPU_Z80, 0xED);
+        if (error != NULL) { return error; }
+        return assemble_emit_byte(context, ASSEMBLE_CPU_Z80, 0x47);
+    }
+    if (lhs.kind == LD_REG_R && rhs.kind == LD_REG8 && rhs.reg8.code == 7 && !rhs.reg8.is_indirect && !rhs.reg8.is_half)
+    {
+        error = assemble_emit_byte(context, ASSEMBLE_CPU_Z80, 0xED);
+        if (error != NULL) { return error; }
+        return assemble_emit_byte(context, ASSEMBLE_CPU_Z80, 0x4F);
+    }
+
+    if (lhs.kind == LD_REG16 && rhs.kind == LD_IMM)
+    {
+        error = emit_prefix(context, lhs.reg16.prefix);
+        if (error != NULL) { return error; }
+        error = assemble_emit_byte(context, ASSEMBLE_CPU_Z80, (uint8_t) (0x01 | (lhs.reg16.code << 4)));
+        if (error != NULL) { return error; }
+        if (rhs.value < -32768 || rhs.value > 65535)
+        {
+            return assemble_set_error(ASSEMBLE_CPU_Z80, ASSEMBLE_ERROR_TYPE_RANGE,
+                                       ASSEMBLE_Z80_ERR_CONST_OVERFLOW_WORD, "Immediate value out of range [0..65535]");
+        }
+        return assemble_emit_word(context, ASSEMBLE_CPU_Z80, (uint16_t) (rhs.value & 0xFFFF));
+    }
+
+    if (lhs.kind == LD_REG16 && rhs.kind == LD_IND_NN)
+    {
+        if (lhs.reg16.code == 2 && lhs.reg16.prefix == PREFIX_NONE)
+        {
+            error = assemble_emit_byte(context, ASSEMBLE_CPU_Z80, 0x2A);
+        }
+        else if (lhs.reg16.prefix != PREFIX_NONE)
+        {
+            error = emit_prefix(context, lhs.reg16.prefix);
+            if (error != NULL) { return error; }
+            error = assemble_emit_byte(context, ASSEMBLE_CPU_Z80, 0x2A);
+        }
+        else
+        {
+            error = assemble_emit_byte(context, ASSEMBLE_CPU_Z80, 0xED);
+            if (error != NULL) { return error; }
+            error = assemble_emit_byte(context, ASSEMBLE_CPU_Z80, (uint8_t) (0x4B | (lhs.reg16.code << 4)));
+        }
+        if (error != NULL) { return error; }
+        return assemble_emit_word(context, ASSEMBLE_CPU_Z80, (uint16_t) (rhs.value & 0xFFFF));
+    }
+
+    if (lhs.kind == LD_IND_NN && rhs.kind == LD_REG16)
+    {
+        if (rhs.reg16.code == 2 && rhs.reg16.prefix == PREFIX_NONE)
+        {
+            error = assemble_emit_byte(context, ASSEMBLE_CPU_Z80, 0x22);
+        }
+        else if (rhs.reg16.prefix != PREFIX_NONE)
+        {
+            error = emit_prefix(context, rhs.reg16.prefix);
+            if (error != NULL) { return error; }
+            error = assemble_emit_byte(context, ASSEMBLE_CPU_Z80, 0x22);
+        }
+        else
+        {
+            error = assemble_emit_byte(context, ASSEMBLE_CPU_Z80, 0xED);
+            if (error != NULL) { return error; }
+            error = assemble_emit_byte(context, ASSEMBLE_CPU_Z80, (uint8_t) (0x43 | (rhs.reg16.code << 4)));
+        }
+        if (error != NULL) { return error; }
+        return assemble_emit_word(context, ASSEMBLE_CPU_Z80, (uint16_t) (lhs.value & 0xFFFF));
+    }
+
+    if (lhs.kind == LD_REG16 && lhs.reg16.code == 3 && lhs.reg16.prefix == PREFIX_NONE && rhs.kind == LD_REG16 &&
+        rhs.reg16.code == 2)
+    {
+        error = emit_prefix(context, rhs.reg16.prefix);
+        if (error != NULL) { return error; }
+        return assemble_emit_byte(context, ASSEMBLE_CPU_Z80, 0xF9);
+    }
+
+    return error_bad_addressing();
+}
+
+/* ---- ALU: ADD, ADC, SBC, SUB, AND, XOR, OR, CP ------------------- */
+
+typedef struct alu_entry
+{
+    const char *mnemonic;
+    uint8_t     reg_base;   /* opcode | reg8.code */
+    uint8_t     imm_opcode;
+    int         needs_acc;  /* 1: "A," is mandatory (ADD/ADC/SBC); 0: "A," is optional (SUB/AND/XOR/OR/CP) */
+} alu_entry_t;
+
+static const alu_entry_t alu_table[] = {
+    { "ADD", 0x80, 0xC6, 1 },
+    { "ADC", 0x88, 0xCE, 1 },
+    { "SBC", 0x98, 0xDE, 1 },
+    { "SUB", 0x90, 0xD6, 0 },
+    { "AND", 0xA0, 0xE6, 0 },
+    { "XOR", 0xA8, 0xEE, 0 },
+    { "OR",  0xB0, 0xF6, 0 },
+    { "CP",  0xB8, 0xFE, 0 }
+};
+
+#define NUM_ALU (sizeof(alu_table) / sizeof(alu_table[0]))
+
+/*******************************************************************
+ Function:      assemble_alu_reg16
+ Description:   Encodes the 16-bit forms of ADD/ADC/SBC: "ADD
+                HL/IX/IY,ss", "ADC HL,ss", "SBC HL,ss".
+ Parameters:    context = the assembly context
+                mnemonic = "ADD", "ADC" or "SBC"
+                lhs = the destination register (HL, IX or IY)
+                text/length/pos_inout = operand text, positioned just
+                          after the comma following lhs
+ Returns:       NULL if successful, otherwise a static error block
+ ******************************************************************/
+static _kernel_oserror *assemble_alu_reg16(assemble_context_t *context, const char *mnemonic,
+                                            const z80_reg16_t *lhs, const uint8_t *text, size_t length,
+                                            size_t *pos_inout)
+{
+    z80_reg16_t rhs;
+    _kernel_oserror *error;
+
+    if (!try_reg16(text, length, pos_inout, &rhs))
+    {
+        return assemble_set_error(ASSEMBLE_CPU_Z80, ASSEMBLE_ERROR_TYPE_BAD_OPERAND, ASSEMBLE_Z80_ERR_EXPECT_REGISTER,
+                                   "Expected BC, DE, HL/IX/IY or SP");
+    }
+    error = check_trailing(text, length, *pos_inout);
+    if (error != NULL)
+    {
+        return error;
+    }
+
+    if (strcmp(mnemonic, "ADD") == 0)
+    {
+        if (rhs.prefix != lhs->prefix && rhs.code == 2)
+        {
+            return error_bad_addressing();
+        }
+        if (rhs.prefix != PREFIX_NONE && rhs.prefix != lhs->prefix)
+        {
+            return error_bad_addressing();
+        }
+        error = emit_prefix(context, lhs->prefix);
+        if (error != NULL) { return error; }
+        return assemble_emit_byte(context, ASSEMBLE_CPU_Z80, (uint8_t) (0x09 | (rhs.code << 4)));
+    }
+
+    if (lhs->prefix != PREFIX_NONE || rhs.prefix != PREFIX_NONE)
+    {
+        return error_bad_addressing();
+    }
+    error = assemble_emit_byte(context, ASSEMBLE_CPU_Z80, 0xED);
+    if (error != NULL) { return error; }
+    return assemble_emit_byte(context, ASSEMBLE_CPU_Z80,
+                               (uint8_t) ((strcmp(mnemonic, "ADC") == 0 ? 0x4A : 0x42) | (rhs.code << 4)));
+}
+
+/*******************************************************************
+ Function:      assemble_alu
+ Description:   Parses and encodes ADD/ADC/SBC/SUB/AND/XOR/OR/CP: an
+                optional leading "A," (mandatory for ADD/ADC/SBC),
+                then either a register/(HL)/(IX+d)/(IY+d) operand, an
+                immediate, or (for ADD/ADC/SBC only) a 16-bit "HL,ss"/
+                "IX,pp"/"IY,rr" pair.
+ Parameters:    context = the assembly context
+                mnemonic = the ALU mnemonic
+                text/length = the operand text following the mnemonic
+ Returns:       NULL if successful, otherwise a static error block
+ ******************************************************************/
+static _kernel_oserror *assemble_alu(assemble_context_t *context, const char *mnemonic,
+                                      const uint8_t *text, size_t length)
+{
+    size_t pos = 0;
+    size_t i;
+    const alu_entry_t *entry = NULL;
+    z80_reg8_t reg8;
+    z80_reg16_t reg16;
+    _kernel_oserror *error;
+    int matched;
+
+    for (i = 0; i < NUM_ALU; i++)
+    {
+        if (strcmp(alu_table[i].mnemonic, mnemonic) == 0)
+        {
+            entry = &alu_table[i];
+            break;
+        }
+    }
+
+    pos += assemble_skip_spaces(text + pos, length - pos);
+
+    /* ADD/ADC/SBC also have a 16-bit "HL/IX/IY,ss" form with no
+       leading "A,"; try that first since it is unambiguous (only
+       ADD/ADC/SBC have needs_acc set, and SUB/AND/XOR/OR/CP have no
+       16-bit form at all). */
+    if (entry->needs_acc)
+    {
+        size_t save = pos;
+
+        if (try_reg16(text, length, &pos, &reg16) && reg16.code == 2)
+        {
+            size_t p = pos;
+
+            p += assemble_skip_spaces(text + p, length - p);
+            if (p < length && text[p] == ',')
+            {
+                pos = p + 1;
+                pos += assemble_skip_spaces(text + pos, length - pos);
+                return assemble_alu_reg16(context, mnemonic, &reg16, text, length, &pos);
+            }
+        }
+        pos = save;
+    }
+
+    if (pos < length && is_char_ci(text[pos], 'A') && at_word_boundary(text, length, pos + 1))
+    {
+        size_t save = pos;
+        size_t p = pos + 1;
+
+        p += assemble_skip_spaces(text + p, length - p);
+        if (p < length && text[p] == ',')
+        {
+            pos = p + 1;
+            pos += assemble_skip_spaces(text + pos, length - pos);
+        }
+        else if (entry->needs_acc)
+        {
+            return assemble_set_error(ASSEMBLE_CPU_Z80, ASSEMBLE_ERROR_TYPE_SYNTAX, ASSEMBLE_Z80_ERR_EXPECT_COMMA,
+                                       "Expected A,");
+        }
+        else
+        {
+            pos = save;
+        }
+    }
+    else if (entry->needs_acc)
+    {
+        return assemble_set_error(ASSEMBLE_CPU_Z80, ASSEMBLE_ERROR_TYPE_BAD_OPERAND, ASSEMBLE_Z80_ERR_EXPECT_REGISTER,
+                                   "Expected A,");
+    }
+
+    matched = try_reg8(context, text, length, &pos, &reg8, &error);
+    if (matched)
+    {
+        uint8_t opcode;
+
+        if (error != NULL)
+        {
+            return error;
+        }
+        error = check_trailing(text, length, pos);
+        if (error != NULL)
+        {
+            return error;
+        }
+        opcode = (uint8_t) (entry->reg_base | reg8.code);
+        error = emit_prefix(context, reg8.prefix);
+        if (error != NULL) { return error; }
+        error = assemble_emit_byte(context, ASSEMBLE_CPU_Z80, opcode);
+        if (error != NULL) { return error; }
+        return emit_reg8_disp(context, &reg8);
+    }
+
+    {
+        int32_t value;
+
+        error = eval_numeric(context, text, length, &pos, &value);
+        if (error != NULL)
+        {
+            return error;
+        }
+        error = check_trailing(text, length, pos);
+        if (error != NULL)
+        {
+            return error;
+        }
+        if (value < -128 || value > 255)
+        {
+            return assemble_set_error(ASSEMBLE_CPU_Z80, ASSEMBLE_ERROR_TYPE_RANGE,
+                                       ASSEMBLE_Z80_ERR_CONST_OVERFLOW_BYTE, "Immediate value out of range");
+        }
+        error = assemble_emit_byte(context, ASSEMBLE_CPU_Z80, entry->imm_opcode);
+        if (error != NULL) { return error; }
+        return assemble_emit_byte(context, ASSEMBLE_CPU_Z80, (uint8_t) (value & 0xFF));
+    }
+}
+
+/* ---- INC / DEC ---------------------------------------------------- */
+
+static _kernel_oserror *assemble_incdec(assemble_context_t *context, const char *mnemonic,
+                                         const uint8_t *text, size_t length)
+{
+    size_t pos = 0;
+    z80_reg8_t reg8;
+    z80_reg16_t reg16;
+    _kernel_oserror *error;
+    int matched;
+    uint8_t base8 = (strcmp(mnemonic, "INC") == 0) ? 0x04 : 0x05;
+    uint8_t base16 = (strcmp(mnemonic, "INC") == 0) ? 0x03 : 0x0B;
+
+    pos += assemble_skip_spaces(text + pos, length - pos);
+
+    matched = try_reg8(context, text, length, &pos, &reg8, &error);
+    if (matched)
+    {
+        if (error != NULL)
+        {
+            return error;
+        }
+        error = check_trailing(text, length, pos);
+        if (error != NULL)
+        {
+            return error;
+        }
+        error = emit_prefix(context, reg8.prefix);
+        if (error != NULL) { return error; }
+        error = assemble_emit_byte(context, ASSEMBLE_CPU_Z80, (uint8_t) (base8 | (reg8.code << 3)));
+        if (error != NULL) { return error; }
+        return emit_reg8_disp(context, &reg8);
+    }
+
+    if (try_reg16(text, length, &pos, &reg16))
+    {
+        error = check_trailing(text, length, pos);
+        if (error != NULL)
+        {
+            return error;
+        }
+        error = emit_prefix(context, reg16.prefix);
+        if (error != NULL) { return error; }
+        return assemble_emit_byte(context, ASSEMBLE_CPU_Z80, (uint8_t) (base16 | (reg16.code << 4)));
+    }
+
+    return assemble_set_error(ASSEMBLE_CPU_Z80, ASSEMBLE_ERROR_TYPE_BAD_OPERAND, ASSEMBLE_Z80_ERR_EXPECT_REGISTER,
+                               "Expected a register");
+}
+
+/* ---- Rotate/shift: RLC, RRC, RL, RR, SLA, SRA, SLL (undoc), SRL -- */
+
+static const struct { const char *mnemonic; uint8_t base; } rotate_table[] = {
+    { "RLC", 0x00 }, { "RRC", 0x08 }, { "RL", 0x10 }, { "RR", 0x18 },
+    { "SLA", 0x20 }, { "SRA", 0x28 }, { "SLL", 0x30 }, { "SRL", 0x38 }
+};
+
+#define NUM_ROTATE (sizeof(rotate_table) / sizeof(rotate_table[0]))
+
+/*******************************************************************
+ Function:      parse_shadow_reg8
+ Description:   Parses the optional undocumented ",r" suffix on a
+                DD CB/FD CB rotate/shift/RES/SET instruction, which
+                also copies the result into a plain register. Only
+                B, C, D, E, H, L or A are valid (not another indexed
+                or half form).
+ Parameters:    text/length = the full operand text
+                pos_inout = current position; advanced past the
+                            suffix if one was present
+                out_code = set to the register's code, or 6 (meaning
+                           "no copy") if there was no ",r" suffix
+ Returns:       NULL if successful, otherwise a static error block
+ ******************************************************************/
+static _kernel_oserror *parse_shadow_reg8(const uint8_t *text, size_t length, size_t *pos_inout, int *out_code)
+{
+    size_t pos = *pos_inout;
+
+    *out_code = 6;
+    pos += assemble_skip_spaces(text + pos, length - pos);
+    if (pos < length && text[pos] == ',')
+    {
+        int code = -1;
+
+        pos += 1;
+        pos += assemble_skip_spaces(text + pos, length - pos);
+        if (pos < length && at_word_boundary(text, length, pos + 1))
+        {
+            switch (toupper((int) text[pos]))
+            {
+                case 'B': code = 0; break;
+                case 'C': code = 1; break;
+                case 'D': code = 2; break;
+                case 'E': code = 3; break;
+                case 'H': code = 4; break;
+                case 'L': code = 5; break;
+                case 'A': code = 7; break;
+                default: break;
+            }
+        }
+        if (code < 0)
+        {
+            return assemble_set_error(ASSEMBLE_CPU_Z80, ASSEMBLE_ERROR_TYPE_BAD_OPERAND,
+                                       ASSEMBLE_Z80_ERR_EXPECT_REGISTER,
+                                       "Expected B, C, D, E, H, L or A");
+        }
+        *out_code = code;
+        pos += 1;
+    }
+    *pos_inout = pos;
+    return NULL;
+}
+
+static _kernel_oserror *assemble_rotate(assemble_context_t *context, const char *mnemonic,
+                                         const uint8_t *text, size_t length)
+{
+    size_t pos = 0;
+    size_t i;
+    uint8_t base = 0;
+    z80_reg8_t reg8;
+    _kernel_oserror *error;
+
+    for (i = 0; i < NUM_ROTATE; i++)
+    {
+        if (strcmp(rotate_table[i].mnemonic, mnemonic) == 0)
+        {
+            base = rotate_table[i].base;
+            break;
+        }
+    }
+
+    pos += assemble_skip_spaces(text + pos, length - pos);
+    if (!try_reg8(context, text, length, &pos, &reg8, &error))
+    {
+        return assemble_set_error(ASSEMBLE_CPU_Z80, ASSEMBLE_ERROR_TYPE_BAD_OPERAND, ASSEMBLE_Z80_ERR_EXPECT_REGISTER,
+                                   "Expected a register");
+    }
+    if (error != NULL)
+    {
+        return error;
+    }
+
+    if (reg8.is_indirect && reg8.prefix != PREFIX_NONE)
+    {
+        int copy_code;
+
+        error = parse_shadow_reg8(text, length, &pos, &copy_code);
+        if (error != NULL)
+        {
+            return error;
+        }
+        error = check_trailing(text, length, pos);
+        if (error != NULL)
+        {
+            return error;
+        }
+        error = emit_prefix(context, reg8.prefix);
+        if (error != NULL) { return error; }
+        error = assemble_emit_byte(context, ASSEMBLE_CPU_Z80, 0xCB);
+        if (error != NULL) { return error; }
+        error = assemble_emit_byte(context, ASSEMBLE_CPU_Z80, (uint8_t) (reg8.disp & 0xFF));
+        if (error != NULL) { return error; }
+        return assemble_emit_byte(context, ASSEMBLE_CPU_Z80, (uint8_t) (base | copy_code));
+    }
+
+    error = check_trailing(text, length, pos);
+    if (error != NULL)
+    {
+        return error;
+    }
+    error = assemble_emit_byte(context, ASSEMBLE_CPU_Z80, 0xCB);
+    if (error != NULL) { return error; }
+    return assemble_emit_byte(context, ASSEMBLE_CPU_Z80, (uint8_t) (base | reg8.code));
+}
+
+/* ---- BIT, RES, SET ------------------------------------------------ */
+
+static _kernel_oserror *assemble_bitop(assemble_context_t *context, const char *mnemonic,
+                                        const uint8_t *text, size_t length)
+{
+    size_t pos = 0;
+    int32_t bit;
+    uint8_t base;
+    z80_reg8_t reg8;
+    _kernel_oserror *error;
+    int allow_shadow = (strcmp(mnemonic, "BIT") != 0);
+
+    if (strcmp(mnemonic, "BIT") == 0) { base = 0x40; }
+    else if (strcmp(mnemonic, "RES") == 0) { base = 0x80; }
+    else { base = 0xC0; }
+
+    pos += assemble_skip_spaces(text + pos, length - pos);
+    error = eval_numeric(context, text, length, &pos, &bit);
+    if (error != NULL)
+    {
+        return error;
+    }
+    if (bit < 0 || bit > 7)
+    {
+        return assemble_set_error(ASSEMBLE_CPU_Z80, ASSEMBLE_ERROR_TYPE_RANGE, ASSEMBLE_Z80_ERR_BAD_BIT_INDEX,
+                                   "Bit index must be 0..7");
+    }
+    error = expect_comma(text, length, &pos);
+    if (error != NULL)
+    {
+        return error;
+    }
+    if (!try_reg8(context, text, length, &pos, &reg8, &error))
+    {
+        return assemble_set_error(ASSEMBLE_CPU_Z80, ASSEMBLE_ERROR_TYPE_BAD_OPERAND, ASSEMBLE_Z80_ERR_EXPECT_REGISTER,
+                                   "Expected a register");
+    }
+    if (error != NULL)
+    {
+        return error;
+    }
+
+    if (reg8.is_indirect && reg8.prefix != PREFIX_NONE)
+    {
+        int copy_code = 6;
+
+        if (allow_shadow)
+        {
+            error = parse_shadow_reg8(text, length, &pos, &copy_code);
+            if (error != NULL)
+            {
+                return error;
+            }
+        }
+        error = check_trailing(text, length, pos);
+        if (error != NULL)
+        {
+            return error;
+        }
+        error = emit_prefix(context, reg8.prefix);
+        if (error != NULL) { return error; }
+        error = assemble_emit_byte(context, ASSEMBLE_CPU_Z80, 0xCB);
+        if (error != NULL) { return error; }
+        error = assemble_emit_byte(context, ASSEMBLE_CPU_Z80, (uint8_t) (reg8.disp & 0xFF));
+        if (error != NULL) { return error; }
+        return assemble_emit_byte(context, ASSEMBLE_CPU_Z80, (uint8_t) (base | (bit << 3) | copy_code));
+    }
+
+    error = check_trailing(text, length, pos);
+    if (error != NULL)
+    {
+        return error;
+    }
+    error = assemble_emit_byte(context, ASSEMBLE_CPU_Z80, 0xCB);
+    if (error != NULL) { return error; }
+    return assemble_emit_byte(context, ASSEMBLE_CPU_Z80, (uint8_t) (base | (bit << 3) | reg8.code));
+}
+
+/* ---- JP, JR, DJNZ, CALL, RET, RST ---------------------------------- */
+
+/* "(HL)"/"(IX)"/"(IY)" -- note this means "jump to the value in the
+   register", not "jump to the value stored at that address"; no
+   displacement is permitted here despite the parentheses. */
+static int try_jp_indirect_reg(const uint8_t *text, size_t length, size_t *pos_inout, int *out_prefix)
+{
+    size_t pos = *pos_inout;
+
+    if (pos < length && text[pos] == '(')
+    {
+        size_t p = pos + 1;
+
+        p += assemble_skip_spaces(text + p, length - p);
+        if (p + 1 < length && is_char_ci(text[p], 'H') && is_char_ci(text[p + 1], 'L'))
+        {
+            size_t p2 = p + 2;
+
+            p2 += assemble_skip_spaces(text + p2, length - p2);
+            if (p2 < length && text[p2] == ')')
+            {
+                *out_prefix = PREFIX_NONE;
+                *pos_inout = p2 + 1;
+                return 1;
+            }
+        }
+        if (p + 1 < length && is_char_ci(text[p], 'I') &&
+            (is_char_ci(text[p + 1], 'X') || is_char_ci(text[p + 1], 'Y')))
+        {
+            int prefix = is_char_ci(text[p + 1], 'X') ? PREFIX_IX : PREFIX_IY;
+            size_t p2 = p + 2;
+
+            p2 += assemble_skip_spaces(text + p2, length - p2);
+            if (p2 < length && text[p2] == ')')
+            {
+                *out_prefix = prefix;
+                *pos_inout = p2 + 1;
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
+static _kernel_oserror *assemble_jp(assemble_context_t *context, const uint8_t *text, size_t length)
+{
+    size_t pos = 0;
+    int prefix;
+    int cond;
+    int32_t target;
+    _kernel_oserror *error;
+
+    pos += assemble_skip_spaces(text + pos, length - pos);
+
+    if (try_jp_indirect_reg(text, length, &pos, &prefix))
+    {
+        error = check_trailing(text, length, pos);
+        if (error != NULL) { return error; }
+        error = emit_prefix(context, prefix);
+        if (error != NULL) { return error; }
+        return assemble_emit_byte(context, ASSEMBLE_CPU_Z80, 0xE9);
+    }
+
+    {
+        size_t save = pos;
+
+        if (try_condition(text, length, &pos, &cond))
+        {
+            size_t p = pos;
+
+            p += assemble_skip_spaces(text + p, length - p);
+            if (p < length && text[p] == ',')
+            {
+                pos = p + 1;
+                pos += assemble_skip_spaces(text + pos, length - pos);
+                error = eval_numeric(context, text, length, &pos, &target);
+                if (error != NULL) { return error; }
+                error = check_trailing(text, length, pos);
+                if (error != NULL) { return error; }
+                error = assemble_emit_byte(context, ASSEMBLE_CPU_Z80, (uint8_t) (0xC2 | (cond << 3)));
+                if (error != NULL) { return error; }
+                return assemble_emit_word(context, ASSEMBLE_CPU_Z80, (uint16_t) (target & 0xFFFF));
+            }
+            pos = save;
+        }
+    }
+
+    error = eval_numeric(context, text, length, &pos, &target);
+    if (error != NULL) { return error; }
+    error = check_trailing(text, length, pos);
+    if (error != NULL) { return error; }
+    error = assemble_emit_byte(context, ASSEMBLE_CPU_Z80, 0xC3);
+    if (error != NULL) { return error; }
+    return assemble_emit_word(context, ASSEMBLE_CPU_Z80, (uint16_t) (target & 0xFFFF));
+}
+
+/*******************************************************************
+ Function:      assemble_relative
+ Description:   Parses and encodes JR (optionally conditional on
+                NZ/Z/NC/C) and DJNZ, computing the signed 8-bit
+                relative offset from the following instruction.
+ Parameters:    context = the assembly context
+                mnemonic = "JR" or "DJNZ"
+                text/length = the operand text following the mnemonic
+ Returns:       NULL if successful, otherwise a static error block
+ ******************************************************************/
+static _kernel_oserror *assemble_relative(assemble_context_t *context, const char *mnemonic,
+                                           const uint8_t *text, size_t length)
+{
+    size_t pos = 0;
+    int cond = -1;
+    int32_t target;
+    int32_t offset;
+    uint8_t opcode;
+    _kernel_oserror *error;
+
+    pos += assemble_skip_spaces(text + pos, length - pos);
+
+    if (strcmp(mnemonic, "JR") == 0)
+    {
+        size_t save = pos;
+
+        if (try_condition(text, length, &pos, &cond))
+        {
+            size_t p = pos;
+
+            p += assemble_skip_spaces(text + p, length - p);
+            if (cond <= 3 && p < length && text[p] == ',')
+            {
+                pos = p + 1;
+                pos += assemble_skip_spaces(text + pos, length - pos);
+            }
+            else
+            {
+                cond = -1;
+                pos = save;
+            }
+        }
+    }
+
+    error = eval_numeric(context, text, length, &pos, &target);
+    if (error != NULL) { return error; }
+    error = check_trailing(text, length, pos);
+    if (error != NULL) { return error; }
+
+    offset = target - ((int32_t) context->address + 2);
+    if (offset < -128 || offset > 127)
+    {
+        return assemble_set_error(ASSEMBLE_CPU_Z80, ASSEMBLE_ERROR_TYPE_RANGE, ASSEMBLE_Z80_ERR_BRANCH_RANGE,
+                                   "Branch target out of range");
+    }
+
+    opcode = (strcmp(mnemonic, "DJNZ") == 0) ? 0x10 : (cond < 0 ? 0x18 : (uint8_t) (0x20 | (cond << 3)));
+    error = assemble_emit_byte(context, ASSEMBLE_CPU_Z80, opcode);
+    if (error != NULL) { return error; }
+    return assemble_emit_byte(context, ASSEMBLE_CPU_Z80, (uint8_t) (offset & 0xFF));
+}
+
+static _kernel_oserror *assemble_call(assemble_context_t *context, const uint8_t *text, size_t length)
+{
+    size_t pos = 0;
+    int cond;
+    int32_t target;
+    _kernel_oserror *error;
+    size_t save;
+
+    pos += assemble_skip_spaces(text + pos, length - pos);
+    save = pos;
+
+    if (try_condition(text, length, &pos, &cond))
+    {
+        size_t p = pos;
+
+        p += assemble_skip_spaces(text + p, length - p);
+        if (p < length && text[p] == ',')
+        {
+            pos = p + 1;
+            pos += assemble_skip_spaces(text + pos, length - pos);
+            error = eval_numeric(context, text, length, &pos, &target);
+            if (error != NULL) { return error; }
+            error = check_trailing(text, length, pos);
+            if (error != NULL) { return error; }
+            error = assemble_emit_byte(context, ASSEMBLE_CPU_Z80, (uint8_t) (0xC4 | (cond << 3)));
+            if (error != NULL) { return error; }
+            return assemble_emit_word(context, ASSEMBLE_CPU_Z80, (uint16_t) (target & 0xFFFF));
+        }
+        pos = save;
+    }
+
+    error = eval_numeric(context, text, length, &pos, &target);
+    if (error != NULL) { return error; }
+    error = check_trailing(text, length, pos);
+    if (error != NULL) { return error; }
+    error = assemble_emit_byte(context, ASSEMBLE_CPU_Z80, 0xCD);
+    if (error != NULL) { return error; }
+    return assemble_emit_word(context, ASSEMBLE_CPU_Z80, (uint16_t) (target & 0xFFFF));
+}
+
+static _kernel_oserror *assemble_ret(assemble_context_t *context, const uint8_t *text, size_t length)
+{
+    size_t pos = 0;
+    int cond;
+    _kernel_oserror *error;
+
+    pos += assemble_skip_spaces(text + pos, length - pos);
+    if (pos >= length)
+    {
+        return assemble_emit_byte(context, ASSEMBLE_CPU_Z80, 0xC9);
+    }
+    if (!try_condition(text, length, &pos, &cond))
+    {
+        return assemble_set_error(ASSEMBLE_CPU_Z80, ASSEMBLE_ERROR_TYPE_BAD_OPERAND,
+                                   ASSEMBLE_Z80_ERR_EXPECT_CONDITION, "Expected a condition");
+    }
+    error = check_trailing(text, length, pos);
+    if (error != NULL) { return error; }
+    return assemble_emit_byte(context, ASSEMBLE_CPU_Z80, (uint8_t) (0xC0 | (cond << 3)));
+}
+
+static _kernel_oserror *assemble_rst(assemble_context_t *context, const uint8_t *text, size_t length)
+{
+    size_t pos = 0;
+    int32_t value;
+    _kernel_oserror *error;
+
+    pos += assemble_skip_spaces(text + pos, length - pos);
+    error = eval_numeric(context, text, length, &pos, &value);
+    if (error != NULL) { return error; }
+    error = check_trailing(text, length, pos);
+    if (error != NULL) { return error; }
+    if (value < 0 || value > 56 || (value % 8) != 0)
+    {
+        return assemble_set_error(ASSEMBLE_CPU_Z80, ASSEMBLE_ERROR_TYPE_RANGE, ASSEMBLE_Z80_ERR_BAD_RST,
+                                   "RST operand must be 0, 8, 16, ..., 56");
+    }
+    return assemble_emit_byte(context, ASSEMBLE_CPU_Z80, (uint8_t) (0xC7 | value));
+}
+
+/* ---- PUSH, POP ----------------------------------------------------- */
+
+static _kernel_oserror *assemble_pushpop(assemble_context_t *context, const char *mnemonic,
+                                          const uint8_t *text, size_t length)
+{
+    size_t pos = 0;
+    z80_reg16_t reg16;
+    _kernel_oserror *error;
+    uint8_t base = (strcmp(mnemonic, "PUSH") == 0) ? 0xC5 : 0xC1;
+
+    pos += assemble_skip_spaces(text + pos, length - pos);
+    if (!try_reg16_stack(text, length, &pos, &reg16))
+    {
+        return assemble_set_error(ASSEMBLE_CPU_Z80, ASSEMBLE_ERROR_TYPE_BAD_OPERAND, ASSEMBLE_Z80_ERR_EXPECT_REGISTER,
+                                   "Expected BC, DE, HL/IX/IY or AF");
+    }
+    error = check_trailing(text, length, pos);
+    if (error != NULL) { return error; }
+    error = emit_prefix(context, reg16.prefix);
+    if (error != NULL) { return error; }
+    return assemble_emit_byte(context, ASSEMBLE_CPU_Z80, (uint8_t) (base | (reg16.code << 4)));
+}
+
+/* ---- EX -------------------------------------------------------------- */
+
+static _kernel_oserror *assemble_ex(assemble_context_t *context, const uint8_t *text, size_t length)
+{
+    size_t pos = 0;
+
+    pos += assemble_skip_spaces(text + pos, length - pos);
+
+    if (pos + 1 < length && is_char_ci(text[pos], 'A') && is_char_ci(text[pos + 1], 'F'))
+    {
+        size_t p = pos + 2;
+
+        p += assemble_skip_spaces(text + p, length - p);
+        if (p < length && text[p] == ',')
+        {
+            p += 1;
+            p += assemble_skip_spaces(text + p, length - p);
+            if (p + 2 < length && is_char_ci(text[p], 'A') && is_char_ci(text[p + 1], 'F') && text[p + 2] == '\'')
+            {
+                _kernel_oserror *error = check_trailing(text, length, p + 3);
+
+                if (error != NULL) { return error; }
+                return assemble_emit_byte(context, ASSEMBLE_CPU_Z80, 0x08);
+            }
+        }
+        return error_bad_addressing();
+    }
+
+    if (pos + 1 < length && is_char_ci(text[pos], 'D') && is_char_ci(text[pos + 1], 'E'))
+    {
+        size_t p = pos + 2;
+
+        p += assemble_skip_spaces(text + p, length - p);
+        if (p < length && text[p] == ',')
+        {
+            p += 1;
+            p += assemble_skip_spaces(text + p, length - p);
+            if (p + 1 < length && is_char_ci(text[p], 'H') && is_char_ci(text[p + 1], 'L'))
+            {
+                _kernel_oserror *error = check_trailing(text, length, p + 2);
+
+                if (error != NULL) { return error; }
+                return assemble_emit_byte(context, ASSEMBLE_CPU_Z80, 0xEB);
+            }
+        }
+        return error_bad_addressing();
+    }
+
+    if (pos < length && text[pos] == '(')
+    {
+        size_t p = pos + 1;
+
+        p += assemble_skip_spaces(text + p, length - p);
+        if (p + 1 < length && is_char_ci(text[p], 'S') && is_char_ci(text[p + 1], 'P'))
+        {
+            size_t p2 = p + 2;
+            _kernel_oserror *error;
+
+            p2 += assemble_skip_spaces(text + p2, length - p2);
+            if (p2 < length && text[p2] == ')')
+            {
+                z80_reg16_t reg16;
+
+                p2 += 1;
+                p2 += assemble_skip_spaces(text + p2, length - p2);
+                if (p2 < length && text[p2] == ',')
+                {
+                    p2 += 1;
+                    p2 += assemble_skip_spaces(text + p2, length - p2);
+                    if (try_reg16(text, length, &p2, &reg16) && reg16.code == 2)
+                    {
+                        error = check_trailing(text, length, p2);
+                        if (error != NULL) { return error; }
+                        error = emit_prefix(context, reg16.prefix);
+                        if (error != NULL) { return error; }
+                        return assemble_emit_byte(context, ASSEMBLE_CPU_Z80, 0xE3);
+                    }
+                }
+            }
+        }
+    }
+
+    return error_bad_addressing();
+}
+
+/* ---- IN, OUT --------------------------------------------------------- */
+
+static _kernel_oserror *assemble_in(assemble_context_t *context, const uint8_t *text, size_t length)
+{
+    size_t pos = 0;
+    z80_reg8_t reg8;
+    _kernel_oserror *error;
+    int matched;
+    int dest_code = -1; /* -1 selects the undocumented "IN (C)"/"IN F,(C)" flags-only form */
+
+    pos += assemble_skip_spaces(text + pos, length - pos);
+
+    matched = try_reg8(context, text, length, &pos, &reg8, &error);
+    if (matched && error != NULL)
+    {
+        return error;
+    }
+    if (matched && !reg8.is_indirect && !reg8.is_half)
+    {
+        dest_code = reg8.code;
+    }
+    else if (!matched && pos < length && is_char_ci(text[pos], 'F') && at_word_boundary(text, length, pos + 1))
+    {
+        pos += 1;
+    }
+    else
+    {
+        pos = 0;
+        pos += assemble_skip_spaces(text + pos, length - pos);
+    }
+
+    pos += assemble_skip_spaces(text + pos, length - pos);
+
+    if (dest_code == 7 && pos < length && text[pos] == ',')
+    {
+        size_t p = pos + 1;
+
+        p += assemble_skip_spaces(text + p, length - p);
+        if (p < length && text[p] == '(')
+        {
+            size_t p2 = p + 1;
+
+            p2 += assemble_skip_spaces(text + p2, length - p2);
+            if (!(p2 < length && is_char_ci(text[p2], 'C') && at_word_boundary(text, length, p2 + 1)))
+            {
+                int32_t port;
+
+                error = eval_numeric(context, text, length, &p2, &port);
+                if (error != NULL) { return error; }
+                p2 += assemble_skip_spaces(text + p2, length - p2);
+                if (!(p2 < length && text[p2] == ')'))
+                {
+                    return assemble_set_error(ASSEMBLE_CPU_Z80, ASSEMBLE_ERROR_TYPE_SYNTAX,
+                                               ASSEMBLE_Z80_ERR_EXPECT_RPAREN, "Expected )");
+                }
+                error = check_trailing(text, length, p2 + 1);
+                if (error != NULL) { return error; }
+                if (port < 0 || port > 255)
+                {
+                    return assemble_set_error(ASSEMBLE_CPU_Z80, ASSEMBLE_ERROR_TYPE_RANGE,
+                                               ASSEMBLE_Z80_ERR_CONST_OVERFLOW_BYTE, "Port value out of range");
+                }
+                error = assemble_emit_byte(context, ASSEMBLE_CPU_Z80, 0xDB);
+                if (error != NULL) { return error; }
+                return assemble_emit_byte(context, ASSEMBLE_CPU_Z80, (uint8_t) (port & 0xFF));
+            }
+        }
+    }
+
+    if (pos < length && text[pos] == ',')
+    {
+        pos += 1;
+    }
+    pos += assemble_skip_spaces(text + pos, length - pos);
+    if (!(pos < length && text[pos] == '('))
+    {
+        return error_bad_addressing();
+    }
+    pos += 1;
+    pos += assemble_skip_spaces(text + pos, length - pos);
+    if (!(pos < length && is_char_ci(text[pos], 'C') && at_word_boundary(text, length, pos + 1)))
+    {
+        return assemble_set_error(ASSEMBLE_CPU_Z80, ASSEMBLE_ERROR_TYPE_BAD_OPERAND, ASSEMBLE_Z80_ERR_EXPECT_REGISTER,
+                                   "Expected (C)");
+    }
+    pos += 1;
+    pos += assemble_skip_spaces(text + pos, length - pos);
+    if (!(pos < length && text[pos] == ')'))
+    {
+        return assemble_set_error(ASSEMBLE_CPU_Z80, ASSEMBLE_ERROR_TYPE_SYNTAX, ASSEMBLE_Z80_ERR_EXPECT_RPAREN,
+                                   "Expected )");
+    }
+    error = check_trailing(text, length, pos + 1);
+    if (error != NULL) { return error; }
+    error = assemble_emit_byte(context, ASSEMBLE_CPU_Z80, 0xED);
+    if (error != NULL) { return error; }
+    return assemble_emit_byte(context, ASSEMBLE_CPU_Z80,
+                               (uint8_t) (0x40 | ((dest_code < 0 ? 6 : dest_code) << 3)));
+}
+
+static _kernel_oserror *assemble_out(assemble_context_t *context, const uint8_t *text, size_t length)
+{
+    size_t pos = 0;
+    _kernel_oserror *error;
+
+    pos += assemble_skip_spaces(text + pos, length - pos);
+    if (!(pos < length && text[pos] == '('))
+    {
+        return error_bad_addressing();
+    }
+    pos += 1;
+    pos += assemble_skip_spaces(text + pos, length - pos);
+
+    if (pos < length && is_char_ci(text[pos], 'C') && at_word_boundary(text, length, pos + 1))
+    {
+        z80_reg8_t reg8;
+        int matched;
+        size_t p = pos + 1;
+
+        p += assemble_skip_spaces(text + p, length - p);
+        if (p < length && text[p] == ')')
+        {
+            p += 1;
+            error = expect_comma(text, length, &p);
+            if (error != NULL) { return error; }
+            if (p < length && text[p] == '0' && at_word_boundary(text, length, p + 1))
+            {
+                error = check_trailing(text, length, p + 1);
+                if (error != NULL) { return error; }
+                error = assemble_emit_byte(context, ASSEMBLE_CPU_Z80, 0xED);
+                if (error != NULL) { return error; }
+                return assemble_emit_byte(context, ASSEMBLE_CPU_Z80, 0x71);
+            }
+            matched = try_reg8(context, text, length, &p, &reg8, &error);
+            if (matched && error != NULL) { return error; }
+            if (matched && !reg8.is_indirect && !reg8.is_half)
+            {
+                error = check_trailing(text, length, p);
+                if (error != NULL) { return error; }
+                error = assemble_emit_byte(context, ASSEMBLE_CPU_Z80, 0xED);
+                if (error != NULL) { return error; }
+                return assemble_emit_byte(context, ASSEMBLE_CPU_Z80, (uint8_t) (0x41 | (reg8.code << 3)));
+            }
+        }
+    }
+
+    {
+        int32_t port;
+        z80_reg8_t reg8;
+
+        error = eval_numeric(context, text, length, &pos, &port);
+        if (error != NULL) { return error; }
+        pos += assemble_skip_spaces(text + pos, length - pos);
+        if (!(pos < length && text[pos] == ')'))
+        {
+            return assemble_set_error(ASSEMBLE_CPU_Z80, ASSEMBLE_ERROR_TYPE_SYNTAX, ASSEMBLE_Z80_ERR_EXPECT_RPAREN,
+                                       "Expected )");
+        }
+        pos += 1;
+        error = expect_comma(text, length, &pos);
+        if (error != NULL) { return error; }
+        if (!try_reg8(context, text, length, &pos, &reg8, &error) || reg8.is_indirect || reg8.is_half ||
+            reg8.code != 7)
+        {
+            if (error != NULL) { return error; }
+            return assemble_set_error(ASSEMBLE_CPU_Z80, ASSEMBLE_ERROR_TYPE_BAD_OPERAND,
+                                       ASSEMBLE_Z80_ERR_EXPECT_REGISTER, "Expected A");
+        }
+        error = check_trailing(text, length, pos);
+        if (error != NULL) { return error; }
+        if (port < 0 || port > 255)
+        {
+            return assemble_set_error(ASSEMBLE_CPU_Z80, ASSEMBLE_ERROR_TYPE_RANGE,
+                                       ASSEMBLE_Z80_ERR_CONST_OVERFLOW_BYTE, "Port value out of range");
+        }
+        error = assemble_emit_byte(context, ASSEMBLE_CPU_Z80, 0xD3);
+        if (error != NULL) { return error; }
+        return assemble_emit_byte(context, ASSEMBLE_CPU_Z80, (uint8_t) (port & 0xFF));
+    }
+}
+
+/* ---- IM ---------------------------------------------------------------- */
+
+static _kernel_oserror *assemble_im(assemble_context_t *context, const uint8_t *text, size_t length)
+{
+    size_t pos = 0;
+    int32_t value;
+    _kernel_oserror *error;
+
+    pos += assemble_skip_spaces(text + pos, length - pos);
+    error = eval_numeric(context, text, length, &pos, &value);
+    if (error != NULL) { return error; }
+    error = check_trailing(text, length, pos);
+    if (error != NULL) { return error; }
+    if (value < 0 || value > 2)
+    {
+        return assemble_set_error(ASSEMBLE_CPU_Z80, ASSEMBLE_ERROR_TYPE_RANGE, ASSEMBLE_Z80_ERR_BAD_IM,
+                                   "IM operand must be 0, 1 or 2");
+    }
+    error = assemble_emit_byte(context, ASSEMBLE_CPU_Z80, 0xED);
+    if (error != NULL) { return error; }
+    return assemble_emit_byte(context, ASSEMBLE_CPU_Z80,
+                               (uint8_t) (value == 0 ? 0x46 : (value == 1 ? 0x56 : 0x5E)));
+}
+
+/* ---- Implied (no-operand) mnemonics ------------------------------------ */
+
+typedef struct implied_entry
+{
+    const char *mnemonic;
+    uint16_t    opcode; /* > 0xFF: high byte 0xED prefix, low byte the opcode */
+} implied_entry_t;
+
+static const implied_entry_t implied_table[] = {
+    { "NOP",  0x00 }, { "RLCA", 0x07 }, { "RRCA", 0x0F }, { "RLA", 0x17 }, { "RRA", 0x1F },
+    { "DAA",  0x27 }, { "CPL",  0x2F }, { "SCF",  0x37 }, { "CCF", 0x3F }, { "HALT", 0x76 },
+    { "EXX",  0xD9 }, { "DI",   0xF3 }, { "EI",   0xFB },
+    { "NEG",  0xED44 }, { "RETN", 0xED45 }, { "RETI", 0xED4D },
+    { "RRD",  0xED67 }, { "RLD",  0xED6F },
+    { "LDI",  0xEDA0 }, { "CPI",  0xEDA1 }, { "INI",  0xEDA2 }, { "OUTI", 0xEDA3 },
+    { "LDD",  0xEDA8 }, { "CPD",  0xEDA9 }, { "IND",  0xEDAA }, { "OUTD", 0xEDAB },
+    { "LDIR", 0xEDB0 }, { "CPIR", 0xEDB1 }, { "INIR", 0xEDB2 }, { "OTIR", 0xEDB3 },
+    { "LDDR", 0xEDB8 }, { "CPDR", 0xEDB9 }, { "INDR", 0xEDBA }, { "OTDR", 0xEDBB }
+};
+
+#define NUM_IMPLIED (sizeof(implied_table) / sizeof(implied_table[0]))
+
+static const implied_entry_t *find_implied(const char *mnemonic)
+{
+    size_t i;
+
+    for (i = 0; i < NUM_IMPLIED; i++)
+    {
+        if (strcmp(implied_table[i].mnemonic, mnemonic) == 0)
+        {
+            return &implied_table[i];
+        }
+    }
+    return NULL;
+}
+
+/* ---- DEFB, DEFW, DEFM ---------------------------------------------- */
+
+/* Matching the original ASMB.Z80 exactly: each of DEFB/DEFW takes a
+   single expression, not a comma-separated list (unlike 6502/6809's
+   DCB/DCW/DCD) -- repeat the pseudo-op, separated by ':', for more
+   than one value. */
+static _kernel_oserror *assemble_defb(assemble_context_t *context, const uint8_t *text, size_t length)
+{
+    size_t pos = 0;
+    int32_t value;
+    _kernel_oserror *error;
+
+    pos += assemble_skip_spaces(text + pos, length - pos);
+    error = eval_numeric(context, text, length, &pos, &value);
+    if (error != NULL) { return error; }
+    error = check_trailing(text, length, pos);
+    if (error != NULL) { return error; }
+    return assemble_emit_byte(context, ASSEMBLE_CPU_Z80, (uint8_t) (value & 0xFF));
+}
+
+static _kernel_oserror *assemble_defw(assemble_context_t *context, const uint8_t *text, size_t length)
+{
+    size_t pos = 0;
+    int32_t value;
+    _kernel_oserror *error;
+
+    pos += assemble_skip_spaces(text + pos, length - pos);
+    error = eval_numeric(context, text, length, &pos, &value);
+    if (error != NULL) { return error; }
+    error = check_trailing(text, length, pos);
+    if (error != NULL) { return error; }
+    return assemble_emit_word(context, ASSEMBLE_CPU_Z80, (uint16_t) (value & 0xFFFF));
+}
+
+static _kernel_oserror *assemble_defm(assemble_context_t *context, const uint8_t *text, size_t length)
+{
+    assemble_value_t value;
+    size_t consumed;
+    size_t i;
+    _kernel_oserror *error = NULL;
+
+    if (context->resolve_expr(context->user_data, text, length, &value, &consumed, &error) != ASSEMBLE_RESULT_OK)
+    {
+        if (error != NULL) { return error; }
+        return assemble_set_error(ASSEMBLE_CPU_Z80, ASSEMBLE_ERROR_TYPE_EXPRESSION, ASSEMBLE_Z80_ERR_NONE,
+                                   "Expression could not be evaluated");
+    }
+    if (value.type != ASSEMBLE_VALUE_STRING)
+    {
+        return assemble_set_error(ASSEMBLE_CPU_Z80, ASSEMBLE_ERROR_TYPE_EXPRESSION, ASSEMBLE_Z80_ERR_NONE,
+                                   "Expected a string value");
+    }
+    error = check_trailing(text, length, consumed);
+    if (error != NULL) { return error; }
+
+    for (i = 0; i < value.value.as_string.length; i++)
+    {
+        error = assemble_emit_byte(context, ASSEMBLE_CPU_Z80, (uint8_t) value.value.as_string.text[i]);
+        if (error != NULL) { return error; }
+    }
+    return NULL;
+}
+
+/* ---- Mnemonic reading and top-level dispatch ------------------------ */
+
+static size_t read_mnemonic(const uint8_t *text, size_t length, char *out)
+{
+    size_t pos = 0;
+    size_t count = 0;
+
+    if (length == 0)
+    {
+        out[0] = '\0';
+        return 0;
+    }
+
+    if (text[0] == TOKEN_AND)
+    {
+        out[count++] = 'A'; out[count++] = 'N'; out[count++] = 'D';
+        pos = 1;
+    }
+    else if (text[0] == TOKEN_OR)
+    {
+        out[count++] = 'O'; out[count++] = 'R';
+        pos = 1;
+    }
+    else if (text[0] == TOKEN_CALL)
+    {
+        out[count++] = 'C'; out[count++] = 'A'; out[count++] = 'L'; out[count++] = 'L';
+        out[count] = '\0';
+        return 1;
+    }
+    else if (text[0] == TOKEN_DEF)
+    {
+        out[count++] = 'D'; out[count++] = 'E'; out[count++] = 'F';
+        pos = 1;
+    }
+
+    while (pos < length && count < 7 &&
+           ((text[pos] >= 'A' && text[pos] <= 'Z') || (text[pos] >= 'a' && text[pos] <= 'z')))
+    {
+        out[count] = (char) toupper((int) text[pos]);
+        count += 1;
+        pos += 1;
+    }
+
+    out[count] = '\0';
+    return pos;
+}
+
+static _kernel_oserror *assign_label(assemble_context_t *context,
+                                      const char *label, size_t label_length,
+                                      const assemble_value_t *value)
+{
+    _kernel_oserror *error = NULL;
+
+    if (context->assign_var(context->user_data, label, label_length, value, &error) != ASSEMBLE_RESULT_OK)
+    {
+        if (error != NULL)
+        {
+            return error;
+        }
+        return assemble_set_error(ASSEMBLE_CPU_Z80, ASSEMBLE_ERROR_TYPE_BAD_LABEL, ASSEMBLE_Z80_ERR_NONE,
+                                   "Label could not be assigned");
+    }
+    return NULL;
+}
+
+/*******************************************************************
+ Function:      assemble_instruction
+ Description:   Dispatches a recognised mnemonic to the appropriate
+                family-specific parser/encoder.
+ Parameters:    context = the assembly context
+                mnemonic = the mnemonic as read from the source line
+                text/length = the operand text following the mnemonic
+                out_recognised = set to 0 if 'mnemonic' is not a known
+                                 Z80 mnemonic at all (so the caller can
+                                 raise ASSEMBLE_ERROR_TYPE_BAD_MNEMONIC)
+ Returns:       NULL if successful, otherwise a static error block
+ ******************************************************************/
+static _kernel_oserror *assemble_instruction(assemble_context_t *context, const char *mnemonic,
+                                              const uint8_t *text, size_t length, int *out_recognised)
+{
+    const implied_entry_t *implied;
+    size_t i;
+
+    *out_recognised = 1;
+
+    if (strcmp(mnemonic, "LD") == 0)   { return assemble_ld(context, text, length); }
+    if (strcmp(mnemonic, "INC") == 0 || strcmp(mnemonic, "DEC") == 0)
+                                        { return assemble_incdec(context, mnemonic, text, length); }
+    if (strcmp(mnemonic, "BIT") == 0 || strcmp(mnemonic, "RES") == 0 || strcmp(mnemonic, "SET") == 0)
+                                        { return assemble_bitop(context, mnemonic, text, length); }
+    if (strcmp(mnemonic, "JP") == 0)   { return assemble_jp(context, text, length); }
+    if (strcmp(mnemonic, "JR") == 0 || strcmp(mnemonic, "DJNZ") == 0)
+                                        { return assemble_relative(context, mnemonic, text, length); }
+    if (strcmp(mnemonic, "CALL") == 0) { return assemble_call(context, text, length); }
+    if (strcmp(mnemonic, "RET") == 0)  { return assemble_ret(context, text, length); }
+    if (strcmp(mnemonic, "RST") == 0)  { return assemble_rst(context, text, length); }
+    if (strcmp(mnemonic, "PUSH") == 0 || strcmp(mnemonic, "POP") == 0)
+                                        { return assemble_pushpop(context, mnemonic, text, length); }
+    if (strcmp(mnemonic, "EX") == 0)   { return assemble_ex(context, text, length); }
+    if (strcmp(mnemonic, "IN") == 0)   { return assemble_in(context, text, length); }
+    if (strcmp(mnemonic, "OUT") == 0)  { return assemble_out(context, text, length); }
+    if (strcmp(mnemonic, "IM") == 0)   { return assemble_im(context, text, length); }
+
+    for (i = 0; i < NUM_ALU; i++)
+    {
+        if (strcmp(alu_table[i].mnemonic, mnemonic) == 0)
+        {
+            return assemble_alu(context, mnemonic, text, length);
+        }
+    }
+    for (i = 0; i < NUM_ROTATE; i++)
+    {
+        if (strcmp(rotate_table[i].mnemonic, mnemonic) == 0)
+        {
+            return assemble_rotate(context, mnemonic, text, length);
+        }
+    }
+
+    implied = find_implied(mnemonic);
+    if (implied != NULL)
+    {
+        _kernel_oserror *error = check_trailing(text, length, 0);
+
+        if (error != NULL) { return error; }
+        if (implied->opcode > 0xFF)
+        {
+            error = assemble_emit_byte(context, ASSEMBLE_CPU_Z80, (uint8_t) (implied->opcode >> 8));
+            if (error != NULL) { return error; }
+        }
+        return assemble_emit_byte(context, ASSEMBLE_CPU_Z80, (uint8_t) (implied->opcode & 0xFF));
+    }
+
+    *out_recognised = 0;
+    return NULL;
+}
+
+_kernel_oserror *assemble_z80_line(assemble_context_t *context,
+                                    const uint8_t *line, size_t line_length)
+{
+    size_t pos;
+    char label[64];
+    size_t label_length = 0;
+    int have_label = 0;
+    char mnemonic[8];
+    size_t consumed;
+    int recognised;
+    _kernel_oserror *error;
+
+    context->bytes_used = 0;
+    pos = 0;
+
+    pos += assemble_skip_spaces(line + pos, line_length - pos);
+
+    if (pos < line_length && line[pos] == '.')
+    {
+        size_t start;
+
+        pos += 1;
+        start = pos;
+        if (!(pos < line_length && assemble_is_ident_start(line[pos])))
+        {
+            return assemble_set_error(ASSEMBLE_CPU_Z80, ASSEMBLE_ERROR_TYPE_BAD_LABEL, ASSEMBLE_Z80_ERR_NONE,
+                                       "Expected a label name after '.'");
+        }
+        while (pos < line_length && assemble_is_ident_char(line[pos]))
+        {
+            pos += 1;
+        }
+        label_length = pos - start;
+        if (label_length >= sizeof(label))
+        {
+            label_length = sizeof(label) - 1;
+        }
+        memcpy(label, line + start, label_length);
+        label[label_length] = '\0';
+        have_label = 1;
+
+        pos += assemble_skip_spaces(line + pos, line_length - pos);
+    }
+
+    if (pos >= line_length)
+    {
+        if (have_label)
+        {
+            assemble_value_t value;
+
+            value.type = ASSEMBLE_VALUE_INTEGER;
+            value.value.as_integer = (int32_t) context->address;
+            return assign_label(context, label, label_length, &value);
+        }
+        return NULL;
+    }
+
+    consumed = read_mnemonic(line + pos, line_length - pos, mnemonic);
+    if (consumed == 0 || mnemonic[0] == '\0')
+    {
+        return assemble_set_error(ASSEMBLE_CPU_Z80, ASSEMBLE_ERROR_TYPE_BAD_MNEMONIC, ASSEMBLE_Z80_ERR_NONE,
+                                   "Mnemonic not recognised");
+    }
+    pos += consumed;
+    pos += assemble_skip_spaces(line + pos, line_length - pos);
+
+    if (have_label)
+    {
+        assemble_value_t value;
+
+        value.type = ASSEMBLE_VALUE_INTEGER;
+        value.value.as_integer = (int32_t) context->address;
+        error = assign_label(context, label, label_length, &value);
+        if (error != NULL)
+        {
+            return error;
+        }
+    }
+
+    if (strcmp(mnemonic, "OPT") == 0)
+    {
+        if (pos < line_length)
+        {
+            assemble_value_t value;
+
+            error = eval_expr(context, line + pos, line_length - pos, &value, &consumed);
+            if (error != NULL)
+            {
+                return error;
+            }
+            pos += consumed;
+        }
+        return check_trailing(line, line_length, pos);
+    }
+
+    if (strcmp(mnemonic, "DEFB") == 0) { return assemble_defb(context, line + pos, line_length - pos); }
+    if (strcmp(mnemonic, "DEFW") == 0) { return assemble_defw(context, line + pos, line_length - pos); }
+    if (strcmp(mnemonic, "DEFM") == 0) { return assemble_defm(context, line + pos, line_length - pos); }
+
+    error = assemble_instruction(context, mnemonic, line + pos, line_length - pos, &recognised);
+    if (!recognised)
+    {
+        return assemble_set_error(ASSEMBLE_CPU_Z80, ASSEMBLE_ERROR_TYPE_BAD_MNEMONIC, ASSEMBLE_Z80_ERR_NONE,
+                                   "Mnemonic not recognised");
+    }
+    return error;
+}

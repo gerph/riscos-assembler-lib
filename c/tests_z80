@@ -1,0 +1,737 @@
+/*******************************************************************
+ * File:        tests_z80
+ * Purpose:     Self-tests for the assemble_z80 library. Provides a
+ *              minimal stand-in for BASIC's expression evaluator and
+ *              variable table so lines can be assembled and checked
+ *              against expected byte sequences.
+ * Author:      Charles Ferguson (Gerph)
+ ******************************************************************/
+
+#include <stdio.h>
+#include <string.h>
+#include <ctype.h>
+
+#include "tests.h"
+#include "assemble_z80.h"
+
+#define MAX_SYMBOLS 32
+#define MAX_OUTPUT  64
+
+typedef struct symbol
+{
+    char             name[32];
+    assemble_value_t value;
+} symbol_t;
+
+typedef struct test_state
+{
+    symbol_t symbols[MAX_SYMBOLS];
+    size_t   symbol_count;
+} test_state_t;
+
+static _kernel_oserror test_error_block;
+
+static _kernel_oserror *test_error(const char *message)
+{
+    test_error_block.errnum = 0;
+    strncpy(test_error_block.errmess, message, sizeof(test_error_block.errmess) - 1);
+    test_error_block.errmess[sizeof(test_error_block.errmess) - 1] = '\0';
+    return &test_error_block;
+}
+
+static int hex_digit_value(uint8_t ch)
+{
+    if (ch >= '0' && ch <= '9')
+    {
+        return ch - '0';
+    }
+    return toupper((int) ch) - 'A' + 10;
+}
+
+static assemble_result_t test_parse_primary(test_state_t *state, const uint8_t *text, size_t length,
+                                             size_t *pos_inout, int32_t *out_value, _kernel_oserror **error)
+{
+    size_t pos = *pos_inout;
+
+    while (pos < length && text[pos] == ' ')
+    {
+        pos += 1;
+    }
+
+    if (pos < length && text[pos] == '&')
+    {
+        int32_t v = 0;
+
+        pos += 1;
+        while (pos < length && isxdigit((int) text[pos]))
+        {
+            v = v * 16 + hex_digit_value(text[pos]);
+            pos += 1;
+        }
+        *out_value = v;
+        *pos_inout = pos;
+        return ASSEMBLE_RESULT_OK;
+    }
+
+    if (pos < length && text[pos] >= '0' && text[pos] <= '9')
+    {
+        int32_t v = 0;
+
+        while (pos < length && text[pos] >= '0' && text[pos] <= '9')
+        {
+            v = v * 10 + (text[pos] - '0');
+            pos += 1;
+        }
+        *out_value = v;
+        *pos_inout = pos;
+        return ASSEMBLE_RESULT_OK;
+    }
+
+    if (pos < length && (isalpha((int) text[pos]) || text[pos] == '_' || text[pos] == '`'))
+    {
+        size_t start = pos;
+        size_t namelen;
+        char name[32];
+        size_t i;
+
+        while (pos < length &&
+               (isalnum((int) text[pos]) || text[pos] == '_' || text[pos] == '`' ||
+                text[pos] == '%' || text[pos] == '$'))
+        {
+            pos += 1;
+        }
+        namelen = pos - start;
+        if (namelen >= sizeof(name))
+        {
+            namelen = sizeof(name) - 1;
+        }
+        memcpy(name, text + start, namelen);
+        name[namelen] = '\0';
+
+        for (i = 0; i < state->symbol_count; i++)
+        {
+            if (strcmp(state->symbols[i].name, name) == 0)
+            {
+                *out_value = state->symbols[i].value.value.as_integer;
+                *pos_inout = pos;
+                return ASSEMBLE_RESULT_OK;
+            }
+        }
+        *error = test_error("Undefined test symbol");
+        return ASSEMBLE_RESULT_ERROR;
+    }
+
+    *error = test_error("Expected a value");
+    return ASSEMBLE_RESULT_ERROR;
+}
+
+static assemble_result_t test_resolve_expr(void *user_data, const uint8_t *text, size_t length,
+                                            assemble_value_t *value, size_t *consumed, _kernel_oserror **error)
+{
+    test_state_t *state = (test_state_t *) user_data;
+    size_t pos = 0;
+    int32_t result;
+    int negate = 0;
+
+    while (pos < length && text[pos] == ' ')
+    {
+        pos += 1;
+    }
+
+    if (pos < length && text[pos] == '"')
+    {
+        size_t start;
+
+        pos += 1;
+        start = pos;
+        while (pos < length && text[pos] != '"')
+        {
+            pos += 1;
+        }
+        value->type = ASSEMBLE_VALUE_STRING;
+        value->value.as_string.text = (const char *) (text + start);
+        value->value.as_string.length = pos - start;
+        if (pos < length)
+        {
+            pos += 1;
+        }
+        *consumed = pos;
+        return ASSEMBLE_RESULT_OK;
+    }
+
+    if (pos < length && text[pos] == '-')
+    {
+        negate = 1;
+        pos += 1;
+    }
+
+    if (test_parse_primary(state, text, length, &pos, &result, error) != ASSEMBLE_RESULT_OK)
+    {
+        return ASSEMBLE_RESULT_ERROR;
+    }
+    if (negate)
+    {
+        result = -result;
+    }
+
+    for (;;)
+    {
+        size_t save = pos;
+        int op;
+        int32_t rhs;
+
+        while (pos < length && text[pos] == ' ')
+        {
+            pos += 1;
+        }
+        if (!(pos < length && (text[pos] == '+' || text[pos] == '-')))
+        {
+            pos = save;
+            break;
+        }
+        op = text[pos];
+        pos += 1;
+        while (pos < length && text[pos] == ' ')
+        {
+            pos += 1;
+        }
+        if (test_parse_primary(state, text, length, &pos, &rhs, error) != ASSEMBLE_RESULT_OK)
+        {
+            return ASSEMBLE_RESULT_ERROR;
+        }
+        result = (op == '+') ? (result + rhs) : (result - rhs);
+    }
+
+    value->type = ASSEMBLE_VALUE_INTEGER;
+    value->value.as_integer = result;
+    *consumed = pos;
+    return ASSEMBLE_RESULT_OK;
+}
+
+static assemble_result_t test_assign_var(void *user_data, const char *name, size_t name_length,
+                                          const assemble_value_t *value, _kernel_oserror **error)
+{
+    test_state_t *state = (test_state_t *) user_data;
+    char namebuf[32];
+    size_t len = name_length;
+    size_t i;
+
+    if (len >= sizeof(namebuf))
+    {
+        len = sizeof(namebuf) - 1;
+    }
+    memcpy(namebuf, name, len);
+    namebuf[len] = '\0';
+
+    for (i = 0; i < state->symbol_count; i++)
+    {
+        if (strcmp(state->symbols[i].name, namebuf) == 0)
+        {
+            state->symbols[i].value = *value;
+            return ASSEMBLE_RESULT_OK;
+        }
+    }
+    if (state->symbol_count >= MAX_SYMBOLS)
+    {
+        *error = test_error("Test symbol table is full");
+        return ASSEMBLE_RESULT_ERROR;
+    }
+    strcpy(state->symbols[state->symbol_count].name, namebuf);
+    state->symbols[state->symbol_count].value = *value;
+    state->symbol_count += 1;
+    return ASSEMBLE_RESULT_OK;
+}
+
+typedef struct test_case
+{
+    const char        *description;
+    const char *const *lines;      /* NULL-terminated */
+    const uint8_t      *expected;  /* concatenated bytes across all lines */
+    size_t              expected_length;
+    int                 expect_error;
+} test_case_t;
+
+static int run_case(const test_case_t *test)
+{
+    test_state_t state;
+    assemble_context_t context;
+    uint8_t output[MAX_OUTPUT];
+    uint32_t offset = 0;
+    size_t i;
+    _kernel_oserror *error = NULL;
+    int saw_error = 0;
+
+    state.symbol_count = 0;
+
+    context.buffer = output;
+    context.buffer_length = (int32_t) sizeof(output);
+    context.address = 0x8000;
+    context.opt = 0;
+    context.resolve_expr = test_resolve_expr;
+    context.assign_var = test_assign_var;
+    context.user_data = &state;
+    context.bytes_used = 0;
+
+    for (i = 0; test->lines[i] != NULL; i++)
+    {
+        const uint8_t *line = (const uint8_t *) test->lines[i];
+        size_t line_length = strlen(test->lines[i]);
+
+        error = assemble_z80_line(&context, line, line_length);
+        if (error != NULL)
+        {
+            saw_error = 1;
+            break;
+        }
+
+        if (offset + context.bytes_used > sizeof(output))
+        {
+            printf("FAIL: %s (test output buffer too small)\n", test->description);
+            return 0;
+        }
+        offset += context.bytes_used;
+        context.address += context.bytes_used;
+        context.buffer = output + offset;
+        context.buffer_length = (int32_t) (sizeof(output) - offset);
+    }
+
+    if (test->expect_error)
+    {
+        if (!saw_error)
+        {
+            printf("FAIL: %s (expected an error, none was raised)\n", test->description);
+            return 0;
+        }
+        return 1;
+    }
+
+    if (saw_error)
+    {
+        printf("FAIL: %s (unexpected error: %s)\n", test->description, error->errmess);
+        return 0;
+    }
+
+    if (offset != test->expected_length || memcmp(output, test->expected, offset) != 0)
+    {
+        size_t j;
+
+        printf("FAIL: %s (byte mismatch, got:", test->description);
+        for (j = 0; j < offset; j++)
+        {
+            printf(" %02X", output[j]);
+        }
+        printf(" expected:");
+        for (j = 0; j < test->expected_length; j++)
+        {
+            printf(" %02X", test->expected[j]);
+        }
+        printf(")\n");
+        return 0;
+    }
+
+    return 1;
+}
+
+/* ---- Test case data ---------------------------------------------- */
+
+static const char *const lines_nop[] = { "NOP", NULL };
+static const uint8_t     bytes_nop[] = { 0x00 };
+
+static const char *const lines_halt[] = { "HALT", NULL };
+static const uint8_t     bytes_halt[] = { 0x76 };
+
+static const char *const lines_exx[] = { "EXX", NULL };
+static const uint8_t     bytes_exx[] = { 0xD9 };
+
+static const char *const lines_ldir[] = { "LDIR", NULL };
+static const uint8_t     bytes_ldir[] = { 0xED, 0xB0 };
+
+static const char *const lines_neg[] = { "NEG", NULL };
+static const uint8_t     bytes_neg[] = { 0xED, 0x44 };
+
+static const char *const lines_ld_rr[] = { "LD A,B", NULL };
+static const uint8_t     bytes_ld_rr[] = { 0x78 };
+
+static const char *const lines_ld_rr2[] = { "LD B,C", NULL };
+static const uint8_t     bytes_ld_rr2[] = { 0x41 };
+
+static const char *const lines_ld_imm[] = { "LD A,&2A", NULL };
+static const uint8_t     bytes_ld_imm[] = { 0x3E, 0x2A };
+
+static const char *const lines_ld_hl_imm[] = { "LD HL,&1234", NULL };
+static const uint8_t     bytes_ld_hl_imm[] = { 0x21, 0x34, 0x12 };
+
+static const char *const lines_ld_ix_imm[] = { "LD IX,&1234", NULL };
+static const uint8_t     bytes_ld_ix_imm[] = { 0xDD, 0x21, 0x34, 0x12 };
+
+static const char *const lines_ld_a_hl[] = { "LD A,(HL)", NULL };
+static const uint8_t     bytes_ld_a_hl[] = { 0x7E };
+
+static const char *const lines_ld_hl_a[] = { "LD (HL),A", NULL };
+static const uint8_t     bytes_ld_hl_a[] = { 0x77 };
+
+static const char *const lines_ld_a_ixd[] = { "LD A,(IX+5)", NULL };
+static const uint8_t     bytes_ld_a_ixd[] = { 0xDD, 0x7E, 0x05 };
+
+static const char *const lines_ld_ixd_a[] = { "LD (IX+5),A", NULL };
+static const uint8_t     bytes_ld_ixd_a[] = { 0xDD, 0x77, 0x05 };
+
+static const char *const lines_ld_iyd_neg[] = { "LD (IY-5),B", NULL };
+static const uint8_t     bytes_ld_iyd_neg[] = { 0xFD, 0x70, 0xFB };
+
+static const char *const lines_ld_ixh_imm[] = { "LD IXH,&12", NULL };
+static const uint8_t     bytes_ld_ixh_imm[] = { 0xDD, 0x26, 0x12 };
+
+static const char *const lines_ld_ixh_ixl[] = { "LD IXH,IXL", NULL };
+static const uint8_t     bytes_ld_ixh_ixl[] = { 0xDD, 0x65 };
+
+static const char *const lines_ld_a_bc[] = { "LD A,(BC)", NULL };
+static const uint8_t     bytes_ld_a_bc[] = { 0x0A };
+
+static const char *const lines_ld_de_a[] = { "LD (DE),A", NULL };
+static const uint8_t     bytes_ld_de_a[] = { 0x12 };
+
+static const char *const lines_ld_a_nn[] = { "LD A,(&1234)", NULL };
+static const uint8_t     bytes_ld_a_nn[] = { 0x3A, 0x34, 0x12 };
+
+static const char *const lines_ld_nn_a[] = { "LD (&1234),A", NULL };
+static const uint8_t     bytes_ld_nn_a[] = { 0x32, 0x34, 0x12 };
+
+static const char *const lines_ld_a_i[] = { "LD A,I", NULL };
+static const uint8_t     bytes_ld_a_i[] = { 0xED, 0x57 };
+
+static const char *const lines_ld_sp_hl[] = { "LD SP,HL", NULL };
+static const uint8_t     bytes_ld_sp_hl[] = { 0xF9 };
+
+static const char *const lines_ld_sp_ix[] = { "LD SP,IX", NULL };
+static const uint8_t     bytes_ld_sp_ix[] = { 0xDD, 0xF9 };
+
+static const char *const lines_ld_bc_nn[] = { "LD BC,(&1234)", NULL };
+static const uint8_t     bytes_ld_bc_nn[] = { 0xED, 0x4B, 0x34, 0x12 };
+
+static const char *const lines_ld_hl_nn[] = { "LD HL,(&1234)", NULL };
+static const uint8_t     bytes_ld_hl_nn[] = { 0x2A, 0x34, 0x12 };
+
+static const char *const lines_ld_nn_de[] = { "LD (&1234),DE", NULL };
+static const uint8_t     bytes_ld_nn_de[] = { 0xED, 0x53, 0x34, 0x12 };
+
+static const char *const lines_add_a_b[] = { "ADD A,B", NULL };
+static const uint8_t     bytes_add_a_b[] = { 0x80 };
+
+static const char *const lines_add_a_imm[] = { "ADD A,7", NULL };
+static const uint8_t     bytes_add_a_imm[] = { 0xC6, 0x07 };
+
+static const char *const lines_add_hl_bc[] = { "ADD HL,BC", NULL };
+static const uint8_t     bytes_add_hl_bc[] = { 0x09 };
+
+static const char *const lines_add_ix_de[] = { "ADD IX,DE", NULL };
+static const uint8_t     bytes_add_ix_de[] = { 0xDD, 0x19 };
+
+static const char *const lines_adc_hl_bc[] = { "ADC HL,BC", NULL };
+static const uint8_t     bytes_adc_hl_bc[] = { 0xED, 0x4A };
+
+static const char *const lines_sbc_hl_de[] = { "SBC HL,DE", NULL };
+static const uint8_t     bytes_sbc_hl_de[] = { 0xED, 0x52 };
+
+static const char *const lines_sub_b[] = { "SUB B", NULL };
+static const uint8_t     bytes_sub_b[] = { 0x90 };
+
+static const char *const lines_sub_a_b[] = { "SUB A,B", NULL };
+static const uint8_t     bytes_sub_a_b[] = { 0x90 };
+
+static const char *const lines_and_imm[] = { "AND &0F", NULL };
+static const uint8_t     bytes_and_imm[] = { 0xE6, 0x0F };
+
+static const char *const lines_xor_a[] = { "XOR A", NULL };
+static const uint8_t     bytes_xor_a[] = { 0xAF };
+
+static const char *const lines_or_c[] = { "OR C", NULL };
+static const uint8_t     bytes_or_c[] = { 0xB1 };
+
+static const char *const lines_cp_imm[] = { "CP &10", NULL };
+static const uint8_t     bytes_cp_imm[] = { 0xFE, 0x10 };
+
+static const char *const lines_inc_b[] = { "INC B", NULL };
+static const uint8_t     bytes_inc_b[] = { 0x04 };
+
+static const char *const lines_dec_hl_ind[] = { "DEC (HL)", NULL };
+static const uint8_t     bytes_dec_hl_ind[] = { 0x35 };
+
+static const char *const lines_inc_ix[] = { "INC IX", NULL };
+static const uint8_t     bytes_inc_ix[] = { 0xDD, 0x23 };
+
+static const char *const lines_dec_bc[] = { "DEC BC", NULL };
+static const uint8_t     bytes_dec_bc[] = { 0x0B };
+
+static const char *const lines_rlc_b[] = { "RLC B", NULL };
+static const uint8_t     bytes_rlc_b[] = { 0xCB, 0x00 };
+
+static const char *const lines_rlc_hl[] = { "RLC (HL)", NULL };
+static const uint8_t     bytes_rlc_hl[] = { 0xCB, 0x06 };
+
+static const char *const lines_rlc_ixd[] = { "RLC (IX+2)", NULL };
+static const uint8_t     bytes_rlc_ixd[] = { 0xDD, 0xCB, 0x02, 0x06 };
+
+static const char *const lines_rlc_ixd_shadow[] = { "RLC (IX+2),B", NULL };
+static const uint8_t     bytes_rlc_ixd_shadow[] = { 0xDD, 0xCB, 0x02, 0x00 };
+
+static const char *const lines_sll_a[] = { "SLL A", NULL };
+static const uint8_t     bytes_sll_a[] = { 0xCB, 0x37 };
+
+static const char *const lines_sla_iyd_neg[] = { "SLA (IY-1)", NULL };
+static const uint8_t     bytes_sla_iyd_neg[] = { 0xFD, 0xCB, 0xFF, 0x26 };
+
+static const char *const lines_bit_7_a[] = { "BIT 7,A", NULL };
+static const uint8_t     bytes_bit_7_a[] = { 0xCB, 0x7F };
+
+static const char *const lines_bit_0_hl[] = { "BIT 0,(HL)", NULL };
+static const uint8_t     bytes_bit_0_hl[] = { 0xCB, 0x46 };
+
+static const char *const lines_res_3_ixd[] = { "RES 3,(IX+4)", NULL };
+static const uint8_t     bytes_res_3_ixd[] = { 0xDD, 0xCB, 0x04, 0x9E };
+
+static const char *const lines_set_1_iyd_shadow[] = { "SET 1,(IY+2),C", NULL };
+static const uint8_t     bytes_set_1_iyd_shadow[] = { 0xFD, 0xCB, 0x02, 0xC9 };
+
+static const char *const lines_jp_nn[] = { "JP &1234", NULL };
+static const uint8_t     bytes_jp_nn[] = { 0xC3, 0x34, 0x12 };
+
+static const char *const lines_jp_cc_nn[] = { "JP NZ,&1234", NULL };
+static const uint8_t     bytes_jp_cc_nn[] = { 0xC2, 0x34, 0x12 };
+
+static const char *const lines_jp_hl[] = { "JP (HL)", NULL };
+static const uint8_t     bytes_jp_hl[] = { 0xE9 };
+
+static const char *const lines_jp_ix[] = { "JP (IX)", NULL };
+static const uint8_t     bytes_jp_ix[] = { 0xDD, 0xE9 };
+
+/* JR back to a label: NOP (1 byte) then "JR loop" -> offset = 0x8000-(0x8001+2) = -3 */
+static const char *const lines_jr_back[] = { ".loop", "NOP", "JR loop", NULL };
+static const uint8_t     bytes_jr_back[] = { 0x00, 0x18, 0xFD };
+
+static const char *const lines_jr_nz_back[] = { ".loop", "NOP", "JR NZ,loop", NULL };
+static const uint8_t     bytes_jr_nz_back[] = { 0x00, 0x20, 0xFD };
+
+static const char *const lines_djnz_back[] = { ".loop", "NOP", "DJNZ loop", NULL };
+static const uint8_t     bytes_djnz_back[] = { 0x00, 0x10, 0xFD };
+
+static const char *const lines_call_nn[] = { "CALL &1234", NULL };
+static const uint8_t     bytes_call_nn[] = { 0xCD, 0x34, 0x12 };
+
+static const char *const lines_call_z_nn[] = { "CALL Z,&1234", NULL };
+static const uint8_t     bytes_call_z_nn[] = { 0xCC, 0x34, 0x12 };
+
+static const char *const lines_ret[] = { "RET", NULL };
+static const uint8_t     bytes_ret[] = { 0xC9 };
+
+static const char *const lines_ret_nz[] = { "RET NZ", NULL };
+static const uint8_t     bytes_ret_nz[] = { 0xC0 };
+
+static const char *const lines_rst_16[] = { "RST 16", NULL };
+static const uint8_t     bytes_rst_16[] = { 0xD7 };
+
+static const char *const lines_push_bc[] = { "PUSH BC", NULL };
+static const uint8_t     bytes_push_bc[] = { 0xC5 };
+
+static const char *const lines_pop_af[] = { "POP AF", NULL };
+static const uint8_t     bytes_pop_af[] = { 0xF1 };
+
+static const char *const lines_push_ix[] = { "PUSH IX", NULL };
+static const uint8_t     bytes_push_ix[] = { 0xDD, 0xE5 };
+
+static const char lines_ex_af_raw[] = "EX AF,AF'";
+static const char *const lines_ex_af[] = { lines_ex_af_raw, NULL };
+static const uint8_t     bytes_ex_af[] = { 0x08 };
+
+static const char *const lines_ex_de_hl[] = { "EX DE,HL", NULL };
+static const uint8_t     bytes_ex_de_hl[] = { 0xEB };
+
+static const char *const lines_ex_sp_hl[] = { "EX (SP),HL", NULL };
+static const uint8_t     bytes_ex_sp_hl[] = { 0xE3 };
+
+static const char *const lines_ex_sp_ix[] = { "EX (SP),IX", NULL };
+static const uint8_t     bytes_ex_sp_ix[] = { 0xDD, 0xE3 };
+
+static const char *const lines_in_a_n[] = { "IN A,(&FE)", NULL };
+static const uint8_t     bytes_in_a_n[] = { 0xDB, 0xFE };
+
+static const char *const lines_in_b_c[] = { "IN B,(C)", NULL };
+static const uint8_t     bytes_in_b_c[] = { 0xED, 0x40 };
+
+static const char *const lines_in_c_undoc[] = { "IN (C)", NULL };
+static const uint8_t     bytes_in_c_undoc[] = { 0xED, 0x70 };
+
+static const char *const lines_in_f_c_undoc[] = { "IN F,(C)", NULL };
+static const uint8_t     bytes_in_f_c_undoc[] = { 0xED, 0x70 };
+
+static const char *const lines_out_n_a[] = { "OUT (&FE),A", NULL };
+static const uint8_t     bytes_out_n_a[] = { 0xD3, 0xFE };
+
+static const char *const lines_out_c_b[] = { "OUT (C),B", NULL };
+static const uint8_t     bytes_out_c_b[] = { 0xED, 0x41 };
+
+static const char *const lines_out_c_0[] = { "OUT (C),0", NULL };
+static const uint8_t     bytes_out_c_0[] = { 0xED, 0x71 };
+
+static const char *const lines_im_1[] = { "IM 1", NULL };
+static const uint8_t     bytes_im_1[] = { 0xED, 0x56 };
+
+static const char *const lines_defb[] = { "DEFB 65", NULL };
+static const uint8_t     bytes_defb[] = { 0x41 };
+
+static const char *const lines_defw[] = { "DEFW &1234", NULL };
+static const uint8_t     bytes_defw[] = { 0x34, 0x12 };
+
+static const char *const lines_defm[] = { "DEFM \"AB\"", NULL };
+static const uint8_t     bytes_defm[] = { 0x41, 0x42 };
+
+static const char *const lines_opt[] = { "OPT 3", "NOP", NULL };
+static const uint8_t     bytes_opt[] = { 0x00 };
+
+static const char *const lines_label_addr[] = { ".here", "LD A,(here)", NULL };
+static const uint8_t     bytes_label_addr[] = { 0x3A, 0x00, 0x80 };
+
+static const char lines_and_token_raw[] = { (char) 0x80, ' ', '&', '0', 'F', '\0' };
+static const char *const lines_and_token[] = { lines_and_token_raw, NULL };
+static const uint8_t     bytes_and_token[] = { 0xE6, 0x0F };
+
+static const char lines_or_token_raw[] = { (char) 0x84, ' ', 'C', '\0' };
+static const char *const lines_or_token[] = { lines_or_token_raw, NULL };
+static const uint8_t     bytes_or_token[] = { 0xB1 };
+
+/* ---- Error cases --------------------------------------------------- */
+
+static const char *const lines_err_bad_mnemonic[] = { "FOO &10", NULL };
+static const char *const lines_err_hl_hl[]        = { "LD (HL),(HL)", NULL };
+static const char *const lines_err_rst_bad[]      = { "RST 3", NULL };
+static const char *const lines_err_jr_range[]     = { "JR &9000", NULL };
+static const char *const lines_err_im_bad[]       = { "IM 5", NULL };
+static const char *const lines_err_bit_range[]    = { "BIT 8,A", NULL };
+static const char *const lines_err_missing_op[]   = { "LD A", NULL };
+static const char *const lines_err_ixh_l_mix[]    = { "LD IXH,L", NULL };
+static const char *const lines_err_disp_range[]   = { "LD A,(IX+200)", NULL };
+static const char *const lines_err_out_bad_reg[]  = { "OUT (C),(HL)", NULL };
+
+static const test_case_t tests[] = {
+    { "NOP",                            lines_nop,               bytes_nop,               sizeof(bytes_nop),               0 },
+    { "HALT",                           lines_halt,              bytes_halt,              sizeof(bytes_halt),              0 },
+    { "EXX",                            lines_exx,               bytes_exx,               sizeof(bytes_exx),               0 },
+    { "LDIR (ED-prefixed implied)",     lines_ldir,              bytes_ldir,              sizeof(bytes_ldir),              0 },
+    { "NEG (ED-prefixed implied)",      lines_neg,               bytes_neg,               sizeof(bytes_neg),               0 },
+    { "LD A,B (reg-reg)",               lines_ld_rr,             bytes_ld_rr,             sizeof(bytes_ld_rr),             0 },
+    { "LD B,C (reg-reg)",               lines_ld_rr2,            bytes_ld_rr2,            sizeof(bytes_ld_rr2),            0 },
+    { "LD A,n (immediate)",             lines_ld_imm,            bytes_ld_imm,            sizeof(bytes_ld_imm),            0 },
+    { "LD HL,nn",                       lines_ld_hl_imm,         bytes_ld_hl_imm,         sizeof(bytes_ld_hl_imm),         0 },
+    { "LD IX,nn (prefixed)",            lines_ld_ix_imm,         bytes_ld_ix_imm,         sizeof(bytes_ld_ix_imm),         0 },
+    { "LD A,(HL)",                      lines_ld_a_hl,           bytes_ld_a_hl,           sizeof(bytes_ld_a_hl),           0 },
+    { "LD (HL),A",                      lines_ld_hl_a,           bytes_ld_hl_a,           sizeof(bytes_ld_hl_a),           0 },
+    { "LD A,(IX+d)",                    lines_ld_a_ixd,          bytes_ld_a_ixd,          sizeof(bytes_ld_a_ixd),          0 },
+    { "LD (IX+d),A",                    lines_ld_ixd_a,          bytes_ld_ixd_a,          sizeof(bytes_ld_ixd_a),          0 },
+    { "LD (IY-d),B (negative disp)",    lines_ld_iyd_neg,        bytes_ld_iyd_neg,        sizeof(bytes_ld_iyd_neg),        0 },
+    { "LD IXH,n (undocumented half)",   lines_ld_ixh_imm,        bytes_ld_ixh_imm,        sizeof(bytes_ld_ixh_imm),        0 },
+    { "LD IXH,IXL (undocumented)",      lines_ld_ixh_ixl,        bytes_ld_ixh_ixl,        sizeof(bytes_ld_ixh_ixl),        0 },
+    { "LD A,(BC)",                      lines_ld_a_bc,           bytes_ld_a_bc,           sizeof(bytes_ld_a_bc),           0 },
+    { "LD (DE),A",                      lines_ld_de_a,           bytes_ld_de_a,           sizeof(bytes_ld_de_a),           0 },
+    { "LD A,(nn)",                      lines_ld_a_nn,           bytes_ld_a_nn,           sizeof(bytes_ld_a_nn),           0 },
+    { "LD (nn),A",                      lines_ld_nn_a,           bytes_ld_nn_a,           sizeof(bytes_ld_nn_a),           0 },
+    { "LD A,I",                         lines_ld_a_i,            bytes_ld_a_i,            sizeof(bytes_ld_a_i),            0 },
+    { "LD SP,HL",                       lines_ld_sp_hl,          bytes_ld_sp_hl,          sizeof(bytes_ld_sp_hl),          0 },
+    { "LD SP,IX",                       lines_ld_sp_ix,          bytes_ld_sp_ix,          sizeof(bytes_ld_sp_ix),          0 },
+    { "LD BC,(nn) (ED-prefixed)",       lines_ld_bc_nn,          bytes_ld_bc_nn,          sizeof(bytes_ld_bc_nn),          0 },
+    { "LD HL,(nn) (unprefixed short)",  lines_ld_hl_nn,          bytes_ld_hl_nn,          sizeof(bytes_ld_hl_nn),          0 },
+    { "LD (nn),DE (ED-prefixed)",       lines_ld_nn_de,          bytes_ld_nn_de,          sizeof(bytes_ld_nn_de),          0 },
+    { "ADD A,B",                        lines_add_a_b,           bytes_add_a_b,           sizeof(bytes_add_a_b),           0 },
+    { "ADD A,n",                        lines_add_a_imm,         bytes_add_a_imm,         sizeof(bytes_add_a_imm),         0 },
+    { "ADD HL,BC (16-bit)",             lines_add_hl_bc,         bytes_add_hl_bc,         sizeof(bytes_add_hl_bc),         0 },
+    { "ADD IX,DE (16-bit, prefixed)",   lines_add_ix_de,         bytes_add_ix_de,         sizeof(bytes_add_ix_de),         0 },
+    { "ADC HL,BC",                      lines_adc_hl_bc,         bytes_adc_hl_bc,         sizeof(bytes_adc_hl_bc),         0 },
+    { "SBC HL,DE",                      lines_sbc_hl_de,         bytes_sbc_hl_de,         sizeof(bytes_sbc_hl_de),         0 },
+    { "SUB B",                          lines_sub_b,             bytes_sub_b,             sizeof(bytes_sub_b),             0 },
+    { "SUB A,B (optional A,)",          lines_sub_a_b,           bytes_sub_a_b,           sizeof(bytes_sub_a_b),           0 },
+    { "AND n",                          lines_and_imm,           bytes_and_imm,           sizeof(bytes_and_imm),           0 },
+    { "XOR A",                          lines_xor_a,             bytes_xor_a,             sizeof(bytes_xor_a),             0 },
+    { "OR C",                           lines_or_c,              bytes_or_c,              sizeof(bytes_or_c),              0 },
+    { "CP n",                           lines_cp_imm,            bytes_cp_imm,            sizeof(bytes_cp_imm),            0 },
+    { "INC B",                          lines_inc_b,             bytes_inc_b,             sizeof(bytes_inc_b),             0 },
+    { "DEC (HL)",                       lines_dec_hl_ind,        bytes_dec_hl_ind,        sizeof(bytes_dec_hl_ind),        0 },
+    { "INC IX",                         lines_inc_ix,            bytes_inc_ix,            sizeof(bytes_inc_ix),            0 },
+    { "DEC BC",                         lines_dec_bc,            bytes_dec_bc,            sizeof(bytes_dec_bc),            0 },
+    { "RLC B",                          lines_rlc_b,             bytes_rlc_b,             sizeof(bytes_rlc_b),             0 },
+    { "RLC (HL)",                       lines_rlc_hl,            bytes_rlc_hl,            sizeof(bytes_rlc_hl),            0 },
+    { "RLC (IX+d)",                     lines_rlc_ixd,           bytes_rlc_ixd,           sizeof(bytes_rlc_ixd),           0 },
+    { "RLC (IX+d),B (undoc shadow)",    lines_rlc_ixd_shadow,    bytes_rlc_ixd_shadow,    sizeof(bytes_rlc_ixd_shadow),    0 },
+    { "SLL A (undocumented)",           lines_sll_a,             bytes_sll_a,             sizeof(bytes_sll_a),             0 },
+    { "SLA (IY-d)",                     lines_sla_iyd_neg,       bytes_sla_iyd_neg,       sizeof(bytes_sla_iyd_neg),       0 },
+    { "BIT 7,A",                        lines_bit_7_a,           bytes_bit_7_a,           sizeof(bytes_bit_7_a),           0 },
+    { "BIT 0,(HL)",                     lines_bit_0_hl,          bytes_bit_0_hl,          sizeof(bytes_bit_0_hl),          0 },
+    { "RES 3,(IX+d)",                   lines_res_3_ixd,         bytes_res_3_ixd,         sizeof(bytes_res_3_ixd),         0 },
+    { "SET 1,(IY+d),C (undoc shadow)",  lines_set_1_iyd_shadow,  bytes_set_1_iyd_shadow,  sizeof(bytes_set_1_iyd_shadow),  0 },
+    { "JP nn",                          lines_jp_nn,             bytes_jp_nn,             sizeof(bytes_jp_nn),             0 },
+    { "JP cc,nn",                       lines_jp_cc_nn,          bytes_jp_cc_nn,          sizeof(bytes_jp_cc_nn),          0 },
+    { "JP (HL)",                        lines_jp_hl,             bytes_jp_hl,             sizeof(bytes_jp_hl),             0 },
+    { "JP (IX)",                        lines_jp_ix,             bytes_jp_ix,             sizeof(bytes_jp_ix),             0 },
+    { "JR backward branch",             lines_jr_back,           bytes_jr_back,           sizeof(bytes_jr_back),           0 },
+    { "JR NZ, backward branch",         lines_jr_nz_back,        bytes_jr_nz_back,        sizeof(bytes_jr_nz_back),        0 },
+    { "DJNZ backward branch",           lines_djnz_back,         bytes_djnz_back,         sizeof(bytes_djnz_back),         0 },
+    { "CALL nn",                        lines_call_nn,           bytes_call_nn,           sizeof(bytes_call_nn),           0 },
+    { "CALL cc,nn",                     lines_call_z_nn,         bytes_call_z_nn,         sizeof(bytes_call_z_nn),         0 },
+    { "RET",                            lines_ret,               bytes_ret,               sizeof(bytes_ret),               0 },
+    { "RET cc",                         lines_ret_nz,            bytes_ret_nz,            sizeof(bytes_ret_nz),            0 },
+    { "RST n",                          lines_rst_16,            bytes_rst_16,            sizeof(bytes_rst_16),            0 },
+    { "PUSH BC",                        lines_push_bc,           bytes_push_bc,           sizeof(bytes_push_bc),           0 },
+    { "POP AF",                         lines_pop_af,            bytes_pop_af,            sizeof(bytes_pop_af),            0 },
+    { "PUSH IX",                        lines_push_ix,           bytes_push_ix,           sizeof(bytes_push_ix),           0 },
+    { "EX AF,AF'",                      lines_ex_af,             bytes_ex_af,             sizeof(bytes_ex_af),             0 },
+    { "EX DE,HL",                       lines_ex_de_hl,          bytes_ex_de_hl,          sizeof(bytes_ex_de_hl),          0 },
+    { "EX (SP),HL",                     lines_ex_sp_hl,          bytes_ex_sp_hl,          sizeof(bytes_ex_sp_hl),          0 },
+    { "EX (SP),IX",                     lines_ex_sp_ix,          bytes_ex_sp_ix,          sizeof(bytes_ex_sp_ix),          0 },
+    { "IN A,(n)",                       lines_in_a_n,            bytes_in_a_n,            sizeof(bytes_in_a_n),            0 },
+    { "IN B,(C)",                       lines_in_b_c,            bytes_in_b_c,            sizeof(bytes_in_b_c),            0 },
+    { "IN (C) (undocumented)",          lines_in_c_undoc,        bytes_in_c_undoc,        sizeof(bytes_in_c_undoc),        0 },
+    { "IN F,(C) (undocumented)",        lines_in_f_c_undoc,      bytes_in_f_c_undoc,      sizeof(bytes_in_f_c_undoc),      0 },
+    { "OUT (n),A",                      lines_out_n_a,           bytes_out_n_a,           sizeof(bytes_out_n_a),           0 },
+    { "OUT (C),B",                      lines_out_c_b,           bytes_out_c_b,           sizeof(bytes_out_c_b),           0 },
+    { "OUT (C),0 (undocumented)",       lines_out_c_0,           bytes_out_c_0,           sizeof(bytes_out_c_0),           0 },
+    { "IM 1",                           lines_im_1,              bytes_im_1,              sizeof(bytes_im_1),              0 },
+    { "DEFB pseudo-op",                 lines_defb,              bytes_defb,              sizeof(bytes_defb),              0 },
+    { "DEFW pseudo-op",                 lines_defw,              bytes_defw,              sizeof(bytes_defw),              0 },
+    { "DEFM pseudo-op (string)",        lines_defm,              bytes_defm,              sizeof(bytes_defm),              0 },
+    { "OPT pseudo-op is a no-op",       lines_opt,               bytes_opt,               sizeof(bytes_opt),               0 },
+    { "label address reference",        lines_label_addr,        bytes_label_addr,        sizeof(bytes_label_addr),        0 },
+    { "tokenised AND -> AND",           lines_and_token,         bytes_and_token,         sizeof(bytes_and_token),         0 },
+    { "tokenised OR -> OR",             lines_or_token,          bytes_or_token,          sizeof(bytes_or_token),          0 },
+
+    { "error: bad mnemonic",            lines_err_bad_mnemonic,  NULL, 0, 1 },
+    { "error: LD (HL),(HL) invalid",    lines_err_hl_hl,         NULL, 0, 1 },
+    { "error: RST not a multiple of 8", lines_err_rst_bad,       NULL, 0, 1 },
+    { "error: JR out of range",         lines_err_jr_range,      NULL, 0, 1 },
+    { "error: IM bad value",            lines_err_im_bad,        NULL, 0, 1 },
+    { "error: BIT index out of range",  lines_err_bit_range,     NULL, 0, 1 },
+    { "error: missing operand",         lines_err_missing_op,    NULL, 0, 1 },
+    { "error: IXH mixed with plain L",  lines_err_ixh_l_mix,     NULL, 0, 1 },
+    { "error: (IX+d) displacement range", lines_err_disp_range,  NULL, 0, 1 },
+    { "error: OUT (C),(HL) invalid",    lines_err_out_bad_reg,   NULL, 0, 1 }
+};
+
+int run_tests_z80(void)
+{
+    size_t i;
+    int passed = 0;
+    int failed = 0;
+
+    for (i = 0; i < sizeof(tests) / sizeof(tests[0]); i++)
+    {
+        if (run_case(&tests[i]))
+        {
+            passed += 1;
+        }
+        else
+        {
+            failed += 1;
+        }
+    }
+
+    printf("assemble_z80: %d passed, %d failed (of %d)\n", passed, failed, passed + failed);
+
+    return failed;
+}
