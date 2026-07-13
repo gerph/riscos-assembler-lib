@@ -21,7 +21,7 @@ Five backends exist today:
 | 6809         | `h/assemble_6809`, `c/assemble_6809`       | 6809 (single dialect)            |
 | x86-64       | `h/assemble_x86_64`, `c/assemble_x86_64`   | x86-64, limited (see below)      |
 | Z80          | `h/assemble_z80`, `c/assemble_z80`         | Z80, including common undocumented forms |
-| ARM32        | `h/assemble_arm32`, `c/assemble_arm32`     | base ARM (ARMv4-ARMv8 AArch32 subset); FPA/VFP are separate follow-on backends, not yet added (see below) |
+| ARM32        | `h/assemble_arm32`, `c/assemble_arm32`     | base ARM (ARMv4-ARMv8 AArch32 subset) + legacy FPA (dialect via OPT bits); VFP/NEON is a separate follow-on backend, not yet added (see below) |
 
 Shared infrastructure lives in `h/assemble_common` / `c/assemble_common`.
 
@@ -225,16 +225,32 @@ SMULL/SMLAL)/CDP/MCR/MRC/LDC/STC all write their size or mode suffix
 **after** the condition code (`LDREQB`, not `LDRBEQ`), so they're matched
 on a fixed 3-character root and handed to a dedicated parser in
 `c/assemble_arm32` rather than going through the generic
-root+condition+[S] mnemonic table used for everything else.
+root+condition+[S] mnemonic table used for everything else. The legacy
+FPA arithmetic/load-store mnemonics (see below) follow the same pattern,
+but with *two* extra suffixes after the condition: a mandatory precision
+letter and an optional rounding-mode letter, eg `ADFEQDP`.
 
-Known, deliberate gaps (not silently dropped — each raises "Mnemonic not
-recognised"): the ARMv5TE/v6 'xy' DSP multiply family (SMLABB/SMLAWx/
-SMUAD/SMLAD/SMLALD and friends) and SMMLA/SMMLS/SMMUL; MRRC/MCRR; the
-ARMv8 LDA/STL/LDAEX/STLEX load-acquire/store-release family; and the
-banked-register form of MSR/MRS used for hypervisor-mode register access.
-FPA and VFP/NEON support are separate follow-on backends layered on top
-of this one (not yet added), gated by `ASSEMBLE_ARM32_OPT_FPA`/
-`ASSEMBLE_ARM32_OPT_VFP` dialect bits once they land.
+Known, deliberate gaps in base ARM32 (not silently dropped — each raises
+"Mnemonic not recognised"): the ARMv5TE/v6 'xy' DSP multiply family
+(SMLABB/SMLAWx/SMUAD/SMLAD/SMLALD and friends) and SMMLA/SMMLS/SMMUL;
+MRRC/MCRR; the ARMv8 LDA/STL/LDAEX/STLEX load-acquire/store-release
+family; and the banked-register form of MSR/MRS used for hypervisor-mode
+register access.
+
+FPA (coprocessor 1, `ADF`/`MUF`/`SUF`/.../`LDF`/`STF` and friends) is
+implemented, gated by `ASSEMBLE_ARM32_OPT_FPA` — 39 of the original's 41
+FPA mnemonics. `LFM`/`SFM` (multiple-register stack transfer) are a
+deliberate gap: their real encoding packs the register count together
+with a P/U/offset-clearing rule that couldn't be verified to the same
+confidence as the rest of this port from the available source fragments,
+so they were omitted rather than risking a wrong encoding. LDF/STF use
+the same word-aligned ±1020-byte addressing shape as the generic
+coprocessor LDC/STC (a separate, structurally similar parse in each of
+`encode_fpa_ldf_stf` and `handle_coprocessor` — not literally shared
+code, since the "bare `[Rn]`" pre/post-indexed distinction was a bug
+fixed in both places together; see the git history if extending either).
+VFP/NEON support is a separate follow-on backend layered on top of this
+one (not yet added), gated by `ASSEMBLE_ARM32_OPT_VFP` once it lands.
 
 ## Source material handling
 

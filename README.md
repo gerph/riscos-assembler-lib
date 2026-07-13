@@ -20,7 +20,7 @@ interface is designed to make that straightforward for a future caller.
 | 6809    | `h.assemble_6809`  | `c.assemble_6809`     | 6809                                          |
 | x86-64  | `h.assemble_x86_64`| `c.assemble_x86_64`   | x86-64 (limited subset, see below)            |
 | Z80     | `h.assemble_z80`   | `c.assemble_z80`      | Z80 (including common undocumented forms)     |
-| ARM32   | `h.assemble_arm32` | `c.assemble_arm32`    | Base ARM (ARMv4 through the AArch32 subset of ARMv8); FPA and VFP/NEON are separate follow-on backends, not yet added |
+| ARM32   | `h.assemble_arm32` | `c.assemble_arm32`    | Base ARM (ARMv4 through the AArch32 subset of ARMv8) + legacy FPA (dialect via `opt` bits); VFP/NEON is a separate follow-on backend, not yet added |
 
 Shared infrastructure (the assembly context, error reporting, byte/word
 emission helpers) lives in `h.assemble_common` / `c.assemble_common`.
@@ -206,21 +206,40 @@ literal's raw bytes as immediate data still works.
 
 ### Known limitation: ARM32
 
-Only the base ARM instruction set is implemented so far; FPA and VFP/NEON
-mnemonics are planned as separate follow-on backends, gated by
-`ASSEMBLE_ARM32_OPT_FPA`/`ASSEMBLE_ARM32_OPT_VFP` dialect bits once added.
-Within base ARM32, the ARMv5TE/v6 'xy' DSP multiply family (`SMLABB`,
-`SMLAWx`, `SMUAD`, `SMLAD`, `SMLALD` and friends), `SMMLA`/`SMMLS`/`SMMUL`,
-`MRRC`/`MCRR`, the ARMv8 `LDA`/`STL`/`LDAEX`/`STLEX` load-acquire/store-
-release family, and the banked-register form of `MSR`/`MRS` (hypervisor-
-mode register access) are not yet implemented and raise "Mnemonic not
-recognised".
+Base ARM32 and legacy FPA are implemented; VFP/NEON mnemonics are planned
+as a separate follow-on backend, gated by `ASSEMBLE_ARM32_OPT_VFP` once
+added. Within base ARM32, the ARMv5TE/v6 'xy' DSP multiply family
+(`SMLABB`, `SMLAWx`, `SMUAD`, `SMLAD`, `SMLALD` and friends),
+`SMMLA`/`SMMLS`/`SMMUL`, `MRRC`/`MCRR`, the ARMv8 `LDA`/`STL`/`LDAEX`/
+`STLEX` load-acquire/store-release family, and the banked-register form
+of `MSR`/`MRS` (hypervisor-mode register access) are not yet implemented
+and raise "Mnemonic not recognised". Within FPA, `LFM`/`SFM` (multiple-
+register stack transfer) are omitted for the same reason — see
+`AGENTS.md` for detail.
 
 A syntax quirk worth knowing: unlike every other ARM mnemonic, `LDR`,
 `STR`, `LDM`, `STM`, `SWP`, the long-multiply family (`UMULL`/`UMLAL`/
-`SMULL`/`SMLAL`) and the generic coprocessor instructions (`CDP`, `MCR`,
-`MRC`, `LDC`, `STC`) all write their size or addressing-mode suffix
-**after** the condition code — `LDREQB`, not `LDRBEQ`.
+`SMULL`/`SMLAL`), the generic coprocessor instructions (`CDP`, `MCR`,
+`MRC`, `LDC`, `STC`) and the FPA mnemonics all write their size,
+addressing-mode or precision suffix **after** the condition code —
+`LDREQB`, not `LDRBEQ`; `ADFEQDP`, not `ADFDPEQ`.
+
+### FPA dialect: `ASSEMBLE_ARM32_OPT_FPA`
+
+FPA mnemonics (`ADF`, `MUF`, `SUF`, ..., `LDF`, `STF` — the legacy
+floating-point coprocessor instruction set, superseded by VFP decades
+ago but still assembleable code some RISC OS software targets) are only
+recognised when `context->opt` has `ASSEMBLE_ARM32_OPT_FPA` (bit 4) set;
+using one without the bit set raises `ASSEMBLE_ERROR_TYPE_UNSUPPORTED_ON_VARIANT`
+rather than "mnemonic not recognised", so a caller can distinguish
+"this needs the FPA dialect enabled" from a genuine typo. FPA registers
+are written `F0`-`F7`. Arithmetic mnemonics need a mandatory precision
+suffix (`S`/`D`/`E` for single/double/extended) and accept an optional
+rounding-mode suffix (`P`/`M`/`Z` for round to +infinity/-infinity/zero,
+default is round to nearest) — eg `ADFD F0,F1,F2`, `ADFDP F0,F1,F2`.
+`LDF`/`STF` take the same precision letters plus `P` (packed decimal).
+Immediate operands (`#imm`) must be exactly one of the 8 constants the
+hardware supports: `0, 1, 2, 3, 4, 5, 0.5, 10`.
 
 ### Platform constraint: no 64-bit integer type
 

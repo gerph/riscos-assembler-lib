@@ -232,6 +232,7 @@ typedef struct test_case
     const uint8_t      *expected;  /* concatenated bytes across all lines */
     size_t              expected_length;
     int                 expect_error;
+    uint32_t            opt;       /* extra ASSEMBLE_ARM32_OPT_* bits, eg _FPA */
 } test_case_t;
 
 static int run_case(const test_case_t *test)
@@ -249,7 +250,7 @@ static int run_case(const test_case_t *test)
     context.buffer = output;
     context.buffer_length = (int32_t) sizeof(output);
     context.address = test->address != 0 ? test->address : 0x8000u;
-    context.opt = 0;
+    context.opt = test->opt;
     context.resolve_expr = test_resolve_expr;
     context.assign_var = test_assign_var;
     context.user_data = &state;
@@ -407,6 +408,56 @@ static const uint8_t     bytes_dcd[] = { 0x78, 0x56, 0x34, 0x12 };
 static const char *const lines_adr[] = { "ADR R0,&8010", NULL };
 static const uint8_t     bytes_adr[] = { 0x08, 0x00, 0x8F, 0xE2 }; /* E28F0008 */
 
+static const char *const lines_fpa_disabled[] = { "ADFS F0,F1,F2", NULL };
+
+static const char *const lines_adf[] = { "ADFS F0,F1,F2", NULL };
+static const uint8_t     bytes_adf[] = { 0x02, 0x01, 0x01, 0xEE }; /* EE010102 */
+
+static const char *const lines_mvf[] = { "MVFS F0,F1", NULL };
+static const uint8_t     bytes_mvf[] = { 0x01, 0x81, 0x00, 0xEE }; /* EE008101 */
+
+static const char *const lines_fix[] = { "FIX R0,F1", NULL };
+static const uint8_t     bytes_fix[] = { 0x11, 0x01, 0x10, 0xEE }; /* EE100111 */
+
+static const char *const lines_flt[] = { "FLTS F0,R1", NULL };
+static const uint8_t     bytes_flt[] = { 0x10, 0x11, 0x00, 0xEE }; /* EE001110 */
+
+static const char *const lines_wfs[] = { "WFS R0", NULL };
+static const uint8_t     bytes_wfs[] = { 0x10, 0x01, 0x20, 0xEE }; /* EE200110 */
+
+static const char *const lines_cmf[] = { "CMF F0,F1", NULL };
+static const uint8_t     bytes_cmf[] = { 0x11, 0xF1, 0x90, 0xEE }; /* EE90F111 */
+
+static const char *const lines_stf[] = { "STFS F0,[R1]", NULL };
+static const uint8_t     bytes_stf[] = { 0x00, 0x01, 0x81, 0xED }; /* ED810100 */
+
+static const char *const lines_ldf[] = { "LDFD F0,[R1,#8]", NULL };
+static const uint8_t     bytes_ldf[] = { 0x02, 0x81, 0x91, 0xED }; /* ED918102 */
+
+static const char *const lines_adf_imm[] = { "ADFS F0,F1,#2", NULL };
+static const uint8_t     bytes_adf_imm[] = { 0x0A, 0x01, 0x01, 0xEE }; /* EE01010A */
+
+static const char *const lines_fpa_bad_imm[] = { "ADFS F0,F1,#7", NULL }; /* not one of the 8 constants */
+
+static const char *const lines_fpa_bad_prec[] = { "ADFX F0,F1,F2", NULL }; /* X is not S/D/E */
+
+static const char *const lines_cdp[] = { "CDP CP1,#0,C0,C1,C2", NULL };
+static const uint8_t     bytes_cdp[] = { 0x02, 0x01, 0x01, 0xEE }; /* EE010102 */
+
+static const char *const lines_mcr[] = { "MCR CP15,#0,R0,C1,C2,#0", NULL };
+static const uint8_t     bytes_mcr[] = { 0x12, 0x0F, 0x01, 0xEE }; /* EE010F12 */
+
+static const char *const lines_stc[] = { "STC CP1,C0,[R1,#4]", NULL };
+static const uint8_t     bytes_stc[] = { 0x01, 0x01, 0x81, 0xED }; /* ED810101 */
+
+/* Regression test for a bug where bare "[Rn]" (no offset at all) was
+   wrongly encoded as post-indexed (P=0) instead of pre-indexed with
+   an implicit zero offset (P=1) -- the same bug also affected the
+   base LDR/STR and FPA LDF/STF addressing parsers, fixed alongside
+   this one. */
+static const char *const lines_ldc_bare[] = { "LDC CP1,C0,[R1]", NULL };
+static const uint8_t     bytes_ldc_bare[] = { 0x00, 0x01, 0x91, 0xED }; /* ED910100 */
+
 static const test_case_t tests[] = {
     { "MOV Rd,#imm",                   lines_mov_imm,          0, bytes_mov_imm,          sizeof(bytes_mov_imm),          0 },
     { "MOVS Rd,Rm",                    lines_mov_reg,          0, bytes_mov_reg,          sizeof(bytes_mov_reg),          0 },
@@ -438,7 +489,25 @@ static const test_case_t tests[] = {
     { "Backward branch to a label",    lines_label_branch,     0, bytes_label_branch,     sizeof(bytes_label_branch),     0 },
     { "EQU assigns a value, not an address", lines_equ,        0, NULL, 0, 0 },
     { "DCD emits a little-endian word",lines_dcd,              0, bytes_dcd,              sizeof(bytes_dcd),              0 },
-    { "ADR Rd,label",                  lines_adr,              0, bytes_adr,              sizeof(bytes_adr),              0 }
+    { "ADR Rd,label",                  lines_adr,              0, bytes_adr,              sizeof(bytes_adr),              0 },
+
+    { "FPA mnemonic without OPT_FPA is rejected", lines_fpa_disabled, 0, NULL, 0, 1, 0 },
+    { "ADFS Fd,Fn,Fm",                 lines_adf,              0, bytes_adf,              sizeof(bytes_adf),              0, ASSEMBLE_ARM32_OPT_FPA },
+    { "ADFS Fd,Fn,#imm (built-in constant)", lines_adf_imm,     0, bytes_adf_imm,          sizeof(bytes_adf_imm),          0, ASSEMBLE_ARM32_OPT_FPA },
+    { "MVFS Fd,Fm (monadic)",          lines_mvf,              0, bytes_mvf,              sizeof(bytes_mvf),              0, ASSEMBLE_ARM32_OPT_FPA },
+    { "FIX Rd,Fm",                     lines_fix,              0, bytes_fix,              sizeof(bytes_fix),              0, ASSEMBLE_ARM32_OPT_FPA },
+    { "FLTS Fn,Rd",                    lines_flt,              0, bytes_flt,              sizeof(bytes_flt),              0, ASSEMBLE_ARM32_OPT_FPA },
+    { "WFS Rd",                        lines_wfs,              0, bytes_wfs,              sizeof(bytes_wfs),              0, ASSEMBLE_ARM32_OPT_FPA },
+    { "CMF Fn,Fm",                     lines_cmf,              0, bytes_cmf,              sizeof(bytes_cmf),              0, ASSEMBLE_ARM32_OPT_FPA },
+    { "STFS Fd,[Rn]",                  lines_stf,              0, bytes_stf,              sizeof(bytes_stf),              0, ASSEMBLE_ARM32_OPT_FPA },
+    { "LDFD Fd,[Rn,#imm]",             lines_ldf,              0, bytes_ldf,              sizeof(bytes_ldf),              0, ASSEMBLE_ARM32_OPT_FPA },
+    { "FPA #imm must be a built-in constant", lines_fpa_bad_imm, 0, NULL, 0, 1, ASSEMBLE_ARM32_OPT_FPA },
+    { "FPA precision must be S/D/E",   lines_fpa_bad_prec,     0, NULL, 0, 1, ASSEMBLE_ARM32_OPT_FPA },
+
+    { "CDP coproc,#op1,CRd,CRn,CRm",   lines_cdp,              0, bytes_cdp,              sizeof(bytes_cdp),              0 },
+    { "MCR coproc,#op1,Rd,CRn,CRm,#op2", lines_mcr,            0, bytes_mcr,              sizeof(bytes_mcr),              0 },
+    { "STC coproc,CRd,[Rn,#imm]",      lines_stc,              0, bytes_stc,              sizeof(bytes_stc),              0 },
+    { "LDC coproc,CRd,[Rn] (bare, regression)", lines_ldc_bare, 0, bytes_ldc_bare,         sizeof(bytes_ldc_bare),         0 }
 };
 
 int run_tests_arm32(void)

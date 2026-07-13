@@ -3229,12 +3229,12 @@ static _kernel_oserror *handle_coprocessor(assemble_context_t *context,
         if (pos < length && text[pos] == ']')
         {
             pos += 1;
-            bits |= (1u << 23); /* U */
             pos += assemble_skip_spaces(text + pos, length - pos);
             if (pos < length && text[pos] == ',')
             {
                 int32_t value;
 
+                bits |= (1u << 23); /* U (post-indexed, offset follows) */
                 pos += 1;
                 error = expect_char(text, length, &pos, '#');
                 if (error != NULL) return error;
@@ -3243,6 +3243,11 @@ static _kernel_oserror *handle_coprocessor(assemble_context_t *context,
                 if (value < 0) { bits &= ~(1u << 23); value = -value; }
                 if ((value & 3) != 0 || value > 0x3FC) return error_bad_offset();
                 bits |= (uint32_t) (value >> 2);
+            }
+            else
+            {
+                /* "[Rn]" with nothing else: pre-indexed, implicit #0. */
+                bits |= (1u << 24) | (1u << 23); /* P, U */
             }
         }
         else
@@ -3547,6 +3552,506 @@ static _kernel_oserror *assemble_align(assemble_context_t *context, const uint8_
     return NULL;
 }
 
+/* ---------------------------------------------------------------
+ * FPA (legacy floating-point coprocessor) support, gated by
+ * ASSEMBLE_ARM32_OPT_FPA. Like LDR/STR, FPA mnemonics write their
+ * suffixes after the condition code -- but here there are *two*
+ * suffixes: a mandatory precision letter (S/D/E, or for LDF/STF/
+ * also P) and, for the arithmetic/FIX/FLT forms, an optional
+ * rounding-mode letter (P/M/Z), eg "ADFEQDP" = ADF + EQ + D + P.
+ *
+ * Known, deliberate gap: LFM/SFM (multiple-register stack transfer)
+ * are not implemented. Their real encoding packs the register count
+ * and a P/U/offset-clearing rule that could not be verified to the
+ * same confidence as the rest of this port from the available
+ * source fragments, so they are omitted rather than risking a wrong
+ * encoding; "Mnemonic not recognised" is raised for them.
+ * --------------------------------------------------------------- */
+
+typedef enum fpa_family
+{
+    FPA_THREEOP,   /* Fd,Fn,Fm|#imm -- ADF MUF SUF RSF DVF RDF POW RPW RMF FML FDV FRD POL */
+    FPA_TWOOP,     /* Fd,Fm|#imm    -- MVF MNF ABS RND SQT LOG LGN EXP SIN COS TAN ASN ACS ATN URD NRM */
+    FPA_FIX,       /* Rd,Fm{,round} */
+    FPA_FLT,       /* Fn,Rd{,prec}{,round} */
+    FPA_WRFSC,     /* Rd -- WFS RFS WFC RFC */
+    FPA_CMF_CNF,   /* Fn,Fm|#imm */
+    FPA_LDF_STF    /* Fd,[address]{,prec} */
+} fpa_family_t;
+
+typedef struct fpa_mnemonic_entry
+{
+    const char    *root;
+    fpa_family_t   family;
+    uint32_t       opcode;
+} fpa_mnemonic_entry_t;
+
+static const fpa_mnemonic_entry_t fpa_mnemonic_table[] = {
+    { "ADF", FPA_THREEOP, 0 }, { "MUF", FPA_THREEOP, 1 }, { "SUF", FPA_THREEOP, 2 },
+    { "RSF", FPA_THREEOP, 3 }, { "DVF", FPA_THREEOP, 4 }, { "RDF", FPA_THREEOP, 5 },
+    { "POW", FPA_THREEOP, 6 }, { "RPW", FPA_THREEOP, 7 }, { "RMF", FPA_THREEOP, 8 },
+    { "FML", FPA_THREEOP, 9 }, { "FDV", FPA_THREEOP, 10 }, { "FRD", FPA_THREEOP, 11 },
+    { "POL", FPA_THREEOP, 12 },
+
+    { "MVF", FPA_TWOOP, 0 }, { "MNF", FPA_TWOOP, 1 }, { "ABS", FPA_TWOOP, 2 },
+    { "RND", FPA_TWOOP, 3 }, { "SQT", FPA_TWOOP, 4 }, { "LOG", FPA_TWOOP, 5 },
+    { "LGN", FPA_TWOOP, 6 }, { "EXP", FPA_TWOOP, 7 }, { "SIN", FPA_TWOOP, 8 },
+    { "COS", FPA_TWOOP, 9 }, { "TAN", FPA_TWOOP, 10 }, { "ASN", FPA_TWOOP, 11 },
+    { "ACS", FPA_TWOOP, 12 }, { "ATN", FPA_TWOOP, 13 }, { "URD", FPA_TWOOP, 14 },
+    { "NRM", FPA_TWOOP, 15 },
+
+    { "FIX", FPA_FIX, 0 },
+    { "FLT", FPA_FLT, 0 },
+    { "WFS", FPA_WRFSC, 2 }, { "RFS", FPA_WRFSC, 3 }, { "WFC", FPA_WRFSC, 4 }, { "RFC", FPA_WRFSC, 5 },
+    { "CMF", FPA_CMF_CNF, 9 }, { "CNF", FPA_CMF_CNF, 0xB },
+    { "LDF", FPA_LDF_STF, 1 }, { "STF", FPA_LDF_STF, 0 }
+};
+#define NUM_FPA_MNEMONICS (sizeof(fpa_mnemonic_table) / sizeof(fpa_mnemonic_table[0]))
+
+static const fpa_mnemonic_entry_t *find_fpa_root(const char *mnemonic)
+{
+    size_t i;
+
+    if (strlen(mnemonic) < 3)
+    {
+        return NULL;
+    }
+    for (i = 0; i < NUM_FPA_MNEMONICS; i++)
+    {
+        if (memcmp(fpa_mnemonic_table[i].root, mnemonic, 3) == 0)
+        {
+            return &fpa_mnemonic_table[i];
+        }
+    }
+    return NULL;
+}
+
+static _kernel_oserror *error_bad_fp_precision(void)
+{
+    return assemble_set_error(ASSEMBLE_CPU_ARM32, ASSEMBLE_ERROR_TYPE_SYNTAX, ASSEMBLE_ARM32_ERR_BAD_FP_PRECISION,
+                               "Bad FP precision (expected S, D or E)");
+}
+
+static _kernel_oserror *error_bad_fp_immediate(void)
+{
+    return assemble_set_error(ASSEMBLE_CPU_ARM32, ASSEMBLE_ERROR_TYPE_RANGE, ASSEMBLE_ARM32_ERR_BAD_FP_IMMEDIATE,
+                               "Bad FP immediate (must be one of 0,1,2,3,4,5,0.5,10)");
+}
+
+/* F0-F7, falling back to a full expression (range-checked 0-7), same
+   pattern as parse_register. */
+static _kernel_oserror *parse_fp_register(assemble_context_t *context,
+                                           const uint8_t *text, size_t length,
+                                           size_t *pos_inout, uint32_t *out_reg)
+{
+    size_t pos = *pos_inout;
+    uint8_t c0, c1;
+    int32_t value;
+    _kernel_oserror *error;
+
+    pos += assemble_skip_spaces(text + pos, length - pos);
+    c0 = (pos < length) ? (uint8_t) toupper((int) text[pos]) : 0;
+    c1 = (pos + 1 < length) ? text[pos + 1] : 0;
+    if (c0 == 'F' && c1 >= '0' && c1 <= '7' && !continues_identifier(text, length, pos + 2))
+    {
+        *out_reg = (uint32_t) (c1 - '0');
+        *pos_inout = pos + 2;
+        return NULL;
+    }
+
+    *pos_inout = pos;
+    error = eval_numeric(context, text, length, pos_inout, &value);
+    if (error != NULL)
+    {
+        return error;
+    }
+    if (value < 0 || value > 7)
+    {
+        return error_bad_register();
+    }
+    *out_reg = (uint32_t) value;
+    return NULL;
+}
+
+/* Matches one of the 8 FPA immediate constants (0,1,2,3,4,5,0.5,10),
+   returning its 3-bit table index, or -1 if the value is not exactly
+   one of them. */
+static int fpa_immediate_index(const assemble_value_t *value)
+{
+    static const double constants[8] = { 0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 0.5, 10.0 };
+    double v;
+    int i;
+
+    v = (value->type == ASSEMBLE_VALUE_FLOAT) ? value->value.as_float : (double) value->value.as_integer;
+    for (i = 0; i < 8; i++)
+    {
+        if (v == constants[i])
+        {
+            return i;
+        }
+    }
+    return -1;
+}
+
+/* Mandatory precision suffix for CPDO ops (S/D/E -> 0/1/2, packed as
+   bit7 for D and bit19 for E by the caller). */
+static _kernel_oserror *parse_fpa_precision(const uint8_t *text, size_t length, size_t *pos_inout, uint32_t *out_prec)
+{
+    uint8_t ch;
+
+    if (*pos_inout >= length)
+    {
+        return error_bad_fp_precision();
+    }
+    ch = (uint8_t) toupper((int) text[*pos_inout]);
+    if (ch == 'S') { *out_prec = 0; }
+    else if (ch == 'D') { *out_prec = 1; }
+    else if (ch == 'E') { *out_prec = 2; }
+    else { return error_bad_fp_precision(); }
+    *pos_inout += 1;
+    return NULL;
+}
+
+/* Mandatory precision suffix for CPDT (LDF/STF) ops: S/D/E/P -> 0/1/2/3. */
+static _kernel_oserror *parse_fpa_precision_dt(const uint8_t *text, size_t length, size_t *pos_inout, uint32_t *out_prec)
+{
+    uint8_t ch;
+
+    if (*pos_inout >= length)
+    {
+        return error_bad_fp_precision();
+    }
+    ch = (uint8_t) toupper((int) text[*pos_inout]);
+    if (ch == 'S') { *out_prec = 0; }
+    else if (ch == 'D') { *out_prec = 1; }
+    else if (ch == 'E') { *out_prec = 2; }
+    else if (ch == 'P') { *out_prec = 3; }
+    else { return error_bad_fp_precision(); }
+    *pos_inout += 1;
+    return NULL;
+}
+
+/* Optional rounding-mode suffix: P/M/Z -> 1/2/3 (0 = round to
+   nearest, the default when no letter is present). */
+static uint32_t parse_fpa_rounding(const uint8_t *text, size_t length, size_t *pos_inout)
+{
+    uint8_t ch;
+
+    if (*pos_inout >= length)
+    {
+        return 0;
+    }
+    ch = (uint8_t) toupper((int) text[*pos_inout]);
+    if (ch == 'P') { *pos_inout += 1; return 1; }
+    if (ch == 'M') { *pos_inout += 1; return 2; }
+    if (ch == 'Z') { *pos_inout += 1; return 3; }
+    return 0;
+}
+
+/* Fd|Fn, then either Fm or #imm (the 8-constant table form). Shared
+   by THREEOP/TWOOP/CMF/CNF's final operand. */
+static _kernel_oserror *parse_fpa_operand2(assemble_context_t *context,
+                                            const uint8_t *text, size_t length, size_t *pos_inout,
+                                            uint32_t *out_field)
+{
+    size_t pos = *pos_inout;
+
+    pos += assemble_skip_spaces(text + pos, length - pos);
+    if (pos < length && text[pos] == '#')
+    {
+        assemble_value_t value;
+        size_t consumed;
+        _kernel_oserror *error;
+        int index;
+
+        pos += 1;
+        error = eval_expr(context, text + pos, length - pos, &value, &consumed);
+        if (error != NULL) return error;
+        pos += consumed;
+        index = fpa_immediate_index(&value);
+        if (index < 0) return error_bad_fp_immediate();
+        *out_field = 0x8u | (uint32_t) index;
+        *pos_inout = pos;
+        return NULL;
+    }
+    else
+    {
+        uint32_t fm;
+        _kernel_oserror *error;
+
+        error = parse_fp_register(context, text, length, &pos, &fm);
+        if (error != NULL) return error;
+        *out_field = fm;
+        *pos_inout = pos;
+        return NULL;
+    }
+}
+
+/* ADF/MUF/SUF/... Fd,Fn,Fm|#imm and MVF/MNF/ABS/... Fd,Fm|#imm
+   (monadic -- 'is_monadic' skips the Fn operand and sets bit15). */
+static _kernel_oserror *encode_fpa_threeop_twoop(assemble_context_t *context, const fpa_mnemonic_entry_t *entry,
+                                                  uint32_t cond, uint32_t prec, uint32_t round,
+                                                  const uint8_t *text, size_t length, size_t pos,
+                                                  int is_monadic, uint32_t *out_instr)
+{
+    uint32_t fd, fn = 0, op2;
+    _kernel_oserror *error;
+
+    error = parse_fp_register(context, text, length, &pos, &fd);
+    if (error != NULL) return error;
+    error = expect_char(text, length, &pos, ',');
+    if (error != NULL) return error;
+    if (!is_monadic)
+    {
+        error = parse_fp_register(context, text, length, &pos, &fn);
+        if (error != NULL) return error;
+        error = expect_char(text, length, &pos, ',');
+        if (error != NULL) return error;
+    }
+    error = parse_fpa_operand2(context, text, length, &pos, &op2);
+    if (error != NULL) return error;
+    error = check_trailing(text, length, pos);
+    if (error != NULL) return error;
+
+    *out_instr = (cond << 28) | 0x0E000100u | (entry->opcode << 20) | (fn << 16) | (fd << 12) |
+                 (round << 5) | ((prec == 1) ? (1u << 7) : 0) | ((prec == 2) ? (1u << 19) : 0) |
+                 (is_monadic ? (1u << 15) : 0) | op2;
+    return NULL;
+}
+
+/* FIX Rd,Fm{,round} -- float to integer, no precision suffix. */
+static _kernel_oserror *encode_fpa_fix(assemble_context_t *context, const fpa_mnemonic_entry_t *entry,
+                                        uint32_t cond, uint32_t round,
+                                        const uint8_t *text, size_t length, size_t pos,
+                                        uint32_t *out_instr)
+{
+    uint32_t rd, fm;
+    _kernel_oserror *error;
+
+    (void) entry;
+    error = parse_register(context, text, length, &pos, &rd);
+    if (error != NULL) return error;
+    error = expect_char(text, length, &pos, ',');
+    if (error != NULL) return error;
+    error = parse_fp_register(context, text, length, &pos, &fm);
+    if (error != NULL) return error;
+    error = check_trailing(text, length, pos);
+    if (error != NULL) return error;
+
+    *out_instr = (cond << 28) | 0x0E100110u | (round << 5) | (rd << 12) | fm;
+    return NULL;
+}
+
+/* FLT Fn,Rd{,prec}{,round} -- integer to float. */
+static _kernel_oserror *encode_fpa_flt(assemble_context_t *context, const fpa_mnemonic_entry_t *entry,
+                                        uint32_t cond, uint32_t prec, uint32_t round,
+                                        const uint8_t *text, size_t length, size_t pos,
+                                        uint32_t *out_instr)
+{
+    uint32_t fn, rd;
+    _kernel_oserror *error;
+
+    (void) entry;
+    error = parse_fp_register(context, text, length, &pos, &fn);
+    if (error != NULL) return error;
+    error = expect_char(text, length, &pos, ',');
+    if (error != NULL) return error;
+    error = parse_register(context, text, length, &pos, &rd);
+    if (error != NULL) return error;
+    error = check_trailing(text, length, pos);
+    if (error != NULL) return error;
+
+    *out_instr = (cond << 28) | 0x0E000110u | (fn << 16) | (rd << 12) | (round << 5) |
+                 ((prec == 1) ? (1u << 7) : 0) | ((prec == 2) ? (1u << 19) : 0);
+    return NULL;
+}
+
+/* WFS/RFS/WFC/RFC Rd -- write/read the FPA status/control register. */
+static _kernel_oserror *encode_fpa_wrfsc(assemble_context_t *context, const fpa_mnemonic_entry_t *entry,
+                                          uint32_t cond,
+                                          const uint8_t *text, size_t length, size_t pos,
+                                          uint32_t *out_instr)
+{
+    uint32_t rd;
+    _kernel_oserror *error;
+
+    error = parse_register(context, text, length, &pos, &rd);
+    if (error != NULL) return error;
+    error = check_trailing(text, length, pos);
+    if (error != NULL) return error;
+
+    *out_instr = (cond << 28) | 0x0E000110u | (entry->opcode << 20) | (rd << 12);
+    return NULL;
+}
+
+/* CMF/CNF Fn,Fm|#imm -- compare, result to condition flags (no Fd). */
+static _kernel_oserror *encode_fpa_cmf_cnf(assemble_context_t *context, const fpa_mnemonic_entry_t *entry,
+                                            uint32_t cond,
+                                            const uint8_t *text, size_t length, size_t pos,
+                                            uint32_t *out_instr)
+{
+    uint32_t fn, op2;
+    _kernel_oserror *error;
+
+    error = parse_fp_register(context, text, length, &pos, &fn);
+    if (error != NULL) return error;
+    error = expect_char(text, length, &pos, ',');
+    if (error != NULL) return error;
+    error = parse_fpa_operand2(context, text, length, &pos, &op2);
+    if (error != NULL) return error;
+    error = check_trailing(text, length, pos);
+    if (error != NULL) return error;
+
+    *out_instr = (cond << 28) | 0x0E000110u | (entry->opcode << 20) | (0xFu << 12) | (fn << 16) | op2;
+    return NULL;
+}
+
+/* LDF/STF Fd,[address]{,prec} -- same word-aligned +-1020 addressing
+   as the generic coprocessor LDC/STC. */
+static _kernel_oserror *encode_fpa_ldf_stf(assemble_context_t *context, const fpa_mnemonic_entry_t *entry,
+                                            uint32_t cond, uint32_t prec,
+                                            const uint8_t *text, size_t length, size_t pos,
+                                            uint32_t *out_instr)
+{
+    uint32_t fd;
+    uint32_t bits = 0;
+    _kernel_oserror *error;
+
+    error = parse_fp_register(context, text, length, &pos, &fd);
+    if (error != NULL) return error;
+    error = expect_char(text, length, &pos, ',');
+    if (error != NULL) return error;
+
+    error = expect_char(text, length, &pos, '[');
+    if (error != NULL) return error;
+    {
+        uint32_t rn;
+
+        error = parse_register(context, text, length, &pos, &rn);
+        if (error != NULL) return error;
+        bits |= rn << 16;
+    }
+    pos += assemble_skip_spaces(text + pos, length - pos);
+    if (pos < length && text[pos] == ']')
+    {
+        pos += 1;
+        pos += assemble_skip_spaces(text + pos, length - pos);
+        if (pos < length && text[pos] == ',')
+        {
+            int32_t value;
+
+            bits |= (1u << 23); /* U (post-indexed, offset follows) */
+            pos += 1;
+            error = expect_char(text, length, &pos, '#');
+            if (error != NULL) return error;
+            error = eval_numeric(context, text, length, &pos, &value);
+            if (error != NULL) return error;
+            if (value < 0) { bits &= ~(1u << 23); value = -value; }
+            if ((value & 3) != 0 || value > 0x3FC) return error_bad_offset();
+            bits |= (uint32_t) (value >> 2);
+        }
+        else
+        {
+            /* "[Rn]" with nothing else: pre-indexed, implicit #0. */
+            bits |= (1u << 24) | (1u << 23); /* P, U */
+        }
+    }
+    else
+    {
+        int32_t value;
+
+        bits |= (1u << 24) | (1u << 23); /* P, U */
+        error = expect_char(text, length, &pos, ',');
+        if (error != NULL) return error;
+        error = expect_char(text, length, &pos, '#');
+        if (error != NULL) return error;
+        error = eval_numeric(context, text, length, &pos, &value);
+        if (error != NULL) return error;
+        if (value < 0) { bits &= ~(1u << 23); value = -value; }
+        if ((value & 3) != 0 || value > 0x3FC) return error_bad_offset();
+        bits |= (uint32_t) (value >> 2);
+        error = expect_char(text, length, &pos, ']');
+        if (error != NULL) return error;
+        pos += assemble_skip_spaces(text + pos, length - pos);
+        if (pos < length && text[pos] == '!')
+        {
+            pos += 1;
+            bits |= (1u << 21); /* W */
+        }
+    }
+    error = check_trailing(text, length, pos);
+    if (error != NULL) return error;
+
+    *out_instr = (cond << 28) | 0x0C000100u | (entry->opcode << 20) | bits | (fd << 12) |
+                 ((prec & 1) ? (1u << 15) : 0) | ((prec & 2) ? (1u << 22) : 0);
+    return NULL;
+}
+
+/*******************************************************************
+ Function:      handle_fpa
+ Description:   Parses and encodes a full FPA instruction, starting
+                just after the matched 3-character root.
+ Parameters:    context = the assembly context
+                text/length = full source text
+                pos_inout = [[inout]] position, just after the root
+                entry = the matched fpa_mnemonic_table entry
+                out_instr = [[out]] the completed instruction word
+ Returns:       NULL if successful, otherwise a static error block
+ ******************************************************************/
+static _kernel_oserror *handle_fpa(assemble_context_t *context,
+                                    const uint8_t *text, size_t length, size_t *pos_inout,
+                                    const fpa_mnemonic_entry_t *entry, uint32_t *out_instr)
+{
+    size_t pos = *pos_inout;
+    uint32_t cond = COND_AL;
+    uint32_t prec = 0, round = 0;
+    _kernel_oserror *error;
+
+    if (match_condition(text + pos, length - pos, &cond))
+    {
+        pos += 2;
+    }
+
+    switch (entry->family)
+    {
+        case FPA_THREEOP:
+            error = parse_fpa_precision(text, length, &pos, &prec);
+            if (error != NULL) return error;
+            round = parse_fpa_rounding(text, length, &pos);
+            error = encode_fpa_threeop_twoop(context, entry, cond, prec, round, text, length, pos, 0, out_instr);
+            break;
+        case FPA_TWOOP:
+            error = parse_fpa_precision(text, length, &pos, &prec);
+            if (error != NULL) return error;
+            round = parse_fpa_rounding(text, length, &pos);
+            error = encode_fpa_threeop_twoop(context, entry, cond, prec, round, text, length, pos, 1, out_instr);
+            break;
+        case FPA_FIX:
+            round = parse_fpa_rounding(text, length, &pos);
+            error = encode_fpa_fix(context, entry, cond, round, text, length, pos, out_instr);
+            break;
+        case FPA_FLT:
+            error = parse_fpa_precision(text, length, &pos, &prec);
+            if (error != NULL) return error;
+            round = parse_fpa_rounding(text, length, &pos);
+            error = encode_fpa_flt(context, entry, cond, prec, round, text, length, pos, out_instr);
+            break;
+        case FPA_WRFSC:
+            error = encode_fpa_wrfsc(context, entry, cond, text, length, pos, out_instr);
+            break;
+        case FPA_CMF_CNF:
+            error = encode_fpa_cmf_cnf(context, entry, cond, text, length, pos, out_instr);
+            break;
+        case FPA_LDF_STF:
+        default:
+            error = parse_fpa_precision_dt(text, length, &pos, &prec);
+            if (error != NULL) return error;
+            error = encode_fpa_ldf_stf(context, entry, cond, prec, text, length, pos, out_instr);
+            break;
+    }
+    return error;
+}
+
 /*******************************************************************
  Function:      assemble_arm32_line
  Description:   see h/assemble_arm32
@@ -3699,6 +4204,38 @@ _kernel_oserror *assemble_arm32_line(assemble_context_t *context,
             return error;
         }
         return assemble_emit_dword(context, ASSEMBLE_CPU_ARM32, instr);
+    }
+
+    {
+        const fpa_mnemonic_entry_t *fpa_entry = find_fpa_root(mnemonic);
+
+        if (fpa_entry != NULL)
+        {
+            uint32_t instr;
+            size_t opstart = pos + 3;
+
+            if (!(context->opt & ASSEMBLE_ARM32_OPT_FPA))
+            {
+                return assemble_set_error(ASSEMBLE_CPU_ARM32, ASSEMBLE_ERROR_TYPE_UNSUPPORTED_ON_VARIANT,
+                                           ASSEMBLE_ARM32_ERR_NONE,
+                                           "FPA mnemonic used without ASSEMBLE_ARM32_OPT_FPA set");
+            }
+            if (have_label)
+            {
+                assemble_value_t value;
+
+                value.type = ASSEMBLE_VALUE_INTEGER;
+                value.value.as_integer = (int32_t) context->address;
+                error = assign_label(context, label, label_length, &value);
+                if (error != NULL) return error;
+            }
+            error = handle_fpa(context, line, line_length, &opstart, fpa_entry, &instr);
+            if (error != NULL)
+            {
+                return error;
+            }
+            return assemble_emit_dword(context, ASSEMBLE_CPU_ARM32, instr);
+        }
     }
 
     if (strcmp(mnemonic, "EQU") == 0)
