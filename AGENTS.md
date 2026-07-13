@@ -21,7 +21,7 @@ Five backends exist today:
 | 6809         | `h/assemble_6809`, `c/assemble_6809`       | 6809 (single dialect)            |
 | x86-64       | `h/assemble_x86_64`, `c/assemble_x86_64`   | x86-64, limited (see below)      |
 | Z80          | `h/assemble_z80`, `c/assemble_z80`         | Z80, including common undocumented forms |
-| ARM32        | `h/assemble_arm32`, `c/assemble_arm32`     | base ARM (ARMv4-ARMv8 AArch32 subset) + legacy FPA (dialect via OPT bits); VFP/NEON is a separate follow-on backend, not yet added (see below) |
+| ARM32        | `h/assemble_arm32`, `c/assemble_arm32`     | base ARM (ARMv4-ARMv8 AArch32 subset) + legacy FPA + classic VFP scalar (dialect via OPT bits); NEON/SIMD is a separate follow-on backend, not yet added (see below) |
 
 Shared infrastructure lives in `h/assemble_common` / `c/assemble_common`.
 
@@ -228,7 +228,13 @@ on a fixed 3-character root and handed to a dedicated parser in
 root+condition+[S] mnemonic table used for everything else. The legacy
 FPA arithmetic/load-store mnemonics (see below) follow the same pattern,
 but with *two* extra suffixes after the condition: a mandatory precision
-letter and an optional rounding-mode letter, eg `ADFEQDP`.
+letter and an optional rounding-mode letter, eg `ADFEQDP`. VFP mnemonics
+(see further below) are the odd one out in the *other* direction: UAL
+syntax separates the condition from the `.F32`/`.F64` datatype suffix
+with a literal `.`, so `read_token` naturally stops there and VFP
+mnemonics go through the *ordinary* generic mnemonic table after all —
+each VFP family encoder just parses its own `.` suffix from the operand
+text that follows.
 
 Known, deliberate gaps in base ARM32 (not silently dropped — each raises
 "Mnemonic not recognised"): the ARMv5TE/v6 'xy' DSP multiply family
@@ -249,8 +255,41 @@ coprocessor LDC/STC (a separate, structurally similar parse in each of
 `encode_fpa_ldf_stf` and `handle_coprocessor` — not literally shared
 code, since the "bare `[Rn]`" pre/post-indexed distinction was a bug
 fixed in both places together; see the git history if extending either).
-VFP/NEON support is a separate follow-on backend layered on top of this
-one (not yet added), gated by `ASSEMBLE_ARM32_OPT_VFP` once it lands.
+Classic VFPv2/VFPv3 scalar (`VMOV`/`VADD`/`VSUB`/`VMUL`/`VMLA`/`VMLS`/
+`VNMLA`/`VNMLS`/`VNMUL`/`VDIV`/`VABS`/`VNEG`/`VSQRT`/`VCMP`/`VCMPE`/`VLDR`/
+`VSTR`/`VLDMIA`/`VLDMDB`/`VSTMIA`/`VSTMDB`/`VPUSH`/`VPOP`/`VMRS`/`VMSR`) is
+implemented, gated by `ASSEMBLE_ARM32_OPT_VFP` — the `mnemonic_entry_t`
+table gained a `requires_opt` field for this (0 for everything not
+dialect-gated), checked once in `assemble_arm32_line` right after
+`match_mnemonic()` succeeds, alongside the FPA dialect check. `VMOV` is
+special: it's the *same* literal root for both the register-register
+form (`VMOV.F64 Dd,Dm`, needs a `.`) and the ARM-core-register transfer
+form (`VMOV Sn,Rt`/`VMOV Rt,Sn`, no `.`), so a single table entry maps to
+`encode_vfp_mov_reg`, which peeks for a following `.` and delegates to
+`encode_vfp_mov_core` if there isn't one — two table entries sharing one
+root would silently shadow each other in `match_mnemonic()`'s
+longest-match logic, since both roots are identical length.
+
+Known, deliberate gaps in VFP (not silently dropped): `VCVT` (all forms
+— integer/fixed-point/half-precision conversions) is omitted because its
+real encoding packs signedness and rounding-mode selection across
+non-adjacent bits in a way that couldn't be pinned down to the same
+confidence as the rest of this port without a live reference; so are the
+`VMOV`-immediate and two-core-register (`VMOV Rt,Rt2,Sm,Sm+1`) forms.
+NEON/SIMD and the ARMv8-only VFP additions (`VRINT*`, `VSEL*`,
+`VMAXNM`/`VMINNM`, directed-rounding `VCVT`) are a much larger separate
+follow-on piece (not yet added) — per a 2026-07 reconnaissance pass over
+`VFPLib/VFPLib`'s ~540 generated syntax patterns, roughly 83% of the full
+VFP+NEON+ARMv8 pattern count is NEON/SIMD, spread across an estimated
+75-90 "instruction family" implementations versus the ~20 covered here,
+and several of the remaining families (`VMOV`/`VMVN`'s immediate `cmode`
+table, shift-immediate bitfield formulas, datatype-conditional structure-
+load alignment) are meaningfully higher-risk to get bit-exact than
+anything ported so far — deliberately deferred to its own session rather
+than rushed. `VLDR`/`VSTR` use the same word-aligned ±1020-byte
+addressing shape as the generic coprocessor LDC/STC and FPA LDF/STF (see
+above) — a third structurally similar but separate parse, in
+`encode_vfp_ldr_str`.
 
 ## Source material handling
 

@@ -458,6 +458,55 @@ static const uint8_t     bytes_stc[] = { 0x01, 0x01, 0x81, 0xED }; /* ED810101 *
 static const char *const lines_ldc_bare[] = { "LDC CP1,C0,[R1]", NULL };
 static const uint8_t     bytes_ldc_bare[] = { 0x00, 0x01, 0x91, 0xED }; /* ED910100 */
 
+static const char *const lines_vfp_disabled[] = { "VADD.F32 S0,S1,S2", NULL };
+
+static const char *const lines_vmov_reg[] = { "VMOV.F64 D0,D1", NULL };
+static const uint8_t     bytes_vmov_reg[] = { 0x41, 0x0B, 0xB0, 0xEE }; /* EEB00B41 */
+
+static const char *const lines_vmov_to_vfp[] = { "VMOV S0,R0", NULL };
+static const uint8_t     bytes_vmov_to_vfp[] = { 0x10, 0x0A, 0x00, 0xEE }; /* EE000A10 */
+
+static const char *const lines_vmov_to_arm[] = { "VMOV R0,S0", NULL };
+static const uint8_t     bytes_vmov_to_arm[] = { 0x10, 0x0A, 0x10, 0xEE }; /* EE100A10 */
+
+static const char *const lines_vadd[] = { "VADD.F32 S0,S1,S2", NULL };
+static const uint8_t     bytes_vadd[] = { 0x81, 0x0A, 0x30, 0xEE }; /* EE300A81 */
+
+static const char *const lines_vsub[] = { "VSUB.F32 S0,S1,S2", NULL };
+static const uint8_t     bytes_vsub[] = { 0xC1, 0x0A, 0x30, 0xEE }; /* EE300AC1 */
+
+static const char *const lines_vabs[] = { "VABS.F64 D0,D1", NULL };
+static const uint8_t     bytes_vabs[] = { 0xC1, 0x0B, 0xB0, 0xEE }; /* EEB00BC1 */
+
+static const char *const lines_vcmp[] = { "VCMP.F32 S0,S1", NULL };
+static const uint8_t     bytes_vcmp[] = { 0x60, 0x0A, 0xB4, 0xEE }; /* EEB40A60 */
+
+static const char *const lines_vcmp_zero[] = { "VCMP.F32 S0,#0", NULL };
+static const uint8_t     bytes_vcmp_zero[] = { 0x40, 0x0A, 0xB5, 0xEE }; /* EEB50A40 */
+
+static const char *const lines_vldr[] = { "VLDR.F64 D0,[R1]", NULL };
+static const uint8_t     bytes_vldr[] = { 0x00, 0x0B, 0xB1, 0xED }; /* EDB10B00 */
+
+static const char *const lines_vstr[] = { "VSTR.F32 S0,[R1,#4]", NULL };
+static const uint8_t     bytes_vstr[] = { 0x01, 0x0A, 0xA1, 0xED }; /* EDA10A01 */
+
+static const char *const lines_vldm[] = { "VLDMIA R0!,{D0-D1}", NULL };
+static const uint8_t     bytes_vldm[] = { 0x04, 0x0B, 0x90, 0xEC }; /* EC900B04 */
+
+static const char *const lines_vpush[] = { "VPUSH {D0-D1}", NULL };
+static const uint8_t     bytes_vpush[] = { 0x04, 0x0B, 0x2D, 0xED }; /* ED2D0B04 */
+
+static const char *const lines_vpop[] = { "VPOP {D0-D1}", NULL };
+static const uint8_t     bytes_vpop[] = { 0x04, 0x0B, 0xBD, 0xEC }; /* ECBD0B04 */
+
+static const char *const lines_vmrs[] = { "VMRS R0,FPSCR", NULL };
+static const uint8_t     bytes_vmrs[] = { 0x10, 0x0A, 0xF1, 0xEE }; /* EEF10A10 */
+
+static const char *const lines_vmsr[] = { "VMSR FPSCR,R0", NULL };
+static const uint8_t     bytes_vmsr[] = { 0x10, 0x0A, 0xE1, 0xEE }; /* EEE10A10 */
+
+static const char *const lines_vfp_mismatched_prec[] = { "VADD.F32 S0,D1,S2", NULL };
+
 static const test_case_t tests[] = {
     { "MOV Rd,#imm",                   lines_mov_imm,          0, bytes_mov_imm,          sizeof(bytes_mov_imm),          0 },
     { "MOVS Rd,Rm",                    lines_mov_reg,          0, bytes_mov_reg,          sizeof(bytes_mov_reg),          0 },
@@ -507,7 +556,25 @@ static const test_case_t tests[] = {
     { "CDP coproc,#op1,CRd,CRn,CRm",   lines_cdp,              0, bytes_cdp,              sizeof(bytes_cdp),              0 },
     { "MCR coproc,#op1,Rd,CRn,CRm,#op2", lines_mcr,            0, bytes_mcr,              sizeof(bytes_mcr),              0 },
     { "STC coproc,CRd,[Rn,#imm]",      lines_stc,              0, bytes_stc,              sizeof(bytes_stc),              0 },
-    { "LDC coproc,CRd,[Rn] (bare, regression)", lines_ldc_bare, 0, bytes_ldc_bare,         sizeof(bytes_ldc_bare),         0 }
+    { "LDC coproc,CRd,[Rn] (bare, regression)", lines_ldc_bare, 0, bytes_ldc_bare,         sizeof(bytes_ldc_bare),         0 },
+
+    { "VFP mnemonic without OPT_VFP is rejected", lines_vfp_disabled, 0, NULL, 0, 1, 0 },
+    { "VMOV.F64 Dd,Dm",                lines_vmov_reg,         0, bytes_vmov_reg,         sizeof(bytes_vmov_reg),         0, ASSEMBLE_ARM32_OPT_VFP },
+    { "VMOV Sn,Rt (to VFP)",           lines_vmov_to_vfp,      0, bytes_vmov_to_vfp,      sizeof(bytes_vmov_to_vfp),      0, ASSEMBLE_ARM32_OPT_VFP },
+    { "VMOV Rt,Sn (to ARM)",           lines_vmov_to_arm,      0, bytes_vmov_to_arm,      sizeof(bytes_vmov_to_arm),      0, ASSEMBLE_ARM32_OPT_VFP },
+    { "VADD.F32 Sd,Sn,Sm",             lines_vadd,             0, bytes_vadd,             sizeof(bytes_vadd),             0, ASSEMBLE_ARM32_OPT_VFP },
+    { "VSUB.F32 Sd,Sn,Sm",             lines_vsub,             0, bytes_vsub,             sizeof(bytes_vsub),             0, ASSEMBLE_ARM32_OPT_VFP },
+    { "VABS.F64 Dd,Dm",                lines_vabs,             0, bytes_vabs,             sizeof(bytes_vabs),             0, ASSEMBLE_ARM32_OPT_VFP },
+    { "VCMP.F32 Sd,Sm",                lines_vcmp,             0, bytes_vcmp,             sizeof(bytes_vcmp),             0, ASSEMBLE_ARM32_OPT_VFP },
+    { "VCMP.F32 Sd,#0",                lines_vcmp_zero,        0, bytes_vcmp_zero,        sizeof(bytes_vcmp_zero),        0, ASSEMBLE_ARM32_OPT_VFP },
+    { "VLDR.F64 Dd,[Rn]",              lines_vldr,             0, bytes_vldr,             sizeof(bytes_vldr),             0, ASSEMBLE_ARM32_OPT_VFP },
+    { "VSTR.F32 Sd,[Rn,#imm]",         lines_vstr,             0, bytes_vstr,             sizeof(bytes_vstr),             0, ASSEMBLE_ARM32_OPT_VFP },
+    { "VLDMIA Rn!,{list}",             lines_vldm,             0, bytes_vldm,             sizeof(bytes_vldm),             0, ASSEMBLE_ARM32_OPT_VFP },
+    { "VPUSH {list}",                  lines_vpush,            0, bytes_vpush,            sizeof(bytes_vpush),            0, ASSEMBLE_ARM32_OPT_VFP },
+    { "VPOP {list}",                   lines_vpop,             0, bytes_vpop,             sizeof(bytes_vpop),             0, ASSEMBLE_ARM32_OPT_VFP },
+    { "VMRS Rt,FPSCR",                 lines_vmrs,             0, bytes_vmrs,             sizeof(bytes_vmrs),             0, ASSEMBLE_ARM32_OPT_VFP },
+    { "VMSR FPSCR,Rt",                 lines_vmsr,             0, bytes_vmsr,             sizeof(bytes_vmsr),             0, ASSEMBLE_ARM32_OPT_VFP },
+    { "VFP operands must all be one precision", lines_vfp_mismatched_prec, 0, NULL, 0, 1, ASSEMBLE_ARM32_OPT_VFP }
 };
 
 int run_tests_arm32(void)

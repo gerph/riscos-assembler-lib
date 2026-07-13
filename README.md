@@ -20,7 +20,7 @@ interface is designed to make that straightforward for a future caller.
 | 6809    | `h.assemble_6809`  | `c.assemble_6809`     | 6809                                          |
 | x86-64  | `h.assemble_x86_64`| `c.assemble_x86_64`   | x86-64 (limited subset, see below)            |
 | Z80     | `h.assemble_z80`   | `c.assemble_z80`      | Z80 (including common undocumented forms)     |
-| ARM32   | `h.assemble_arm32` | `c.assemble_arm32`    | Base ARM (ARMv4 through the AArch32 subset of ARMv8) + legacy FPA (dialect via `opt` bits); VFP/NEON is a separate follow-on backend, not yet added |
+| ARM32   | `h.assemble_arm32` | `c.assemble_arm32`    | Base ARM (ARMv4 through the AArch32 subset of ARMv8) + legacy FPA + classic VFP scalar (dialect via `opt` bits); NEON/SIMD is a separate follow-on backend, not yet added |
 
 Shared infrastructure (the assembly context, error reporting, byte/word
 emission helpers) lives in `h.assemble_common` / `c.assemble_common`.
@@ -206,23 +206,30 @@ literal's raw bytes as immediate data still works.
 
 ### Known limitation: ARM32
 
-Base ARM32 and legacy FPA are implemented; VFP/NEON mnemonics are planned
-as a separate follow-on backend, gated by `ASSEMBLE_ARM32_OPT_VFP` once
-added. Within base ARM32, the ARMv5TE/v6 'xy' DSP multiply family
-(`SMLABB`, `SMLAWx`, `SMUAD`, `SMLAD`, `SMLALD` and friends),
-`SMMLA`/`SMMLS`/`SMMUL`, `MRRC`/`MCRR`, the ARMv8 `LDA`/`STL`/`LDAEX`/
-`STLEX` load-acquire/store-release family, and the banked-register form
-of `MSR`/`MRS` (hypervisor-mode register access) are not yet implemented
-and raise "Mnemonic not recognised". Within FPA, `LFM`/`SFM` (multiple-
-register stack transfer) are omitted for the same reason — see
-`AGENTS.md` for detail.
+Base ARM32, legacy FPA and classic VFP scalar are implemented; NEON/SIMD
+and ARMv8-only VFP additions (`VRINT*`, `VSEL*`, `VMAXNM`/`VMINNM`,
+directed-rounding `VCVT`) are a separate, larger follow-on backend, gated
+by `ASSEMBLE_ARM32_OPT_VFP` once added (the same OPT bit already gates
+the classic VFP scalar support below — NEON extends the same dialect
+rather than adding a new one). Within base ARM32, the ARMv5TE/v6 'xy' DSP
+multiply family (`SMLABB`, `SMLAWx`, `SMUAD`, `SMLAD`, `SMLALD` and
+friends), `SMMLA`/`SMMLS`/`SMMUL`, `MRRC`/`MCRR`, the ARMv8 `LDA`/`STL`/
+`LDAEX`/`STLEX` load-acquire/store-release family, and the banked-register
+form of `MSR`/`MRS` (hypervisor-mode register access) are not yet
+implemented and raise "Mnemonic not recognised". Within FPA, `LFM`/`SFM`
+(multiple-register stack transfer) are omitted for the same reason.
+Within VFP, `VCVT` (all forms) and the `VMOV`-immediate and two-core-
+register transfer forms are omitted — see `AGENTS.md` for detail on all
+of these.
 
 A syntax quirk worth knowing: unlike every other ARM mnemonic, `LDR`,
 `STR`, `LDM`, `STM`, `SWP`, the long-multiply family (`UMULL`/`UMLAL`/
 `SMULL`/`SMLAL`), the generic coprocessor instructions (`CDP`, `MCR`,
 `MRC`, `LDC`, `STC`) and the FPA mnemonics all write their size,
 addressing-mode or precision suffix **after** the condition code —
-`LDREQB`, not `LDRBEQ`; `ADFEQDP`, not `ADFDPEQ`.
+`LDREQB`, not `LDRBEQ`; `ADFEQDP`, not `ADFDPEQ`. VFP mnemonics instead
+separate the condition from a `.F32`/`.F64` datatype suffix with a dot,
+following normal UAL syntax — `VADDEQ.F64`, not `VADD.F64EQ`.
 
 ### FPA dialect: `ASSEMBLE_ARM32_OPT_FPA`
 
@@ -240,6 +247,27 @@ default is round to nearest) — eg `ADFD F0,F1,F2`, `ADFDP F0,F1,F2`.
 `LDF`/`STF` take the same precision letters plus `P` (packed decimal).
 Immediate operands (`#imm`) must be exactly one of the 8 constants the
 hardware supports: `0, 1, 2, 3, 4, 5, 0.5, 10`.
+
+### VFP dialect: `ASSEMBLE_ARM32_OPT_VFP`
+
+Classic VFPv2/VFPv3 scalar mnemonics (`VMOV`, `VADD`, `VSUB`, `VMUL`,
+`VMLA`, `VMLS`, `VNMLA`, `VNMLS`, `VNMUL`, `VDIV`, `VABS`, `VNEG`, `VSQRT`,
+`VCMP`, `VCMPE`, `VLDR`, `VSTR`, `VLDMIA`/`VLDMDB`/`VSTMIA`/`VSTMDB`,
+`VPUSH`, `VPOP`, `VMRS`, `VMSR`) are only recognised when `context->opt`
+has `ASSEMBLE_ARM32_OPT_VFP` (bit 5) set, with the same
+"UNSUPPORTED_ON_VARIANT vs mnemonic-not-recognised" distinction as FPA.
+VFP registers are written `S0`-`S31` (single-precision) or `D0`-`D31`
+(double-precision) and, unlike FPA, operands are not required to be a
+single register class across a whole instruction stream — but every
+register *within one instruction* must be the same precision, matching
+the datatype suffix (`ADD.F32 S0,D1,S2` is rejected). Most arithmetic
+and comparison mnemonics need a mandatory `.F32`/`.F64` datatype suffix
+written **after** the condition code, UAL-style — eg `VADDEQ.F64
+D0,D1,D2`. `VMOV` between an ARM core register and a single-precision
+register (`VMOV S0,R0` / `VMOV R0,S0`) takes no datatype suffix at all;
+the encoder tells the two `VMOV` forms apart by whether a `.` follows.
+`VCMP`/`VCMPE` additionally accept `#0` (or `#0.0`) in place of the
+second register, comparing against zero.
 
 ### Platform constraint: no 64-bit integer type
 
