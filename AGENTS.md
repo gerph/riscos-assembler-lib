@@ -27,10 +27,18 @@ Shared infrastructure lives in `h/assemble_common` / `c/assemble_common`.
 
 ```
 riscos-amu                # 32-bit build
-riscos-amu BUILD64=1      # 64-bit build (compile-check only in this
-                           # environment; 64-bit AIFs aren't runnable here)
-riscos-build-run aif32 --command "run aif32.Assemble"   # run all self-tests
+riscos-amu BUILD64=1      # 64-bit build
+
+riscos-build-run aif32 --command "run aif32.Assemble"          # run all self-tests, 32-bit (aarch32)
+riscos-build-run --64 aif64 --command "run aif64.Assemble"     # run all self-tests, 64-bit (aarch64)
 ```
+
+`riscos-build-run` defaults to an aarch32 (32-bit) system, which can't
+execute a 64-bit AIF — pass `--64`/`--64bit` (shorthand for `--arch
+aarch64`) to run one on an aarch64 system instead. Both architectures run
+the full test suite and should show identical pass counts; run both when
+changing anything that could plausibly behave differently by word size
+(pointer-sized types, the no-64-bit-integer workarounds below, etc).
 
 There is no separate test runner — `c/main` calls `run_tests()` /
 `run_tests_6809()` / `run_tests_x86_64()` in sequence and returns the total
