@@ -1012,6 +1012,12 @@ typedef enum instr_family
     FAMILY_NEON_VEXT,           /* Dd/Qd,Dn/Qn,Dm/Qm,#imm -- VEXT (byte-offset extract) */
     FAMILY_NEON_TBL,            /* Dd,(register list),Dm -- VTBL VTBX (table lookup/extend) */
 
+    /* Structure load/store, "multiple" form only (ARM DDI 0406C
+       A7.7/A7.9, the "VLD1/VLD2/VLD3/VLD4" and "VST1..4" tables) --
+       (register list),[Rn{@align}]{!}{,Rm}. The single-lane and
+       single-all-lanes forms are not implemented; see AGENTS.md. */
+    FAMILY_NEON_LDST_MULTIPLE,  /* VLD1 VLD2 VLD3 VLD4 VST1 VST2 VST3 VST4 */
+
     FAMILY_NONE         /* unreachable placeholder root, never dispatched */
 } instr_family_t;
 
@@ -1452,7 +1458,18 @@ static const mnemonic_entry_t mnemonic_table[] = {
 
     /* param1: 0=VTBL, 1=VTBX. */
     { "VTBL", FAMILY_NEON_TBL, 0, 0, 0, 0, ASSEMBLE_ARM32_OPT_VFP },
-    { "VTBX", FAMILY_NEON_TBL, 1, 0, 0, 0, ASSEMBLE_ARM32_OPT_VFP }
+    { "VTBX", FAMILY_NEON_TBL, 1, 0, 0, 0, ASSEMBLE_ARM32_OPT_VFP },
+
+    /* param1: bit0=is_load, bits2:1=struct_class (0=1-register,
+       1=2-register, 2=3-register, 3=4-register "unit"). */
+    { "VLD1", FAMILY_NEON_LDST_MULTIPLE, 1u | (0u<<1), 0, 0, 0, ASSEMBLE_ARM32_OPT_VFP },
+    { "VST1", FAMILY_NEON_LDST_MULTIPLE, 0u | (0u<<1), 0, 0, 0, ASSEMBLE_ARM32_OPT_VFP },
+    { "VLD2", FAMILY_NEON_LDST_MULTIPLE, 1u | (1u<<1), 0, 0, 0, ASSEMBLE_ARM32_OPT_VFP },
+    { "VST2", FAMILY_NEON_LDST_MULTIPLE, 0u | (1u<<1), 0, 0, 0, ASSEMBLE_ARM32_OPT_VFP },
+    { "VLD3", FAMILY_NEON_LDST_MULTIPLE, 1u | (2u<<1), 0, 0, 0, ASSEMBLE_ARM32_OPT_VFP },
+    { "VST3", FAMILY_NEON_LDST_MULTIPLE, 0u | (2u<<1), 0, 0, 0, ASSEMBLE_ARM32_OPT_VFP },
+    { "VLD4", FAMILY_NEON_LDST_MULTIPLE, 1u | (3u<<1), 0, 0, 0, ASSEMBLE_ARM32_OPT_VFP },
+    { "VST4", FAMILY_NEON_LDST_MULTIPLE, 0u | (3u<<1), 0, 0, 0, ASSEMBLE_ARM32_OPT_VFP }
 };
 #define NUM_MNEMONICS (sizeof(mnemonic_table) / sizeof(mnemonic_table[0]))
 
@@ -3773,6 +3790,8 @@ static _kernel_oserror *encode_neon_tbl(assemble_context_t *, const mnemonic_ent
                                          const uint8_t *, size_t, size_t, uint32_t *);
 static _kernel_oserror *encode_neon_mov_mvn_imm_impl(assemble_context_t *, uint32_t, int,
                                                       const uint8_t *, size_t, size_t, uint32_t *);
+static _kernel_oserror *encode_neon_ldst_multiple(assemble_context_t *, const mnemonic_entry_t *, uint32_t, int,
+                                                   const uint8_t *, size_t, size_t, uint32_t *);
 
 static family_encoder_fn family_encoder(instr_family_t family)
 {
@@ -3853,6 +3872,7 @@ static family_encoder_fn family_encoder(instr_family_t family)
         case FAMILY_NEON_VDUP:            return encode_neon_vdup;
         case FAMILY_NEON_VEXT:            return encode_neon_vext;
         case FAMILY_NEON_TBL:             return encode_neon_tbl;
+        case FAMILY_NEON_LDST_MULTIPLE:   return encode_neon_ldst_multiple;
         default:                  return NULL;
     }
 }
@@ -7305,5 +7325,217 @@ static _kernel_oserror *encode_neon_tbl(assemble_context_t *context, const mnemo
     split_neon_register(rm, cm, &vm, &mbit);
     *out_instr = 0xF3B00800u | (dbit << 22) | (vn << 16) | (vd << 12) | (len << 8) | (nbit << 7) |
                  ((uint32_t) entry->param1 << 6) | (mbit << 5) | vm;
+    return NULL;
+}
+
+/* ---------------------------------------------------------------
+ * NEON/Advanced SIMD -- structure load/store, "multiple" form only
+ * (ARM DDI 0406C A7.7/A7.9). This is one of three quite different
+ * addressing shapes VLD1-4/VST1-4 support (the others being "single
+ * lane" and "single all lanes"/replicate, neither implemented here --
+ * see AGENTS.md); "multiple" transfers a run of 1-4 D registers as a
+ * sequential (or, for VLD2/VLD3/VLD4, de-interleaved) block, and uses
+ * a much more regular encoding than the other two forms (a plain
+ * 4-bit "type" field and 2-bit size/align fields, no bit-interleaved
+ * lane index).
+ * --------------------------------------------------------------- */
+
+/* Parses "[Rn{@align}]{!}{,Rm}". out_vm is the resulting Vm field
+   value: 0xD (writeback by the transfer size, ie "!" was given with
+   no explicit Rm), 0xF (no writeback), or the parsed Rm register
+   number. out_align is the raw requested alignment in bits (0 if no
+   "@" was given) -- validating and encoding it is the caller's job,
+   since which alignments are legal depends on the register count. */
+static _kernel_oserror *parse_neon_ldst_address(assemble_context_t *context, const uint8_t *text, size_t length,
+                                                 size_t *pos_inout, uint32_t *out_rn, uint32_t *out_align,
+                                                 uint32_t *out_vm)
+{
+    size_t pos = *pos_inout;
+    uint32_t rn, align = 0u, vm;
+    _kernel_oserror *error;
+
+    error = expect_char(text, length, &pos, '[');
+    if (error != NULL) return error;
+    error = parse_register(context, text, length, &pos, &rn);
+    if (error != NULL) return error;
+    pos += assemble_skip_spaces(text + pos, length - pos);
+    if (pos < length && text[pos] == '@')
+    {
+        assemble_value_t value;
+        size_t consumed;
+
+        pos += 1;
+        error = eval_expr(context, text + pos, length - pos, &value, &consumed);
+        if (error != NULL) return error;
+        pos += consumed;
+        align = (uint32_t) value_to_integer(&value);
+        pos += assemble_skip_spaces(text + pos, length - pos);
+    }
+    error = expect_char(text, length, &pos, ']');
+    if (error != NULL) return error;
+
+    pos += assemble_skip_spaces(text + pos, length - pos);
+    if (pos < length && text[pos] == '!')
+    {
+        pos += 1;
+        vm = 0xDu;
+    }
+    else if (pos < length && text[pos] == ',')
+    {
+        pos += 1;
+        error = parse_register(context, text, length, &pos, &vm);
+        if (error != NULL) return error;
+    }
+    else
+    {
+        vm = 0xFu;
+    }
+
+    *out_rn = rn;
+    *out_align = align;
+    *out_vm = vm;
+    *pos_inout = pos;
+    return NULL;
+}
+
+/* Parses "(Dd{,|-}Dd+gap{,|-}...)", 1-4 D registers with a consistent
+   gap of 1 (consecutive) or 2 (the "widely spaced" VLD2/VLD3/VLD4
+   forms that de-interleave into every other register). */
+static _kernel_oserror *parse_neon_reglist_gap(const uint8_t *text, size_t length, size_t *pos_inout,
+                                                uint32_t *out_base, uint32_t *out_count, uint32_t *out_gap)
+{
+    size_t pos = *pos_inout;
+    uint32_t base, count, gap, prev, cur;
+    uint8_t regclass;
+    _kernel_oserror *error;
+
+    error = expect_char(text, length, &pos, '(');
+    if (error != NULL) return error;
+    error = parse_neon_register(text, length, &pos, &base, &regclass);
+    if (error != NULL) return error;
+    if (regclass != 'D') return error_neon_mismatched_size();
+    count = 1u;
+    gap = 1u;
+    prev = base;
+
+    while (1)
+    {
+        size_t peek = pos;
+
+        peek += assemble_skip_spaces(text + peek, length - peek);
+        if (peek < length && (text[peek] == ',' || text[peek] == '-'))
+        {
+            peek += 1;
+            error = parse_neon_register(text, length, &peek, &cur, &regclass);
+            if (error != NULL) return error;
+            if (regclass != 'D') return error_neon_mismatched_size();
+            if (count == 1u)
+            {
+                if (cur <= prev) return error_bad_register_list("Register list must be ascending");
+                gap = cur - prev;
+                if (gap != 1u && gap != 2u)
+                {
+                    return error_bad_register_list("Register list must have a gap of 1 or 2");
+                }
+            }
+            else if (cur != prev + gap)
+            {
+                return error_bad_register_list("Register list must use a consistent gap");
+            }
+            prev = cur;
+            count += 1u;
+            pos = peek;
+            if (count > 4u) return error_bad_register_list("Register list can contain at most 4 registers");
+        }
+        else
+        {
+            break;
+        }
+    }
+    error = expect_char(text, length, &pos, ')');
+    if (error != NULL) return error;
+
+    *out_base = base;
+    *out_count = count;
+    *out_gap = gap;
+    *pos_inout = pos;
+    return NULL;
+}
+
+/* VLD1/VLD2/VLD3/VLD4/VST1/VST2/VST3/VST4 (register list),[Rn{@align}]
+   {!}{,Rm} -- "multiple" structure load/store. entry->param1: bit0=
+   is_load, bits2:1=struct_class (0=VLD1/VST1 .. 3=VLD4/VST4); see
+   FAMILY_NEON_LDST_MULTIPLE in the mnemonic table. */
+static _kernel_oserror *encode_neon_ldst_multiple(assemble_context_t *context, const mnemonic_entry_t *entry,
+                                                    uint32_t cond, int s_flag,
+                                                    const uint8_t *text, size_t length, size_t pos,
+                                                    uint32_t *out_instr)
+{
+    /* [struct_class][slot] = { count, gap, type }; type 0xFF marks an unused slot. */
+    static const uint32_t TYPES[4][4][3] =
+    {
+        { { 1u, 1u, 0x7u }, { 2u, 1u, 0xAu }, { 3u, 1u, 0x6u }, { 4u, 1u, 0x2u } }, /* VLD1/VST1 */
+        { { 2u, 1u, 0x8u }, { 2u, 2u, 0x9u }, { 4u, 1u, 0x3u }, { 0u, 0u, 0xFFu } }, /* VLD2/VST2 */
+        { { 3u, 1u, 0x4u }, { 3u, 2u, 0x5u }, { 0u, 0u, 0xFFu }, { 0u, 0u, 0xFFu } }, /* VLD3/VST3 */
+        { { 4u, 1u, 0x0u }, { 4u, 2u, 0x1u }, { 0u, 0u, 0xFFu }, { 0u, 0u, 0xFFu } }  /* VLD4/VST4 */
+    };
+    neon_dt_t dt;
+    uint32_t base = 0u, count = 0u, gap = 0u;
+    uint32_t rn, align_req, vm_field;
+    uint32_t struct_class, is_load, type, align_code, size2, vd, dbit;
+    uint32_t i;
+    _kernel_oserror *error;
+
+    (void) s_flag;
+    if (cond != COND_AL) return error_neon_no_condition();
+
+    error = parse_neon_dt(text, length, &pos, &dt);
+    if (error != NULL) return error;
+    if (dt.width != 8 && dt.width != 16 && dt.width != 32 && dt.width != 64) return error_bad_datatype();
+    error = parse_neon_reglist_gap(text, length, &pos, &base, &count, &gap);
+    if (error != NULL) return error;
+    error = expect_char(text, length, &pos, ',');
+    if (error != NULL) return error;
+    error = parse_neon_ldst_address(context, text, length, &pos, &rn, &align_req, &vm_field);
+    if (error != NULL) return error;
+    error = check_trailing(text, length, pos);
+    if (error != NULL) return error;
+
+    is_load = entry->param1 & 1u;
+    struct_class = (entry->param1 >> 1) & 3u;
+
+    type = 0xFFu;
+    for (i = 0u; i < 4u; i++)
+    {
+        if (TYPES[struct_class][i][0] == count && TYPES[struct_class][i][1] == gap)
+        {
+            type = TYPES[struct_class][i][2];
+            break;
+        }
+    }
+    if (type == 0xFFu)
+    {
+        return assemble_set_error(ASSEMBLE_CPU_ARM32, ASSEMBLE_ERROR_TYPE_BAD_OPERAND, ASSEMBLE_ARM32_ERR_NONE,
+                                   "Unsupported register list shape for this mnemonic");
+    }
+
+    align_code = 0u;
+    if (align_req != 0u)
+    {
+        int allow_256 = (struct_class == 3u) || (struct_class == 0u && count == 4u) ||
+                         (struct_class == 1u && count == 4u);
+        int allow_128 = allow_256 || (struct_class == 0u && count == 2u) || (struct_class == 1u && count != 4u);
+
+        if (align_req == 64u) align_code = 1u;
+        else if (align_req == 128u && allow_128) align_code = 2u;
+        else if (align_req == 256u && allow_256) align_code = 3u;
+        else return error_bad_datatype();
+    }
+
+    size2 = neon_dt_size2(dt.width);
+    split_neon_register(base, 'D', &vd, &dbit);
+
+    *out_instr = (is_load ? 0xF4200000u : 0xF4000000u) | (dbit << 22) | (rn << 16) | (vd << 12) |
+                 (type << 8) | (size2 << 6) | (align_code << 4) | vm_field;
     return NULL;
 }

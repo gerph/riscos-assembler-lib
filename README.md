@@ -234,11 +234,16 @@ adding a new one); so far this covers:
 * move-immediate (`VMOV`/`VMVN`, byte/halfword/per-byte-replicate
   forms only — see the ARM32 section of `AGENTS.md` for what's
   deliberately not covered), `VDUP` (from a scalar lane or an ARM core
-  register), `VEXT` and `VTBL`/`VTBX`.
+  register), `VEXT` and `VTBL`/`VTBX`;
+* structure load/store — `VLD1`/`VLD2`/`VLD3`/`VLD4`/`VST1`/`VST2`/
+  `VST3`/`VST4`, "multiple" (register-list) addressing only — the
+  "single lane" and "single all lanes" (replicate) addressing forms
+  are not implemented (see `AGENTS.md`).
 
-Everything else NEON (load/store, and convert/ARMv8-only additions
-such as `VRINT*`, `VSEL*`, `VMAXNM`/`VMINNM` and directed-rounding
-`VCVT`) remains a follow-on. Within base ARM32, the ARMv5TE/v6 'xy' DSP
+Everything else NEON (the two structure load/store forms above, and
+convert/ARMv8-only additions such as `VRINT*`, `VSEL*`, `VMAXNM`/
+`VMINNM` and directed-rounding `VCVT`) remains a follow-on. Within
+base ARM32, the ARMv5TE/v6 'xy' DSP
 multiply family (`SMLABB`, `SMLAWx`, `SMUAD`, `SMLAD`, `SMLALD` and
 friends), `SMMLA`/`SMMLS`/`SMMUL`, `MRRC`/`MCRR`, the ARMv8 `LDA`/`STL`/
 `LDAEX`/`STLEX` load-acquire/store-release family, and the banked-register

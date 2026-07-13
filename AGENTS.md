@@ -603,12 +603,63 @@ half-formed guess.
   `error_bad_register_list` helper (previously only used by
   `LDM`/`STM`) rather than inventing a parallel one.
 
-Everything else NEON — load/store (`VLD1`-`VLD4`/`VST1`-`VST4`, all
-alignment/lane/multiple-structure forms) and the convert/ARMv8-only
-additions (`VCVT` all forms, `VCVTB`/`VCVTT`, `VRINT*`, `VSEL*`,
-`VMAXNM`/`VMINNM`) — remain a follow-on. Datatype-conditional
-structure-load alignment is meaningfully higher-risk to get bit-exact
-than anything ported so far.
+The seventh batch covers structure load/store (ARM DDI 0406C A7.7/
+A7.9) — `VLD1`/`VLD2`/`VLD3`/`VLD4`/`VST1`/`VST2`/`VST3`/`VST4` — but
+only their "multiple" (register-list) addressing form, previously
+flagged during reconnaissance as the most complex remaining addressing
+in NEON. `VLD`/`VST` actually cover *three* structurally different
+addressing shapes sharing those mnemonic names: "multiple" (a run of
+1-4 `D` registers, sequential or de-interleaved), "single lane" (load/
+store one lane of one or more registers, leaving the rest
+untouched), and "single all lanes" (replicate one loaded element
+across every lane, the same idea `VLD1 (single all)` uses for
+`VDUP`-from-memory). Only "multiple" is implemented here — deliberately:
+its encoding is comparatively regular (a plain 4-bit `type` field
+plus 2-bit size/align fields), whereas the other two use a
+datatype-and-lane-index-dependent bit-interleaved alignment field (the
+same family of `bp_x[...]` VFPLib bitstring notation seen in the
+by-scalar batch, but combined with *alignment* rather than just a
+register+index split) that would need the same VFPLib-source-reading
+rigour the `VMOV`/`VMVN` cmode table needed, and this batch was
+already large enough to ship on its own. Revisit "single lane"/"single
+all lanes" as their own follow-up rather than folding them in later
+under time pressure.
+
+- `VLD1`/`VLD2`/`VLD3`/`VLD4` (and their `VST` counterparts) share one
+  encoding, distinguished entirely by a 4-bit `type` field derived from
+  *how many registers the user wrote and whether they're consecutive or
+  spaced two apart* — not by anything in the mnemonic root itself. Eg
+  `VLD2.32 (D0,D1),[R1]` (consecutive pair) and `VLD2.32 (D0,D2),[R1]`
+  (every-other-register pair, for de-interleaving) are the *same
+  mnemonic* with different register-list shapes producing different
+  `type` values (`1000` vs `1001`). `encode_neon_ldst_multiple` parses
+  the list generically (`parse_neon_reglist_gap`, returning a register
+  count and a gap of 1 or 2) and looks up `type` from a small
+  `[struct_class][count,gap]` table per mnemonic rather than trying to
+  encode this as a fixed per-mnemonic-table-row constant.
+- The addressing syntax, `[Rn{@align}]{!}{,Rm}`, is a new parsing shape
+  for this backend: a bracketed base register with an optional
+  "@alignment-in-bits" annotation, then either a bare `!` (writeback by
+  the total transfer size, encoded as `Vm=0xD`), an explicit `,Rm`
+  (writeback by `Rm`, `Vm=Rm`), or neither (`Vm=0xF`, no writeback).
+  `parse_neon_ldst_address` is the one place this shape is parsed;
+  nothing else in NEON needs it since every other load/store-shaped
+  instruction in this backend (`VLDR`/`VSTR`, the FPA/coprocessor
+  `LDC`/`STC` family) uses a conventional `[Rn,#offset]` shape instead.
+- Which alignment values are legal, and what 2-bit code they map to,
+  depends on the register count (and, for the four-register forms of
+  `VLD1`/`VLD2`, specifically on there being *four* registers rather
+  than fewer) — not on datatype. Rather than a full per-mnemonic
+  lookup table for something this regular, `encode_neon_ldst_multiple`
+  computes `allow_128`/`allow_256` directly from `struct_class`/`count`,
+  since every legal combination accepts at least `@64` and the
+  boundary cases (which counts unlock `@128`/`@256`) are few enough to
+  read as a couple of boolean expressions instead of another table.
+
+Everything else NEON — the "single lane" and "single all lanes"
+addressing forms of `VLD`/`VST` described above, and the convert/
+ARMv8-only additions (`VCVT` all forms, `VCVTB`/`VCVTT`, `VRINT*`,
+`VSEL*`, `VMAXNM`/`VMINNM`) — remain a follow-on.
 
 ## Source material handling
 
