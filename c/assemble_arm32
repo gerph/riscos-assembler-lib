@@ -17,6 +17,25 @@
 #define COND_AL 0xEu
 #define COND_NV 0xFu
 
+/* NEON datatype suffix ("I32"/"S16"/"F32"/bare "16" etc), used by the
+   NEON encoders further down this file as well as by encode_vfp_mov_reg
+   above them, which is why this is declared this early rather than
+   alongside parse_neon_dt(). */
+typedef struct neon_dt
+{
+    uint8_t  kind;   /* 'I', 'S', 'U', 'P', 'F', or 0 for a bare size (no letter) */
+    uint32_t width;  /* 8, 16, 32 or 64 */
+} neon_dt_t;
+
+/* Forward declarations: full definitions (and doc comments) are with
+   the rest of the NEON parsing infrastructure further down this file;
+   declared here too since encode_vfp_mov_reg (VFP scalar section,
+   above that point) also needs to recognise a NEON immediate-move
+   operand shape. */
+static _kernel_oserror *parse_neon_dt(const uint8_t *text, size_t length, size_t *pos_inout, neon_dt_t *out_dt);
+static _kernel_oserror *parse_neon_register(const uint8_t *text, size_t length,
+                                             size_t *pos_inout, uint32_t *out_reg, uint8_t *out_class);
+
 /* ---------------------------------------------------------------
  * Condition codes. Both canonical and alias spellings (HS==CS,
  * LO==CC) are matched, mirroring the original CONDTAB.
@@ -987,6 +1006,11 @@ typedef enum instr_family
     FAMILY_NEON_QMOVN,          /* Dd,Qm -- VQMOVN VQMOVUN (narrowing saturating move) */
     FAMILY_NEON_PADAL,          /* Dd/Qd,Dm/Qm -- VPADAL VPADDL (pairwise add, param1 is the full
                                     fixed-bit skeleton, mnemonics differ only in opcode) */
+    FAMILY_NEON_VDUP,           /* Qd/Dd,Dm[x] (scalar, unconditional) or Qd/Dd,Rt (from an ARM
+                                    core register, conditional -- a genuinely different, older
+                                    encoding shape); see encode_neon_vdup */
+    FAMILY_NEON_VEXT,           /* Dd/Qd,Dn/Qn,Dm/Qm,#imm -- VEXT (byte-offset extract) */
+    FAMILY_NEON_TBL,            /* Dd,(register list),Dm -- VTBL VTBX (table lookup/extend) */
 
     FAMILY_NONE         /* unreachable placeholder root, never dispatched */
 } instr_family_t;
@@ -1417,7 +1441,18 @@ static const mnemonic_entry_t mnemonic_table[] = {
     /* param1: the full fixed-bit skeleton (everything except D/size/
        Vd/U/Q/M/Vm, which encode_neon_padal ORs in). */
     { "VPADAL", FAMILY_NEON_PADAL, 0xF3B00600u, 0, 0, 0, ASSEMBLE_ARM32_OPT_VFP },
-    { "VPADDL", FAMILY_NEON_PADAL, 0xF3B00200u, 0, 0, 0, ASSEMBLE_ARM32_OPT_VFP }
+    { "VPADDL", FAMILY_NEON_PADAL, 0xF3B00200u, 0, 0, 0, ASSEMBLE_ARM32_OPT_VFP },
+
+    /* VDUP{cond}.<size> {Dd|Qd},Rt is conditional (a genuinely older,
+       different encoding shape to the rest of NEON); allows_cond is
+       set for this reason, even though the scalar form it shares a
+       root with is not. See encode_neon_vdup. */
+    { "VDUP", FAMILY_NEON_VDUP, 0, 0, 1, 0, ASSEMBLE_ARM32_OPT_VFP },
+    { "VEXT", FAMILY_NEON_VEXT, 0, 0, 0, 0, ASSEMBLE_ARM32_OPT_VFP },
+
+    /* param1: 0=VTBL, 1=VTBX. */
+    { "VTBL", FAMILY_NEON_TBL, 0, 0, 0, 0, ASSEMBLE_ARM32_OPT_VFP },
+    { "VTBX", FAMILY_NEON_TBL, 1, 0, 0, 0, ASSEMBLE_ARM32_OPT_VFP }
 };
 #define NUM_MNEMONICS (sizeof(mnemonic_table) / sizeof(mnemonic_table[0]))
 
@@ -3730,6 +3765,14 @@ static _kernel_oserror *encode_neon_qmovn(assemble_context_t *, const mnemonic_e
                                            const uint8_t *, size_t, size_t, uint32_t *);
 static _kernel_oserror *encode_neon_padal(assemble_context_t *, const mnemonic_entry_t *, uint32_t, int,
                                            const uint8_t *, size_t, size_t, uint32_t *);
+static _kernel_oserror *encode_neon_vdup(assemble_context_t *, const mnemonic_entry_t *, uint32_t, int,
+                                          const uint8_t *, size_t, size_t, uint32_t *);
+static _kernel_oserror *encode_neon_vext(assemble_context_t *, const mnemonic_entry_t *, uint32_t, int,
+                                          const uint8_t *, size_t, size_t, uint32_t *);
+static _kernel_oserror *encode_neon_tbl(assemble_context_t *, const mnemonic_entry_t *, uint32_t, int,
+                                         const uint8_t *, size_t, size_t, uint32_t *);
+static _kernel_oserror *encode_neon_mov_mvn_imm_impl(assemble_context_t *, uint32_t, int,
+                                                      const uint8_t *, size_t, size_t, uint32_t *);
 
 static family_encoder_fn family_encoder(instr_family_t family)
 {
@@ -3807,6 +3850,9 @@ static family_encoder_fn family_encoder(instr_family_t family)
         case FAMILY_NEON_VMOVN:           return encode_neon_vmovn;
         case FAMILY_NEON_QMOVN:           return encode_neon_qmovn;
         case FAMILY_NEON_PADAL:           return encode_neon_padal;
+        case FAMILY_NEON_VDUP:            return encode_neon_vdup;
+        case FAMILY_NEON_VEXT:            return encode_neon_vext;
+        case FAMILY_NEON_TBL:             return encode_neon_tbl;
         default:                  return NULL;
     }
 }
@@ -4851,6 +4897,34 @@ static _kernel_oserror *encode_vfp_mov_reg(assemble_context_t *context, const mn
             return encode_vfp_mov_core(context, entry, cond, s_flag, text, length, pos, out_instr);
         }
     }
+
+    /* VMOV{cond}.<dt> {Dd|Qd},#imm -- NEON immediate move, which
+       permits any dt (not just F32/F64). Peek past the dt and
+       register for a following '#' to tell it apart from the
+       scalar VFP register-move form below. */
+    {
+        size_t peek = pos;
+        neon_dt_t peek_dt;
+        uint32_t peek_reg;
+        uint8_t peek_class;
+
+        if (parse_neon_dt(text, length, &peek, &peek_dt) == NULL &&
+            parse_neon_register(text, length, &peek, &peek_reg, &peek_class) == NULL)
+        {
+            peek += assemble_skip_spaces(text + peek, length - peek);
+            if (peek < length && text[peek] == ',')
+            {
+                size_t peek2 = peek + 1;
+
+                peek2 += assemble_skip_spaces(text + peek2, length - peek2);
+                if (peek2 < length && text[peek2] == '#')
+                {
+                    return encode_neon_mov_mvn_imm_impl(context, cond, 0, text, length, pos, out_instr);
+                }
+            }
+        }
+    }
+
     error = parse_vfp_datatype(text, length, &pos, &sz);
     if (error != NULL) return error;
     error = parse_vfp_register(context, text, length, &pos, &rd, &is_double);
@@ -5310,12 +5384,6 @@ static _kernel_oserror *error_neon_mismatched_size(void)
     return assemble_set_error(ASSEMBLE_CPU_ARM32, ASSEMBLE_ERROR_TYPE_BAD_OPERAND, ASSEMBLE_ARM32_ERR_NONE,
                                "Operands must all be the same width (all Dn or all Qn), and not Sn");
 }
-
-typedef struct neon_dt
-{
-    uint8_t  kind;   /* 'I', 'S', 'U', 'P', 'F', or 0 for a bare size (no letter) */
-    uint32_t width;  /* 8, 16, 32 or 64 */
-} neon_dt_t;
 
 /* Mandatory ".<kind><width>" or ".<width>" datatype suffix, eg
    ".I32"/".S16"/".U8"/".P8"/".F32"/".16". */
@@ -6041,8 +6109,33 @@ static _kernel_oserror *encode_neon_mvn_swp(assemble_context_t *context, const m
     uint32_t vd, dbit, vm, mbit, q;
     _kernel_oserror *error;
 
-    (void) context; (void) s_flag;
+    (void) s_flag;
     if (cond != COND_AL) return error_neon_no_condition();
+
+    /* VMVN (not VSWP) also has an immediate form. */
+    if (entry->param1 == 0u && pos < length && text[pos] == '.')
+    {
+        size_t peek = pos;
+        neon_dt_t peek_dt;
+        uint32_t peek_reg;
+        uint8_t peek_class;
+
+        if (parse_neon_dt(text, length, &peek, &peek_dt) == NULL &&
+            parse_neon_register(text, length, &peek, &peek_reg, &peek_class) == NULL)
+        {
+            peek += assemble_skip_spaces(text + peek, length - peek);
+            if (peek < length && text[peek] == ',')
+            {
+                size_t peek2 = peek + 1;
+
+                peek2 += assemble_skip_spaces(text + peek2, length - peek2);
+                if (peek2 < length && text[peek2] == '#')
+                {
+                    return encode_neon_mov_mvn_imm_impl(context, cond, 1, text, length, pos, out_instr);
+                }
+            }
+        }
+    }
 
     if (pos < length && text[pos] == '.')
     {
@@ -6920,5 +7013,297 @@ static _kernel_oserror *encode_neon_padal(assemble_context_t *context, const mne
     split_neon_register(rd, cd, &vd, &dbit);
     split_neon_register(rm, cm, &vm, &mbit);
     *out_instr = entry->param1 | (dbit << 22) | (size2 << 18) | (vd << 12) | (u << 7) | (q << 6) | (mbit << 5) | vm;
+    return NULL;
+}
+
+/* VMOV/VMVN (immediate) -- {Dd|Qd},#imm, where the datatype selects
+   how the immediate's bit pattern is derived (I8: replicated per
+   byte; I16: per halfword; I32: taken directly), and VMVN loads the
+   bitwise complement of the resulting pattern. VFPLib determines the
+   specific cmode/imm8 encoding by decomposing the (possibly
+   already-replicated) 32-bit value into 4 bytes and matching against
+   a fixed set of shapes -- ported directly from its byte-decompose
+   logic (VFPLib/VFPLib DEF FNvfp_parseop, the "#c" 32-bit immediate
+   case) rather than deriving cmode from dt alone, since dt alone
+   doesn't determine it (eg I32 #0x00004200 uses the same "halfword,
+   byte 1" shape as I16 #0x42). Deliberately not supported: I64
+   (per-bit expansion) and F32 (floating-point immediate) datatypes,
+   and the "ones-fill" cmode 1100/1101 shapes -- VFPLib's own opcmode
+   restriction lists for VMOV/VMVN specifically never reach either
+   (they're reachable from VORR/VBIC instead, not implemented here),
+   so there is nothing to port for these two mnemonics. Likewise,
+   VFPLib's own restriction list for VMVN never reaches the per-byte
+   cmode 1110 (its byte-decompose code hardcodes op=0 for that shape,
+   which never matches VMVN's all-op=1 restriction list), so a
+   uniform-byte VMVN immediate is rejected here exactly as it would be
+   by VFPLib itself, not because of a gap in this port. */
+static _kernel_oserror *encode_neon_mov_mvn_imm_impl(assemble_context_t *context, uint32_t cond, int is_mvn,
+                                                       const uint8_t *text, size_t length, size_t pos,
+                                                       uint32_t *out_instr)
+{
+    neon_dt_t dt;
+    uint32_t rd;
+    uint8_t cd;
+    assemble_value_t value;
+    size_t consumed;
+    uint32_t raw, b0, b1, b2, b3, imm, cmode, op, q, vd, dbit;
+    _kernel_oserror *error;
+
+    if (cond != COND_AL) return error_neon_no_condition();
+
+    error = parse_neon_dt(text, length, &pos, &dt);
+    if (error != NULL) return error;
+    if (dt.width != 8 && dt.width != 16 && dt.width != 32) return error_bad_datatype();
+    error = parse_neon_register(text, length, &pos, &rd, &cd);
+    if (error != NULL) return error;
+    error = expect_char(text, length, &pos, ',');
+    if (error != NULL) return error;
+    error = expect_char(text, length, &pos, '#');
+    if (error != NULL) return error;
+    error = eval_expr(context, text + pos, length - pos, &value, &consumed);
+    if (error != NULL) return error;
+    pos += consumed;
+    error = check_trailing(text, length, pos);
+    if (error != NULL) return error;
+    q = (cd == 'Q') ? 1u : 0u;
+
+    raw = (uint32_t) value_to_integer(&value);
+    if (dt.width == 8)
+    {
+        raw &= 0xFFu;
+        raw = raw | (raw << 8) | (raw << 16) | (raw << 24);
+    }
+    else if (dt.width == 16)
+    {
+        raw &= 0xFFFFu;
+        raw = raw | (raw << 16);
+    }
+
+    b0 = raw & 0xFFu;
+    b1 = (raw >> 8) & 0xFFu;
+    b2 = (raw >> 16) & 0xFFu;
+    b3 = (raw >> 24) & 0xFFu;
+
+    if (b3 == 0 && b2 == 0 && b1 == 0) { cmode = 0x0u; imm = b0; }
+    else if (b3 == 0 && b2 == 0 && b1 != 0 && b0 == 0) { cmode = 0x2u; imm = b1; }
+    else if (b3 == 0 && b2 != 0 && b1 == 0 && b0 == 0) { cmode = 0x4u; imm = b2; }
+    else if (b3 != 0 && b2 == 0 && b1 == 0 && b0 == 0) { cmode = 0x6u; imm = b3; }
+    else if (b3 == 0 && b1 == 0 && b2 == b0 && b0 != 0) { cmode = 0x8u; imm = b0; }
+    else if (b2 == 0 && b0 == 0 && b3 == b1 && b1 != 0) { cmode = 0xAu; imm = b1; }
+    else if (!is_mvn && b3 == b2 && b2 == b1 && b1 == b0 && b0 != 0) { cmode = 0xEu; imm = b0; }
+    else
+    {
+        return assemble_set_error(ASSEMBLE_CPU_ARM32, ASSEMBLE_ERROR_TYPE_RANGE, ASSEMBLE_ARM32_ERR_NONE,
+                                   "Immediate cannot be encoded (unsupported bit pattern for this dt)");
+    }
+    op = is_mvn ? 1u : 0u;
+
+    split_neon_register(rd, cd, &vd, &dbit);
+    *out_instr = assemble_neon_shift_imm((imm >> 7) & 1u, dbit, (imm >> 4) & 0x7u, vd, cmode, 0u, q, op, imm & 0xFu);
+    return NULL;
+}
+
+/* VDUP{cond}.<size> {Dd|Qd},Dm[x] (scalar, unconditional) or
+   VDUP{cond}.<size> {Dd|Qd},Rt (from an ARM core register,
+   conditional -- an older, structurally different encoding entirely,
+   sharing this root only because BASIC syntax-wise both are spelled
+   "VDUP"). */
+static _kernel_oserror *encode_neon_vdup(assemble_context_t *context, const mnemonic_entry_t *entry,
+                                          uint32_t cond, int s_flag,
+                                          const uint8_t *text, size_t length, size_t pos,
+                                          uint32_t *out_instr)
+{
+    neon_dt_t dt;
+    uint32_t rd;
+    uint8_t cd;
+    _kernel_oserror *error;
+
+    (void) entry; (void) s_flag;
+
+    error = parse_neon_dt(text, length, &pos, &dt);
+    if (error != NULL) return error;
+    if (dt.width != 8 && dt.width != 16 && dt.width != 32) return error_bad_datatype();
+    error = parse_neon_register(text, length, &pos, &rd, &cd);
+    if (error != NULL) return error;
+    error = expect_char(text, length, &pos, ',');
+    if (error != NULL) return error;
+
+    if (peek_neon_scalar_operand(text, length, pos))
+    {
+        static const uint32_t MAXINDEX[3] = { 7u, 3u, 1u }; /* per size_class 8/16/32 */
+        uint32_t reg, index, vd, dbit, vm, mbit, q, imm4, size_class;
+
+        if (cond != COND_AL) return error_neon_no_condition();
+        error = parse_neon_scalar_operand(context, text, length, &pos, &reg, &index);
+        if (error != NULL) return error;
+        error = check_trailing(text, length, pos);
+        if (error != NULL) return error;
+        q = (cd == 'Q') ? 1u : 0u;
+
+        size_class = neon_dt_size2(dt.width);
+        if (index > MAXINDEX[size_class]) return error_bad_datatype();
+        imm4 = (index << (size_class + 1u)) | (1u << size_class);
+
+        split_neon_register(rd, cd, &vd, &dbit);
+        split_neon_register(reg, 'D', &vm, &mbit);
+        *out_instr = 0xF3B00C00u | (dbit << 22) | (imm4 << 16) | (vd << 12) | (q << 6) | (mbit << 5) | vm;
+        return NULL;
+    }
+    else
+    {
+        uint32_t rt, vd, dbit, q, esize;
+
+        error = parse_register(context, text, length, &pos, &rt);
+        if (error != NULL) return error;
+        error = check_trailing(text, length, pos);
+        if (error != NULL) return error;
+        q = (cd == 'Q') ? 1u : 0u;
+
+        esize = neon_dt_size2(dt.width);
+        split_neon_register(rd, cd, &vd, &dbit);
+        *out_instr = (cond << 28) | 0x0E800B10u | (((esize >> 1) & 1u) << 22) | (q << 21) | (vd << 16) |
+                     (rt << 12) | (dbit << 7) | ((esize & 1u) << 5);
+        return NULL;
+    }
+}
+
+/* VEXT.<size> {Dd|Qd},{Dn|Qn},{Dm|Qm},#imm -- extract a byte-aligned
+   window across a register pair. The immediate is specified in
+   dt-sized elements but encoded as a byte offset (0-7 for Dd, 0-15
+   for Qd). */
+static _kernel_oserror *encode_neon_vext(assemble_context_t *context, const mnemonic_entry_t *entry,
+                                          uint32_t cond, int s_flag,
+                                          const uint8_t *text, size_t length, size_t pos,
+                                          uint32_t *out_instr)
+{
+    neon_dt_t dt;
+    uint32_t rd, rn, rm;
+    uint8_t cd, cn, cm;
+    assemble_value_t value;
+    size_t consumed;
+    int32_t index;
+    uint32_t vd, dbit, vn, nbit, vm, mbit, q, byte_offset, max_offset;
+    _kernel_oserror *error;
+
+    (void) entry; (void) s_flag;
+    if (cond != COND_AL) return error_neon_no_condition();
+
+    error = parse_neon_dt(text, length, &pos, &dt);
+    if (error != NULL) return error;
+    if (dt.width != 8 && dt.width != 16 && dt.width != 32 && dt.width != 64) return error_bad_datatype();
+    error = parse_neon_register(text, length, &pos, &rd, &cd);
+    if (error != NULL) return error;
+    error = expect_char(text, length, &pos, ',');
+    if (error != NULL) return error;
+    error = parse_neon_register(text, length, &pos, &rn, &cn);
+    if (error != NULL) return error;
+    error = expect_char(text, length, &pos, ',');
+    if (error != NULL) return error;
+    error = parse_neon_register(text, length, &pos, &rm, &cm);
+    if (error != NULL) return error;
+    error = expect_char(text, length, &pos, ',');
+    if (error != NULL) return error;
+    error = expect_char(text, length, &pos, '#');
+    if (error != NULL) return error;
+    error = eval_expr(context, text + pos, length - pos, &value, &consumed);
+    if (error != NULL) return error;
+    pos += consumed;
+    error = check_trailing(text, length, pos);
+    if (error != NULL) return error;
+    if (cd != cn || cd != cm) return error_neon_mismatched_size();
+    q = (cd == 'Q') ? 1u : 0u;
+
+    index = value_to_integer(&value);
+    max_offset = q ? 15u : 7u;
+    if (index < 0) return error_bad_shift();
+    byte_offset = ((uint32_t) index) << (dt.width == 8 ? 0 : (dt.width == 16 ? 1 : (dt.width == 32 ? 2 : 3)));
+    if (byte_offset > max_offset) return error_bad_shift();
+
+    split_neon_register(rd, cd, &vd, &dbit);
+    split_neon_register(rn, cn, &vn, &nbit);
+    split_neon_register(rm, cm, &vm, &mbit);
+    *out_instr = 0xF2B00000u | (dbit << 22) | (vn << 16) | (vd << 12) | (byte_offset << 8) | (nbit << 7) |
+                 (q << 6) | (mbit << 5) | vm;
+    return NULL;
+}
+
+/* VTBL/VTBX Dd,(register list),Dm -- table lookup (VTBL) or extend
+   (VTBX, keeping unmatched destination lanes rather than zeroing
+   them). The register list is a parenthesised, comma-separated run of
+   1-4 consecutive D registers, eg "(D1,D2,D3)"; a "-" range spelling
+   like "(D1-D3)" is also accepted, matching real syntax. */
+static _kernel_oserror *encode_neon_tbl(assemble_context_t *context, const mnemonic_entry_t *entry,
+                                         uint32_t cond, int s_flag,
+                                         const uint8_t *text, size_t length, size_t pos,
+                                         uint32_t *out_instr)
+{
+    uint32_t rd, rn, rm, rn_last;
+    uint8_t cd, cn, cm, cn_last;
+    uint32_t vd, dbit, vn, nbit, vm, mbit, len;
+    _kernel_oserror *error;
+
+    (void) s_flag;
+    if (cond != COND_AL) return error_neon_no_condition();
+
+    if (pos < length && text[pos] == '.')
+    {
+        neon_dt_t dt;
+
+        error = parse_neon_dt(text, length, &pos, &dt);
+        if (error != NULL) return error;
+        if (dt.width != 8) return error_bad_datatype();
+    }
+    error = parse_neon_register(text, length, &pos, &rd, &cd);
+    if (error != NULL) return error;
+    if (cd != 'D') return error_neon_mismatched_size();
+    error = expect_char(text, length, &pos, ',');
+    if (error != NULL) return error;
+    error = expect_char(text, length, &pos, '(');
+    if (error != NULL) return error;
+    error = parse_neon_register(text, length, &pos, &rn, &cn);
+    if (error != NULL) return error;
+    if (cn != 'D') return error_neon_mismatched_size();
+
+    len = 0u;
+    rn_last = rn;
+    cn_last = cn;
+    while (1)
+    {
+        size_t peek = pos;
+
+        peek += assemble_skip_spaces(text + peek, length - peek);
+        if (peek < length && (text[peek] == ',' || text[peek] == '-'))
+        {
+            peek += 1;
+            error = parse_neon_register(text, length, &peek, &rn_last, &cn_last);
+            if (error != NULL) return error;
+            if (cn_last != 'D' || rn_last != rn + len + 1u)
+            {
+                return error_bad_register_list("VTBL/VTBX register list must be consecutive D registers");
+            }
+            len += 1u;
+            pos = peek;
+            if (len > 3u) return error_bad_register_list("VTBL/VTBX register list can contain at most 4 registers");
+        }
+        else
+        {
+            break;
+        }
+    }
+    error = expect_char(text, length, &pos, ')');
+    if (error != NULL) return error;
+    error = expect_char(text, length, &pos, ',');
+    if (error != NULL) return error;
+    error = parse_neon_register(text, length, &pos, &rm, &cm);
+    if (error != NULL) return error;
+    if (cm != 'D') return error_neon_mismatched_size();
+    error = check_trailing(text, length, pos);
+    if (error != NULL) return error;
+
+    split_neon_register(rd, cd, &vd, &dbit);
+    split_neon_register(rn, cn, &vn, &nbit);
+    split_neon_register(rm, cm, &vm, &mbit);
+    *out_instr = 0xF3B00800u | (dbit << 22) | (vn << 16) | (vd << 12) | (len << 8) | (nbit << 7) |
+                 ((uint32_t) entry->param1 << 6) | (mbit << 5) | vm;
     return NULL;
 }

@@ -527,14 +527,88 @@ requiring its own bit of dispatch surgery:
   bits would have made `VQDMULH.F32 ...` silently attempt (and
   mis-encode) a float three-same read instead of being rejected.
 
-Everything else NEON — move-immediate/duplicate/table-lookup/extract
-(`VMOV`/`VMVN` immediate, `VDUP`, `VEXT`, `VTBL`/`VTBX`), load/store
-(`VLD1`-`VLD4`/`VST1`-`VST4`, all alignment/lane/multiple-structure
-forms), and the convert/ARMv8-only additions (`VCVT` all forms,
-`VCVTB`/`VCVTT`, `VRINT*`, `VSEL*`, `VMAXNM`/`VMINNM`) remain a
-follow-on — `VMOV`/`VMVN`'s immediate `cmode` table and
-datatype-conditional structure-load alignment are meaningfully
-higher-risk to get bit-exact than anything ported so far.
+The sixth batch covers move-immediate (`VMOV`/`VMVN`), `VDUP`, `VEXT`
+and `VTBL`/`VTBX`. `VMOV`/`VMVN`'s immediate `cmode` table was flagged
+during reconnaissance as meaningfully higher-risk than anything ported
+before it, so rather than re-deriving the cmode/imm8 encoding from
+architecture recall, this piece was ported by reading VFPLib's own
+`DEF FNvfp_parseop` byte-decomposition logic (the `"#c"` 32-bit
+immediate case) directly and translating it into C — which also
+resolved what first looked like a contradiction: cross-checking the
+"x" wildcard bits in VFPLib's `opcmode` restriction strings against
+real ARM architecture cmode values seemed to disagree at first, until
+re-reading the source showed the wildcards get resolved by combining
+constraints from *two* separate pattern strings (the byte-decompose
+shape's pattern and the specific mnemonic's restriction list), not by
+either one alone — a reminder to verify a "this doesn't add up" moment
+against the actual source rather than either giving up or trusting a
+half-formed guess.
+
+- Given a (possibly dt-replicated) 32-bit value, VFPLib decomposes it
+  into 4 bytes and matches against a fixed, priority-ordered set of
+  shapes (byte-position 32-bit, halfword-position 16-bit, uniform
+  8-bit) to find both the `cmode` and the 8-bit immediate to encode —
+  `encode_neon_mov_mvn_imm_impl` ports that decomposition and matching
+  logic directly (including the priority order, which matters: eg an
+  all-zero value matches the first, "byte 0" shape rather than any
+  other shape that could also technically apply).
+- Deliberately not supported: `I64` (per-bit expansion) and `F32`
+  (floating-point immediate) datatypes, and the "ones-fill" `cmode`
+  1100/1101 shapes. Unlike most gaps documented in this project, these
+  aren't a case of "ran out of time to verify" — VFPLib's own opcmode
+  restriction lists for `VMOV`/`VMVN` specifically never reach any of
+  them (they're reachable from `VORR`/`VBIC` instead, which aren't
+  implemented in this backend at all), so there is nothing to port for
+  these two mnemonics; skipping them doesn't remove any coverage
+  VFPLib itself provided here.
+- A more surprising consequence of the same fact: a uniform-byte
+  (`VMVN.I8`) immediate is *rejected* here, matching a real limitation
+  in VFPLib itself — its byte-decompose code hardcodes `op=0` for that
+  shape regardless of which mnemonic is assembling, which can never
+  match `VMVN`'s restriction list (`op=1` throughout), so VFPLib's own
+  `FNvfp_parseop` would fail to assemble `VMVN.I8` too. This is called
+  out explicitly in `encode_neon_mov_mvn_imm_impl`'s comment so it
+  doesn't look like an accidental omission on a future read.
+- `VMOV`/`VMVN` already had mnemonic-table rows from earlier batches
+  (`VMOV` shares scalar-VFP dispatch, `VMVN` shares `VSWP`'s family),
+  so the immediate form couldn't be a new table row — it's a peek-ahead
+  branch retrofitted into `encode_vfp_mov_reg` and
+  `encode_neon_mvn_swp` respectively (the same technique as the
+  by-scalar retrofits in the previous batch), calling a shared
+  `encode_neon_mov_mvn_imm_impl` helper. That helper takes an explicit
+  `is_mvn` parameter rather than reading it from `entry->param1`,
+  because the two callers' `param1` values don't agree on what 0 means
+  (`VMOV`'s table row has no tag at all, while `VMVN`'s row uses
+  `param1==0` to mean "this is the `VMVN` half of the `VMVN`/`VSWP`
+  shared family") — threading that through `entry->param1` would have
+  silently done the wrong thing for one of the two callers.
+- `VDUP`'s two forms are structurally unrelated, not just differently
+  encoded: the scalar form (`Dd,Dm[x]`) is unconditional NEON, but the
+  ARM-core-register form (`Dd,Rt`) is a genuinely older, conditional
+  encoding (real `cond` field, not the fixed `0xF` every other NEON
+  instruction in this backend uses) — `VDUP`'s mnemonic-table row sets
+  `allows_cond`, and `encode_neon_vdup` explicitly rejects a non-`AL`
+  condition when it determines the scalar form applies, rather than
+  silently accepting (and discarding) one.
+- `VEXT`'s immediate is specified by the user in dt-sized elements but
+  encoded as a plain byte offset — converting between the two is a
+  left-shift by `log2(dt.width/8)`, the same "shift factor" idea
+  VFPLib's own `#sN` syntax convention uses elsewhere (see the
+  shift-by-immediate batch's imm6 notes).
+- `VTBL`/`VTBX`'s register-list operand (`(Dn,Dn+1,...)`, 1-4
+  consecutive `D` registers) is a genuinely new parsing shape not
+  needed by anything else in this backend; `encode_neon_tbl` accepts
+  both comma- and dash-separated spellings and validates the run is
+  consecutive starting at the first register, reusing the existing
+  `error_bad_register_list` helper (previously only used by
+  `LDM`/`STM`) rather than inventing a parallel one.
+
+Everything else NEON — load/store (`VLD1`-`VLD4`/`VST1`-`VST4`, all
+alignment/lane/multiple-structure forms) and the convert/ARMv8-only
+additions (`VCVT` all forms, `VCVTB`/`VCVTT`, `VRINT*`, `VSEL*`,
+`VMAXNM`/`VMINNM`) — remain a follow-on. Datatype-conditional
+structure-load alignment is meaningfully higher-risk to get bit-exact
+than anything ported so far.
 
 ## Source material handling
 

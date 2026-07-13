@@ -230,12 +230,15 @@ adding a new one); so far this covers:
   `VQMOVN`, `VQMOVUN`, `VPADAL`, `VPADDL`;
 * the "by scalar" `Dm[x]` operand form of `VMUL`, `VMLA`, `VMLS`,
   `VMLAL`, `VMLSL`, `VMULL`, `VQDMULH`, `VQRDMULH`, `VQDMULL`,
-  `VQDMLAL` and `VQDMLSL`.
+  `VQDMLAL` and `VQDMLSL`;
+* move-immediate (`VMOV`/`VMVN`, byte/halfword/per-byte-replicate
+  forms only — see the ARM32 section of `AGENTS.md` for what's
+  deliberately not covered), `VDUP` (from a scalar lane or an ARM core
+  register), `VEXT` and `VTBL`/`VTBX`.
 
-Everything else NEON (move-immediate/duplicate/table-lookup/extract,
-load/store, and convert/ARMv8-only additions such as `VRINT*`, `VSEL*`,
-`VMAXNM`/`VMINNM` and directed-rounding `VCVT`) remains a follow-on.
-Within base ARM32, the ARMv5TE/v6 'xy' DSP
+Everything else NEON (load/store, and convert/ARMv8-only additions
+such as `VRINT*`, `VSEL*`, `VMAXNM`/`VMINNM` and directed-rounding
+`VCVT`) remains a follow-on. Within base ARM32, the ARMv5TE/v6 'xy' DSP
 multiply family (`SMLABB`, `SMLAWx`, `SMUAD`, `SMLAD`, `SMLALD` and
 friends), `SMMLA`/`SMMLS`/`SMMUL`, `MRRC`/`MCRR`, the ARMv8 `LDA`/`STL`/
 `LDAEX`/`STLEX` load-acquire/store-release family, and the banked-register
