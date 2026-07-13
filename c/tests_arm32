@@ -507,6 +507,42 @@ static const uint8_t     bytes_vmsr[] = { 0x10, 0x0A, 0xE1, 0xEE }; /* EEE10A10 
 
 static const char *const lines_vfp_mismatched_prec[] = { "VADD.F32 S0,D1,S2", NULL };
 
+static const char *const lines_vmul_scalar[] = { "VMUL.F32 S0,S1,S2", NULL };
+static const uint8_t     bytes_vmul_scalar[] = { 0x81, 0x0A, 0x20, 0xEE }; /* EE200A81 */
+
+static const char *const lines_neon_vadd_i32[] = { "VADD.I32 Q0,Q1,Q2", NULL };
+static const uint8_t     bytes_neon_vadd_i32[] = { 0x44, 0x08, 0x22, 0xF2 }; /* F2220844 */
+
+static const char *const lines_neon_vadd_f32[] = { "VADD.F32 Q0,Q1,Q2", NULL };
+static const uint8_t     bytes_neon_vadd_f32[] = { 0x44, 0x0D, 0x02, 0xF2 }; /* F2020D44 */
+
+static const char *const lines_neon_vmul_i16[] = { "VMUL.I16 D0,D1,D2", NULL };
+static const uint8_t     bytes_neon_vmul_i16[] = { 0x12, 0x09, 0x11, 0xF2 }; /* F2110912 */
+
+static const char *const lines_neon_vmla_i32[] = { "VMLA.I32 Q0,Q1,Q2", NULL };
+static const uint8_t     bytes_neon_vmla_i32[] = { 0x44, 0x09, 0x22, 0xF2 }; /* F2220944 */
+
+static const char *const lines_neon_vqadd_s16[] = { "VQADD.S16 D0,D1,D2", NULL };
+static const uint8_t     bytes_neon_vqadd_s16[] = { 0x12, 0x00, 0x11, 0xF2 }; /* F2110012 */
+
+/* VCLE Vd,Vn,Vm assembles as VCGE Vd,Vm,Vn (operands 2/3 swapped). */
+static const char *const lines_neon_vcle_s32[] = { "VCLE.S32 D0,D1,D2", NULL };
+static const uint8_t     bytes_neon_vcle_s32[] = { 0x11, 0x03, 0x22, 0xF2 }; /* F2220311 */
+
+static const char *const lines_neon_vand[] = { "VAND Q0,Q1,Q2", NULL };
+static const uint8_t     bytes_neon_vand[] = { 0x54, 0x01, 0x02, 0xF2 }; /* F2020154 */
+
+static const char *const lines_neon_veor[] = { "VEOR D0,D1,D2", NULL };
+static const uint8_t     bytes_neon_veor[] = { 0x12, 0x01, 0x01, 0xF3 }; /* F3010112 */
+
+static const char *const lines_neon_vpadd_d[] = { "VPADD.I32 D0,D1,D2", NULL };
+static const uint8_t     bytes_neon_vpadd_d[] = { 0x12, 0x0B, 0x21, 0xF2 }; /* F2210B12 */
+
+static const char *const lines_neon_vpadd_q_rejected[] = { "VPADD.I32 Q0,Q1,Q2", NULL };
+static const char *const lines_neon_cond_rejected[] = { "VADDEQ.I32 Q0,Q1,Q2", NULL };
+static const char *const lines_neon_size_mismatch[] = { "VADD.I32 Q0,D1,D2", NULL };
+static const char *const lines_neon_disabled[] = { "VQADD.S32 D0,D1,D2", NULL };
+
 static const test_case_t tests[] = {
     { "MOV Rd,#imm",                   lines_mov_imm,          0, bytes_mov_imm,          sizeof(bytes_mov_imm),          0 },
     { "MOVS Rd,Rm",                    lines_mov_reg,          0, bytes_mov_reg,          sizeof(bytes_mov_reg),          0 },
@@ -574,7 +610,22 @@ static const test_case_t tests[] = {
     { "VPOP {list}",                   lines_vpop,             0, bytes_vpop,             sizeof(bytes_vpop),             0, ASSEMBLE_ARM32_OPT_VFP },
     { "VMRS Rt,FPSCR",                 lines_vmrs,             0, bytes_vmrs,             sizeof(bytes_vmrs),             0, ASSEMBLE_ARM32_OPT_VFP },
     { "VMSR FPSCR,Rt",                 lines_vmsr,             0, bytes_vmsr,             sizeof(bytes_vmsr),             0, ASSEMBLE_ARM32_OPT_VFP },
-    { "VFP operands must all be one precision", lines_vfp_mismatched_prec, 0, NULL, 0, 1, ASSEMBLE_ARM32_OPT_VFP }
+    { "VFP operands must all be one precision", lines_vfp_mismatched_prec, 0, NULL, 0, 1, ASSEMBLE_ARM32_OPT_VFP },
+    { "VMUL.F32 Sd,Sn,Sm (scalar)",    lines_vmul_scalar,      0, bytes_vmul_scalar,      sizeof(bytes_vmul_scalar),      0, ASSEMBLE_ARM32_OPT_VFP },
+
+    { "VADD.I32 Qd,Qn,Qm (NEON)",      lines_neon_vadd_i32,    0, bytes_neon_vadd_i32,    sizeof(bytes_neon_vadd_i32),    0, ASSEMBLE_ARM32_OPT_VFP },
+    { "VADD.F32 Qd,Qn,Qm (NEON)",      lines_neon_vadd_f32,    0, bytes_neon_vadd_f32,    sizeof(bytes_neon_vadd_f32),    0, ASSEMBLE_ARM32_OPT_VFP },
+    { "VMUL.I16 Dd,Dn,Dm (NEON)",      lines_neon_vmul_i16,    0, bytes_neon_vmul_i16,    sizeof(bytes_neon_vmul_i16),    0, ASSEMBLE_ARM32_OPT_VFP },
+    { "VMLA.I32 Qd,Qn,Qm (NEON)",      lines_neon_vmla_i32,    0, bytes_neon_vmla_i32,    sizeof(bytes_neon_vmla_i32),    0, ASSEMBLE_ARM32_OPT_VFP },
+    { "VQADD.S16 Dd,Dn,Dm",            lines_neon_vqadd_s16,   0, bytes_neon_vqadd_s16,   sizeof(bytes_neon_vqadd_s16),   0, ASSEMBLE_ARM32_OPT_VFP },
+    { "VCLE.S32 Dd,Dn,Dm (swapped VCGE)", lines_neon_vcle_s32,  0, bytes_neon_vcle_s32,    sizeof(bytes_neon_vcle_s32),    0, ASSEMBLE_ARM32_OPT_VFP },
+    { "VAND Qd,Qn,Qm",                 lines_neon_vand,        0, bytes_neon_vand,        sizeof(bytes_neon_vand),        0, ASSEMBLE_ARM32_OPT_VFP },
+    { "VEOR Dd,Dn,Dm",                 lines_neon_veor,        0, bytes_neon_veor,        sizeof(bytes_neon_veor),        0, ASSEMBLE_ARM32_OPT_VFP },
+    { "VPADD.I32 Dd,Dn,Dm (D-only)",   lines_neon_vpadd_d,     0, bytes_neon_vpadd_d,     sizeof(bytes_neon_vpadd_d),     0, ASSEMBLE_ARM32_OPT_VFP },
+    { "VPADD Qd form is rejected (D-only)", lines_neon_vpadd_q_rejected, 0, NULL, 0, 1, ASSEMBLE_ARM32_OPT_VFP },
+    { "NEON mnemonics reject a condition code", lines_neon_cond_rejected, 0, NULL, 0, 1, ASSEMBLE_ARM32_OPT_VFP },
+    { "NEON operands must all be the same width", lines_neon_size_mismatch, 0, NULL, 0, 1, ASSEMBLE_ARM32_OPT_VFP },
+    { "NEON-only mnemonic without OPT_VFP is rejected", lines_neon_disabled, 0, NULL, 0, 1, 0 }
 };
 
 int run_tests_arm32(void)

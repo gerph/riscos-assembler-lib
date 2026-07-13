@@ -20,7 +20,7 @@ interface is designed to make that straightforward for a future caller.
 | 6809    | `h.assemble_6809`  | `c.assemble_6809`     | 6809                                          |
 | x86-64  | `h.assemble_x86_64`| `c.assemble_x86_64`   | x86-64 (limited subset, see below)            |
 | Z80     | `h.assemble_z80`   | `c.assemble_z80`      | Z80 (including common undocumented forms)     |
-| ARM32   | `h.assemble_arm32` | `c.assemble_arm32`    | Base ARM (ARMv4 through the AArch32 subset of ARMv8) + legacy FPA + classic VFP scalar (dialect via `opt` bits); NEON/SIMD is a separate follow-on backend, not yet added |
+| ARM32   | `h.assemble_arm32` | `c.assemble_arm32`    | Base ARM (ARMv4 through the AArch32 subset of ARMv8) + legacy FPA + classic VFP scalar + partial NEON/SIMD (dialect via `opt` bits, see below) |
 
 Shared infrastructure (the assembly context, error reporting, byte/word
 emission helpers) lives in `h.assemble_common` / `c.assemble_common`.
@@ -206,12 +206,20 @@ literal's raw bytes as immediate data still works.
 
 ### Known limitation: ARM32
 
-Base ARM32, legacy FPA and classic VFP scalar are implemented; NEON/SIMD
-and ARMv8-only VFP additions (`VRINT*`, `VSEL*`, `VMAXNM`/`VMINNM`,
-directed-rounding `VCVT`) are a separate, larger follow-on backend, gated
-by `ASSEMBLE_ARM32_OPT_VFP` once added (the same OPT bit already gates
-the classic VFP scalar support below — NEON extends the same dialect
-rather than adding a new one). Within base ARM32, the ARMv5TE/v6 'xy' DSP
+Base ARM32, legacy FPA and classic VFP scalar are implemented. NEON/SIMD
+is being added incrementally, gated by the same `ASSEMBLE_ARM32_OPT_VFP`
+bit as classic VFP scalar (NEON extends the same dialect rather than
+adding a new one); so far this covers the "three registers of the same
+length" family (`VADD`, `VSUB`, `VMUL`, `VMLA`, `VMLS`, `VAND`, `VBIC`,
+`VORR`, `VORN`, `VEOR`, `VBSL`, `VBIT`, `VBIF`, `VQADD`, `VQSUB`, `VRSHL`,
+`VQSHL`, `VQRSHL`, `VHADD`, `VHSUB`, `VRHADD`, `VABA`, `VABD`, `VCEQ`,
+`VCGE`, `VCGT`, `VCLE`, `VCLT`, `VTST`, `VQDMULH`, `VQRDMULH`, `VACGE`,
+`VACGT`, `VACLE`, `VACLT`, `VMAX`, `VMIN`, `VPMAX`, `VPMIN`, `VPADD`).
+Everything else NEON (shifts by immediate, long/wide/narrow arithmetic,
+by-scalar multiply forms, move/duplicate/table/permute, load/store, and
+convert/ARMv8-only additions such as `VRINT*`, `VSEL*`, `VMAXNM`/
+`VMINNM` and directed-rounding `VCVT`) remains a follow-on. Within base
+ARM32, the ARMv5TE/v6 'xy' DSP
 multiply family (`SMLABB`, `SMLAWx`, `SMUAD`, `SMLAD`, `SMLALD` and
 friends), `SMMLA`/`SMMLS`/`SMMUL`, `MRRC`/`MCRR`, the ARMv8 `LDA`/`STL`/
 `LDAEX`/`STLEX` load-acquire/store-release family, and the banked-register

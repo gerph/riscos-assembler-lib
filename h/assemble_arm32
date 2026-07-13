@@ -1,12 +1,12 @@
 /*******************************************************************
  * File:        assemble_arm32
  * Purpose:     Assembler backend for the 32-bit ARM instruction set
- *              (ARMv4 through the AArch32 subset of ARMv8) and the
- *              legacy FPA floating-point coprocessor instruction
- *              set, ported from ROOLBASIC's s/Assembler (BBC BASIC's
- *              inline ARM assembler). VFP/NEON support is a separate
- *              follow-on backend layered on top of this one; see
- *              ASSEMBLE_ARM32_OPT_VFP.
+ *              (ARMv4 through the AArch32 subset of ARMv8), the
+ *              legacy FPA floating-point coprocessor instruction set,
+ *              and classic VFP scalar plus NEON/Advanced SIMD, ported
+ *              from ROOLBASIC's s/Assembler and VFPLib/VFPLib (BBC
+ *              BASIC's inline ARM assembler and VFP support library).
+ *              See ASSEMBLE_ARM32_OPT_FPA and ASSEMBLE_ARM32_OPT_VFP.
  * Author:      Charles Ferguson (Gerph)
  ******************************************************************/
 
@@ -23,13 +23,16 @@
    'opt' field, following the convention used elsewhere in this
    library (eg assemble_6502.h). The base ARM32 instruction set is
    always available; FPA mnemonics are only recognised when
-   ASSEMBLE_ARM32_OPT_FPA is set (VFP/NEON, once added, will be gated
-   by ASSEMBLE_ARM32_OPT_VFP similarly). Using an FPA mnemonic
-   without the bit set raises ASSEMBLE_ERROR_TYPE_UNSUPPORTED_ON_VARIANT
-   rather than "mnemonic not recognised", so a caller can tell the two
-   cases apart. */
+   ASSEMBLE_ARM32_OPT_FPA is set. VFP scalar and NEON/Advanced SIMD
+   mnemonics are both gated by ASSEMBLE_ARM32_OPT_VFP (NEON is not
+   available without VFP hardware, so a single bit covers both; NEON
+   coverage is being added incrementally -- see AGENTS.md for what's
+   implemented so far). Using a gated mnemonic without the relevant
+   bit set raises ASSEMBLE_ERROR_TYPE_UNSUPPORTED_ON_VARIANT rather
+   than "mnemonic not recognised", so a caller can tell the two cases
+   apart. */
 #define ASSEMBLE_ARM32_OPT_FPA (1u << 4)  /* 0x10 */
-#define ASSEMBLE_ARM32_OPT_VFP (1u << 5)  /* 0x20 -- reserved for the VFP/NEON backend */
+#define ASSEMBLE_ARM32_OPT_VFP (1u << 5)  /* 0x20 -- VFP scalar and NEON/Advanced SIMD */
 
 /* CPU-specific detail for errors raised by this backend; see
    ASSEMBLE_ERRNUM_VARIANT(). */
@@ -48,7 +51,8 @@ typedef enum assemble_arm32_error_variant
     ASSEMBLE_ARM32_ERR_BAD_BIT_FIELD,           /* BFI/BFC/SBFX/UBFX/SSAT/USAT lsb/width out of range */
     ASSEMBLE_ARM32_ERR_BRANCH_RANGE,            /* B/BL/BLX/ADR target out of +-32MB (or ADR immediate) range */
     ASSEMBLE_ARM32_ERR_BAD_FP_PRECISION,        /* FPA precision suffix must be S, D or E (P also for LDF/STF) */
-    ASSEMBLE_ARM32_ERR_BAD_FP_IMMEDIATE         /* FPA #imm is not one of the 8 built-in constants (0,1,2,3,4,5,0.5,10) */
+    ASSEMBLE_ARM32_ERR_BAD_FP_IMMEDIATE,        /* FPA #imm is not one of the 8 built-in constants (0,1,2,3,4,5,0.5,10) */
+    ASSEMBLE_ARM32_ERR_BAD_DATATYPE             /* NEON .dt suffix missing/malformed, or not valid for this mnemonic/register combination */
 } assemble_arm32_error_variant_t;
 
 /*******************************************************************

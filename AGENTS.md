@@ -21,7 +21,7 @@ Five backends exist today:
 | 6809         | `h/assemble_6809`, `c/assemble_6809`       | 6809 (single dialect)            |
 | x86-64       | `h/assemble_x86_64`, `c/assemble_x86_64`   | x86-64, limited (see below)      |
 | Z80          | `h/assemble_z80`, `c/assemble_z80`         | Z80, including common undocumented forms |
-| ARM32        | `h/assemble_arm32`, `c/assemble_arm32`     | base ARM (ARMv4-ARMv8 AArch32 subset) + legacy FPA + classic VFP scalar (dialect via OPT bits); NEON/SIMD is a separate follow-on backend, not yet added (see below) |
+| ARM32        | `h/assemble_arm32`, `c/assemble_arm32`     | base ARM (ARMv4-ARMv8 AArch32 subset) + legacy FPA + classic VFP scalar + partial NEON/SIMD (dialect via OPT bits, see below) |
 
 Shared infrastructure lives in `h/assemble_common` / `c/assemble_common`.
 
@@ -276,20 +276,91 @@ real encoding packs signedness and rounding-mode selection across
 non-adjacent bits in a way that couldn't be pinned down to the same
 confidence as the rest of this port without a live reference; so are the
 `VMOV`-immediate and two-core-register (`VMOV Rt,Rt2,Sm,Sm+1`) forms.
-NEON/SIMD and the ARMv8-only VFP additions (`VRINT*`, `VSEL*`,
-`VMAXNM`/`VMINNM`, directed-rounding `VCVT`) are a much larger separate
-follow-on piece (not yet added) — per a 2026-07 reconnaissance pass over
-`VFPLib/VFPLib`'s ~540 generated syntax patterns, roughly 83% of the full
-VFP+NEON+ARMv8 pattern count is NEON/SIMD, spread across an estimated
-75-90 "instruction family" implementations versus the ~20 covered here,
-and several of the remaining families (`VMOV`/`VMVN`'s immediate `cmode`
-table, shift-immediate bitfield formulas, datatype-conditional structure-
-load alignment) are meaningfully higher-risk to get bit-exact than
-anything ported so far — deliberately deferred to its own session rather
-than rushed. `VLDR`/`VSTR` use the same word-aligned ±1020-byte
-addressing shape as the generic coprocessor LDC/STC and FPA LDF/STF (see
-above) — a third structurally similar but separate parse, in
-`encode_vfp_ldr_str`.
+`VLDR`/`VSTR` use the same word-aligned ±1020-byte addressing shape as
+the generic coprocessor LDC/STC and FPA LDF/STF (see above) — a third
+structurally similar but separate parse, in `encode_vfp_ldr_str`. The
+ARMv8-only VFP additions (`VRINT*`, `VSEL*`, `VMAXNM`/`VMINNM`,
+directed-rounding `VCVT`) are also not yet implemented.
+
+### NEON/Advanced SIMD
+
+NEON is a much larger follow-on piece than base ARM32+FPA+VFP scalar
+combined: a 2026-07 reconnaissance pass over `VFPLib/VFPLib`'s ~540
+generated syntax patterns found roughly 83% of the full VFP+NEON+ARMv8
+pattern count is NEON/SIMD, spread across an estimated 75-90 "instruction
+family" implementations versus the ~20 covered by VFP scalar. Unlike the
+rest of this backend (hand-derived from architecture knowledge and
+cross-checked against known reference encodings), `VFPLib/VFPLib` turned
+out to itself be a declarative table — `PROCvfp_addlookup` syntax
+patterns naming an encoding, plus `PROCvfp_addencoding` bitstrings like
+`"1111001U[0]0Vd[4]size[10]Vn[3210]Vd[3210]1000Vn[4]Q[0]Vm[4]0Vm[3210]"`
+giving every field's exact bit position — so this piece is being ported
+by mechanically extracting that table (bit position per named field,
+MSB-first, matching the standard ARM architecture reference manual
+diagrams) rather than re-deriving encodings from memory, which removes
+most of the nibble-position risk that bit the x86-64 backend early on.
+
+So far this covers the "three registers of the same length" family
+(ARM DDI 0406C A7.4.1/A7.4.4/A7.4.5) — every NEON mnemonic of the shape
+`{Dd|Qd},{Dn|Qn},{Dm|Qm}`, listed in the README's ARM32 section. A few
+design points worth knowing before extending this further:
+
+- NEON data-processing instructions are unconditional (cond field fixed
+  to `0xF`) and never take an `S` suffix, unlike every other family in
+  this backend — `encode_neon_three_same` and friends explicitly reject
+  a parsed condition code rather than silently ignoring it.
+- `VADD`/`VSUB`/`VMUL`/`VMLA`/`VMLS` each have *both* a scalar VFP form
+  (`{S|D}d,{S|D}n,{S|D}m`, needs `F32`/`F64` dt, optional condition code)
+  and a NEON three-same form (`Dd/Qd`, any dt, unconditional) — the same
+  "two entries can't share one root" constraint as `VMOV` above, solved
+  the same way: `encode_vfp_or_neon_arith3` parses the dt and peeks at
+  the following register (`Sd`, or `Dd` with dt `F64`, means scalar;
+  anything else means NEON) and dispatches accordingly, delegating the
+  scalar case to the existing `encode_vfp_arith3` via a small shim table
+  translating its tag (0=ADD..4=MLS) into that function's opc1/opc3
+  param convention.
+- Several mnemonics (`VABD`, `VCEQ`, `VCGE`, `VCGT`, `VMAX`, `VMIN`,
+  `VPMAX`, `VPMIN`, `VPADD`) have *both* an integer/S/U-dt three-same
+  form and an F32-only one, selected by the parsed datatype rather than
+  by register class — `encode_neon_three_same` (the generic handler
+  behind `FAMILY_NEON_3SAME`) branches on `dt.kind == 'F'` and reads
+  whichever of `param1` (integer form) / `param2` (float form) applies;
+  a mnemonic missing one form sets that param's `has_int`/`has_float`
+  flag bit to 0 and any attempt to use it raises
+  `ASSEMBLE_ARM32_ERR_BAD_DATATYPE`.
+- `VCLE`/`VCLT`/`VACLE`/`VACLT` don't have their own encodings — per
+  VFPLib's syntax table they assemble as `VCGE`/`VCGT`/`VACGE`/`VACGT`
+  with operands 2 and 3 swapped (`VCLE Vd,Vn,Vm` ≡ `VCGE Vd,Vm,Vn`).
+  The swap is a property of the *mnemonic*, not of which encoding form
+  (integer or float) ends up being used, so it's a single `param1` bit
+  checked once before the integer/float branch, not duplicated per form
+  — an earlier draft got this wrong by putting the swap flag only on
+  the float-form param and missed that the integer form needs it too.
+- `VAND`/`VBIC`/`VORR`/`VORN`/`VEOR`/`VBSL`/`VBIT`/`VBIF` (`FAMILY_
+  NEON_3SAME_LOGICAL`) are size-independent — their optional `.<size>`
+  suffix is parsed (to accept real syntax like `VAND.I32`) and then
+  discarded, since it has no effect on the encoding.
+- Anonymous `struct { ... }` typed identically in two different local
+  declarations are *not* the same type to the Norcroft C89 compiler
+  (`'=': implicit cast of pointer to non-equal pointer`), which
+  surfaced when a small per-tag constant lookup table and the pointer
+  into it were declared with separately-spelled-out anonymous struct
+  types; fixed by using a plain `uint32_t [5][N]` array indexed
+  directly instead of a struct pointer.
+
+Everything else NEON — shift-by-immediate (`VSHL`/`VSHR`/`VSRA`/`VSLI`/
+`VSRI`/`VQSHL`-immediate/`VSHLL`/`VSHRN`/...), long/wide/narrow
+arithmetic (`VADDL`/`VMLAL`/`VMULL`/`VQDMULL`/`VMOVL`/`VMOVN`/...),
+by-scalar multiply forms (`VMUL`/`VMLA`/`VMLAL`/... with a `Dm[x]`
+indexed operand), move/duplicate/table/permute (`VMOV`-immediate,
+`VMVN`, `VDUP`, `VEXT`, `VTBL`/`VTBX`, `VSWP`, `VTRN`/`VUZP`/`VZIP`,
+`VREV16`/`VREV32`/`VREV64`), load/store (`VLD1`-`VLD4`/`VST1`-`VST4`,
+all alignment/lane/multiple-structure forms), and the convert/ARMv8-only
+additions (`VCVT` all forms, `VCVTB`/`VCVTT`, `VRINT*`, `VSEL*`,
+`VMAXNM`/`VMINNM`) remain a follow-on — several of those (the shift-
+immediate bitfield-width formulas, `VMOV`/`VMVN`'s immediate `cmode`
+table, datatype-conditional structure-load alignment) are meaningfully
+higher-risk to get bit-exact than anything ported so far.
 
 ## Source material handling
 
