@@ -1,0 +1,132 @@
+/*******************************************************************
+ * File:        tests_registry
+ * Purpose:     Self-tests for the assemble_registry directory --
+ *              catches a backend being added/removed without its
+ *              table entry being kept in step.
+ * Author:      Charles Ferguson (Gerph)
+ ******************************************************************/
+
+#include <stdio.h>
+#include <string.h>
+
+#include "tests.h"
+#include "assemble_registry.h"
+
+static int passed = 0;
+static int failed = 0;
+
+static void check(int ok, const char *description)
+{
+    if (ok)
+    {
+        passed += 1;
+    }
+    else
+    {
+        printf("FAIL: %s\n", description);
+        failed += 1;
+    }
+}
+
+static void check_class(assemble_cpu_class_t cpu_class, const char *expect_name)
+{
+    const assemble_interface_t *iface = assemble_find_by_class(cpu_class);
+
+    if (iface == NULL)
+    {
+        printf("FAIL: assemble_find_by_class(%d) found nothing (expected \"%s\")\n", (int) cpu_class, expect_name);
+        failed += 1;
+        return;
+    }
+    check(iface->cpu_class == cpu_class, "find_by_class result has the class it was looked up by");
+    check(strcmp(iface->name, expect_name) == 0, "find_by_class result has the expected canonical name");
+    check(iface->assemble_line != NULL, "find_by_class result has a non-NULL assemble_line entry point");
+    check(iface->max_instruction_length > 0, "find_by_class result has a non-zero max_instruction_length");
+    check((iface->opt_flag_count == 0) == (iface->opt_flags == NULL),
+          "opt_flags is NULL exactly when opt_flag_count is 0");
+}
+
+static void check_name(const char *name, assemble_cpu_class_t expect_class, uint32_t expect_opt)
+{
+    uint32_t opt = 0xFFFFFFFFu;
+    const assemble_interface_t *iface = assemble_find_by_name(name, &opt);
+
+    if (iface == NULL)
+    {
+        printf("FAIL: assemble_find_by_name(\"%s\") found nothing\n", name);
+        failed += 1;
+        return;
+    }
+    check(iface->cpu_class == expect_class, "find_by_name result selects the expected backend");
+    check(opt == expect_opt, "find_by_name reports the expected default OPT value");
+}
+
+int run_tests_registry(void)
+{
+    size_t count;
+    const assemble_interface_t *interfaces;
+    const assemble_alias_t *aliases;
+    size_t i;
+    uint32_t opt;
+
+    passed = 0;
+    failed = 0;
+
+    interfaces = assemble_get_interfaces(&count);
+    check(interfaces != NULL && count == 6, "assemble_get_interfaces returns all six backends");
+
+    check_class(ASSEMBLE_CPU_6502,   "6502");
+    check_class(ASSEMBLE_CPU_6809,   "6809");
+    check_class(ASSEMBLE_CPU_X86_64, "x86-64");
+    check_class(ASSEMBLE_CPU_Z80,    "z80");
+    check_class(ASSEMBLE_CPU_ARM32,  "arm32");
+    check_class(ASSEMBLE_CPU_RISCV,  "riscv");
+
+    check(assemble_find_by_class(ASSEMBLE_CPU_GENERIC) == NULL,
+          "find_by_class(GENERIC) finds nothing, since it isn't a backend");
+
+    check_name("6502",   ASSEMBLE_CPU_6502,  0);
+    check_name("arm32",  ASSEMBLE_CPU_ARM32, 0);
+    check_name("riscv",  ASSEMBLE_CPU_RISCV, 0);
+    check_name("65c02",       ASSEMBLE_CPU_6502,  0x10u);
+    check_name("65c816",      ASSEMBLE_CPU_6502,  0x20u);
+    check_name("arm32-fpa",   ASSEMBLE_CPU_ARM32, 0x10u);
+    check_name("arm32-vfp",   ASSEMBLE_CPU_ARM32, 0x20u);
+    check_name("arm32-thumb", ASSEMBLE_CPU_ARM32, 0x40u);
+
+    opt = 0;
+    check(assemble_find_by_name("not-a-real-cpu", &opt) == NULL, "find_by_name rejects an unrecognised name");
+
+    /* Every alias must resolve to a real backend, and every OPT flag
+       bit described by a backend must actually be non-zero and
+       distinct within that backend (so two flags can't be confused
+       with each other). */
+    aliases = assemble_get_aliases(&count);
+    for (i = 0; i < count; i++)
+    {
+        check(assemble_find_by_class(aliases[i].cpu_class) != NULL,
+              "each alias's cpu_class resolves to a registered backend");
+    }
+
+    interfaces = assemble_get_interfaces(&count);
+    for (i = 0; i < count; i++)
+    {
+        size_t j;
+
+        for (j = 0; j < interfaces[i].opt_flag_count; j++)
+        {
+            size_t k;
+
+            check(interfaces[i].opt_flags[j].bit != 0, "an OPT flag's bit value is non-zero");
+            for (k = j + 1; k < interfaces[i].opt_flag_count; k++)
+            {
+                check(interfaces[i].opt_flags[j].bit != interfaces[i].opt_flags[k].bit,
+                      "no two OPT flags on the same backend share a bit value");
+            }
+        }
+    }
+
+    printf("assemble_registry: %d passed, %d failed (of %d)\n", passed, failed, passed + failed);
+
+    return failed;
+}

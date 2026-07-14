@@ -1,0 +1,123 @@
+/*******************************************************************
+ * File:        assemble_registry
+ * Purpose:     A directory of every assembler backend in this
+ *              library. Lets a caller enumerate the available
+ *              backends (eg for a help/listing display) or look one
+ *              up by CPU class or by name, without needing to know
+ *              in advance which backends exist or #include each
+ *              backend's own header directly.
+ * Author:      Charles Ferguson (Gerph)
+ ******************************************************************/
+
+#ifndef ASSEMBLE_REGISTRY_H
+#define ASSEMBLE_REGISTRY_H
+
+#include <stdint.h>
+#include <stddef.h>
+
+#include "kernel.h"
+#include "assemble_common.h"
+
+/* The shape shared by every assemble_<name>_line() entry point. */
+typedef _kernel_oserror *(*assemble_line_fn)(assemble_context_t *context,
+                                              const uint8_t *line,
+                                              size_t line_length);
+
+/* Describes one CPU-specific dialect bit accepted by a backend's
+   context->opt (bits 4 and up -- see that backend's own header for
+   the #define and full details; this is a short summary for
+   enumeration/help purposes, not a replacement for it). */
+typedef struct assemble_opt_flag
+{
+    uint32_t    bit;          /* eg ASSEMBLE_ARM32_OPT_FPA */
+    const char *name;         /* short name, eg "fpa" */
+    const char *description;  /* one-line description of what setting this bit enables */
+} assemble_opt_flag_t;
+
+/* One row per backend in the table returned by assemble_get_interfaces(). */
+typedef struct assemble_interface
+{
+    assemble_cpu_class_t       cpu_class;    /* which backend this is */
+    const char                *name;         /* canonical name, eg "arm32" */
+    const char                *description;  /* one-line summary of the instruction set */
+    assemble_line_fn            assemble_line; /* the assemble_<name>_line entry point */
+
+    /* Worst-case bytes a single assemble_<name>_line() call can write
+       for a genuine (fixed-shape) instruction or pseudo-instruction --
+       enough to size a minimum output buffer. This deliberately
+       excludes pseudo-ops that take an unbounded comma-separated list
+       (DCB/DCW/DCD, DEFM) or a string-literal operand, which have no
+       fixed upper bound; see that backend's own header/AGENTS.md for
+       which pseudo-ops those are. */
+    uint32_t                    max_instruction_length;
+
+    const assemble_opt_flag_t  *opt_flags;      /* CPU-specific OPT bits, or NULL if opt_flag_count==0 */
+    size_t                      opt_flag_count;
+} assemble_interface_t;
+
+/* One row per alias in the table returned by assemble_get_aliases() --
+   a name that selects a backend plus a preset default OPT value (eg
+   "65c02" selects the 6502 backend with ASSEMBLE_6502_OPT_65C02
+   already set, "arm32-thumb" selects the ARM32 backend with
+   ASSEMBLE_ARM32_OPT_THUMB already set). This is how a caller (eg a
+   command-line -cpu argument) standardises the historical "backend
+   plus preset dialect" shortcut names on top of the plain per-backend
+   table, without every caller re-inventing its own alias list. */
+typedef struct assemble_alias
+{
+    const char           *name;      /* alias name, eg "65c02" */
+    assemble_cpu_class_t  cpu_class; /* which backend this alias selects */
+    uint32_t              opt;       /* the default initial OPT value for this alias */
+} assemble_alias_t;
+
+/*******************************************************************
+ Function:      assemble_get_interfaces
+ Description:   Returns the static table describing every backend in
+                this library, for enumeration (eg building a help or
+                -list style display).
+ Parameters:    out_count = [[out]] number of entries in the returned array
+ Returns:       pointer to the first entry of a static array
+ ******************************************************************/
+const assemble_interface_t *assemble_get_interfaces(size_t *out_count);
+
+/*******************************************************************
+ Function:      assemble_get_aliases
+ Description:   Returns the static table of CLI-style aliases -- a
+                name that selects a backend plus a preset default OPT
+                value (eg "65c02", "arm32-fpa", "arm32-thumb").
+ Parameters:    out_count = [[out]] number of entries in the returned array
+ Returns:       pointer to the first entry of a static array
+ ******************************************************************/
+const assemble_alias_t *assemble_get_aliases(size_t *out_count);
+
+/*******************************************************************
+ Function:      assemble_find_by_class
+ Description:   Finds the backend registered for a given CPU class.
+ Parameters:    cpu_class = the backend to find
+ Returns:       pointer to its static assemble_interface_t entry, or
+                NULL if cpu_class is not a recognised backend (eg
+                ASSEMBLE_CPU_GENERIC)
+ ******************************************************************/
+const assemble_interface_t *assemble_find_by_class(assemble_cpu_class_t cpu_class);
+
+/*******************************************************************
+ Function:      assemble_find_by_name
+ Description:   Finds the backend selected by a name, matching first
+                against the alias table (eg "65c02", "arm32-thumb")
+                and then against each backend's own canonical name
+                (eg "arm32"). Matching is case-sensitive, following
+                the lower-case convention used by every existing name.
+ Parameters:    name = the name to look up (NUL-terminated)
+                out_default_opt = [[out]] the OPT value to use as a
+                          starting point for this name -- 0 for a
+                          canonical backend name, or the alias's
+                          preset dialect bits for an alias name. The
+                          caller remains free to override this
+                          afterwards (eg from an explicit -opt
+                          argument).
+ Returns:       pointer to the matching static assemble_interface_t
+                entry, or NULL if no backend or alias matches 'name'
+ ******************************************************************/
+const assemble_interface_t *assemble_find_by_name(const char *name, uint32_t *out_default_opt);
+
+#endif

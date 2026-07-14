@@ -15,7 +15,7 @@ The project builds as three separate pieces, each with its own Makefile:
 | Makefile             | Type      | Produces                                              |
 |-----------------------|-----------|--------------------------------------------------------|
 | `MakefileLib,fe1`     | `LibExport` | `libAssemble` — the backends themselves, plus exported headers |
-| `MakefileTests,fe1`   | `command` (`aif`) | `AssembleTest` — `c/main` calls each backend's `run_tests_<name>()` in sequence and returns the total failure count as the exit code |
+| `MakefileTests,fe1`   | `command` (`aif`) | `AssembleTest` — `c/tests` calls each backend's `run_tests_<name>()` in sequence and returns the total failure count as the exit code |
 | `Makefile,fe1`        | `command` (`aif`) | `Assemble` — a real `*Assemble -cpu <cpu> -input <source> -output <binary>` command-line tool, linking against the built `libAssemble` |
 
 Six backends exist today:
@@ -30,6 +30,9 @@ Six backends exist today:
 | RISC-V       | `h/assemble_riscv`, `c/assemble_riscv`     | RV32I base integer ISA + Zicsr (single dialect, see below) |
 
 Shared infrastructure lives in `h/assemble_common` / `c/assemble_common`.
+A directory of every backend -- for enumeration and by-class/by-name lookup,
+so a caller doesn't need to know the backend list in advance -- lives in
+`h/assemble_registry` / `c/assemble_registry` (see "Backend registry" below).
 
 ## Building and testing
 
@@ -143,6 +146,53 @@ Each `c/tests_<name>` file is self-contained and follows the same shape:
 When adding tests, prefer at least one **independently verifiable** case
 before scaling up (a well-known encoding you can check by hand or against a
 reference) — see "Lessons from the x86-64 port" below for why this matters.
+
+### Backend registry (`h/assemble_registry`, `c/assemble_registry`)
+
+A static table (`assemble_interfaces[]`, one row per backend, exposed via
+`assemble_get_interfaces()`/`assemble_find_by_class()`/
+`assemble_find_by_name()`) so a caller — the `*Assemble` command-line tool's
+`-cpu` handling and `-list` output, in `c/main`, are the first real callers —
+doesn't need to `#include` every backend header or hard-code the backend
+list itself. Each row carries the backend's `assemble_cpu_class_t`,
+canonical name, one-line description, `assemble_<name>_line` function
+pointer, `max_instruction_length`, and an array of CPU-specific OPT-bit
+descriptors (name + bit + description) for backends that have any.
+
+This file necessarily sits *above* the backend layer (it's the one place in
+the library that `#include`s every backend header at once), unlike every
+other shared-infrastructure file, which the backends themselves depend on.
+Keep it that way round — a backend header must never include
+`assemble_registry.h`.
+
+- `max_instruction_length` is the worst case for a genuine fixed-shape
+  instruction or pseudo-instruction, deliberately excluding pseudo-ops that
+  take an unbounded comma-separated list (`DCB`/`DCW`/`DCD`, `DEFM`) or a
+  string-literal operand (which have no fixed upper bound) — see the README
+  table for the six current figures and the specific case that achieves
+  each one. Getting this number right needed an actual audit of each
+  backend's addressing modes/opcode tables, not a guess from the
+  architecture's typical instruction width — eg 6809's 5-byte maximum
+  (a page-2-prefixed 2-byte opcode plus a 16-bit indexed offset) is easy to
+  miss if you only think about its "normal" 1-2 byte opcodes, and ARM32's
+  Thumb mode still tops out at 4 bytes (not 2), because `BL`/`BLX label`
+  emits its two-halfword pair from a single `assemble_arm32_line()` call.
+  If you add a backend or extend an existing one's addressing modes, check
+  whether this number needs revisiting rather than assuming it's still
+  right.
+- A second table (`assemble_aliases[]`, via `assemble_get_aliases()`) maps a
+  name that bundles a backend with a preset default OPT value — `65c02`,
+  `65c816`, `arm32-fpa`, `arm32-vfp`, `arm32-thumb` — onto that backend's
+  `assemble_cpu_class_t` plus the OPT value. `assemble_find_by_name()`
+  checks this table before falling back to matching a backend's own
+  canonical name, and returns the matched default OPT value via an
+  out-parameter the caller remains free to override (eg from an explicit
+  `-opt` argument) — `c/main`'s `-opt` always fully replaces whatever
+  `-cpu` selected, rather than being OR'd with it, so `-cpu arm32-thumb
+  -opt <n>` needs `<n>` to already include `ASSEMBLE_ARM32_OPT_THUMB` if
+  the caller wants both the standard `ASSEMBLE_OPT_*` bits and the dialect.
+  If you add a new dialect-preset alias, add its bit to the table alongside
+  the existing ones rather than special-casing it in `c/main`.
 
 ## Backend-specific notes
 

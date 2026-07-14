@@ -63,4 +63,13 @@ int run_tests_arm32(void);
  ******************************************************************/
 int run_tests_riscv(void);
 
+/*******************************************************************
+ Function:      run_tests_registry
+ Description:   Runs all assemble_registry self-tests, printing a line
+                per failure and a summary at the end.
+ Parameters:    none
+ Returns:       the number of failing tests (0 if all passed)
+ ******************************************************************/
+int run_tests_registry(void);
+
 #endif

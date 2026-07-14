@@ -11,19 +11,12 @@
 #include <limits.h>
 
 #include "assemble_common.h"
-#include "assemble_6502.h"
-#include "assemble_6809.h"
-#include "assemble_z80.h"
-#include "assemble_x86_64.h"
-#include "assemble_arm32.h"
-#include "assemble_riscv.h"
+#include "assemble_registry.h"
 
 #define MAX_SYMBOLS 256
 #define MAX_NAME 64
 #define MAX_LINE 1024
 #define COMMAND_ERROR 0x7f000001
-
-typedef _kernel_oserror *(*assembler_fn)(assemble_context_t *, const uint8_t *, size_t);
 
 typedef struct source_line
 {
@@ -56,7 +49,7 @@ typedef struct command_options
     const char *output_name;
     uint32_t initial_org;
     uint32_t initial_opt;
-    assembler_fn assembler;
+    assemble_line_fn assembler;
 } command_options_t;
 
 /*******************************************************************
@@ -416,20 +409,62 @@ static int directive_after_label(const source_line_t *line, const char **body)
 
 static int select_cpu(command_options_t *options, const char *name)
 {
+    const assemble_interface_t *iface;
+    uint32_t default_opt = 0;
+
+    iface = assemble_find_by_name(name, &default_opt);
+    if (iface == NULL)
+    {
+        return 0;
+    }
     options->cpu_name = name;
-    options->initial_opt = 0;
-    if (strcmp(name, "6502") == 0) options->assembler = assemble_6502_line;
-    else if (strcmp(name, "65c02") == 0) { options->assembler = assemble_6502_line; options->initial_opt = ASSEMBLE_6502_OPT_65C02; }
-    else if (strcmp(name, "65c816") == 0) { options->assembler = assemble_6502_line; options->initial_opt = ASSEMBLE_6502_OPT_65C816; }
-    else if (strcmp(name, "6809") == 0) options->assembler = assemble_6809_line;
-    else if (strcmp(name, "z80") == 0) options->assembler = assemble_z80_line;
-    else if (strcmp(name, "x86-64") == 0) options->assembler = assemble_x86_64_line;
-    else if (strcmp(name, "arm32") == 0) options->assembler = assemble_arm32_line;
-    else if (strcmp(name, "arm32-fpa") == 0) { options->assembler = assemble_arm32_line; options->initial_opt = ASSEMBLE_ARM32_OPT_FPA; }
-    else if (strcmp(name, "arm32-vfp") == 0) { options->assembler = assemble_arm32_line; options->initial_opt = ASSEMBLE_ARM32_OPT_VFP; }
-    else if (strcmp(name, "riscv") == 0) options->assembler = assemble_riscv_line;
-    else return 0;
+    options->assembler = iface->assemble_line;
+    options->initial_opt = default_opt;
     return 1;
+}
+
+/*******************************************************************
+ Function:      list_interfaces
+ Description:   Prints every backend registered in assemble_registry
+                (name, description, minimum output buffer size and
+                any CPU-specific OPT bits), followed by the -cpu
+                aliases that select a backend with a preset OPT value.
+                Used by '*Assemble -list'.
+ Parameters:    none
+ Returns:       nothing
+ ******************************************************************/
+static void list_interfaces(void)
+{
+    size_t count, alias_count, i;
+    const assemble_interface_t *interfaces = assemble_get_interfaces(&count);
+    const assemble_alias_t *aliases = assemble_get_aliases(&alias_count);
+
+    printf("Available -cpu names:\n\n");
+    for (i = 0; i < count; i++)
+    {
+        const assemble_interface_t *iface = &interfaces[i];
+        size_t j;
+
+        printf("  %-8s %s\n", iface->name, iface->description);
+        printf("           minimum output buffer: %u bytes\n", (unsigned) iface->max_instruction_length);
+        for (j = 0; j < iface->opt_flag_count; j++)
+        {
+            printf("           -opt +&%02X: %s\n",
+                   (unsigned) iface->opt_flags[j].bit, iface->opt_flags[j].description);
+        }
+    }
+
+    if (alias_count != 0)
+    {
+        printf("\nAliases (a backend name plus a preset -opt value):\n\n");
+        for (i = 0; i < alias_count; i++)
+        {
+            const assemble_interface_t *base = assemble_find_by_class(aliases[i].cpu_class);
+
+            printf("  %-14s -> -cpu %s -opt &%02X\n",
+                   aliases[i].name, base != NULL ? base->name : "?", (unsigned) aliases[i].opt);
+        }
+    }
 }
 
 static int parse_options(int argc, char **argv, command_options_t *options)
@@ -564,9 +599,15 @@ int main(int argc, char *argv[])
     FILE *output;
     char buffer[MAX_LINE];
     uint8_t *image;
+    if (argc == 2 && strcmp(argv[1], "-list") == 0)
+    {
+        list_interfaces();
+        return EXIT_SUCCESS;
+    }
     if (!parse_options(argc, argv, &options))
     {
-        fprintf(stderr, "Syntax: *Assemble -cpu <cpu> -input <source> -output <binary> [-org <expression>] [-opt <expression>]\n");
+        fprintf(stderr, "Syntax: *Assemble -cpu <cpu> -input <source> -output <binary> [-org <expression>] [-opt <expression>]\n"
+                         "        *Assemble -list\n");
         return EXIT_FAILURE;
     }
     input = fopen(options.input_name, "r");

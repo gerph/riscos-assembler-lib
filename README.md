@@ -6,11 +6,14 @@ be driven one source line at a time by a host such as a BASIC inline
 assembler, assembling a `[...]` block line-by-line across one or more
 passes.
 
-The library itself builds as a `command` type project; the resulting
-`Assemble` binary's `main()` runs the self-test suite for every backend and
-exits with a non-zero status if any test fails. There is currently no BASIC
-integration — nothing wires this into BASIC's own inline assembler — but the
-interface is designed to make that straightforward for a future caller.
+The project builds as three pieces: `MakefileLib` builds the `libAssemble`
+library itself (the backends below, plus exported headers); `MakefileTests`
+builds an `AssembleTest` command that runs every backend's self-test suite
+and exits with a non-zero status if any test fails; `Makefile` builds a real
+`*Assemble -cpu <cpu> -input <source> -output <binary>` command-line tool
+linked against `libAssemble`. There is currently no BASIC integration —
+nothing wires this into BASIC's own inline assembler — but the interface is
+designed to make that straightforward for a future caller.
 
 ## Backends
 
@@ -25,6 +28,56 @@ interface is designed to make that straightforward for a future caller.
 
 Shared infrastructure (the assembly context, error reporting, byte/word
 emission helpers) lives in `h.assemble_common` / `c.assemble_common`.
+
+## Discovering backends at runtime
+
+A caller doesn't need to know the six backends above in advance, or
+`#include` each backend's own header directly: `h.assemble_registry` /
+`c.assemble_registry` provide a directory of every backend, so a caller can
+enumerate what's available or look one up by CPU class or by name.
+
+```c
+typedef struct assemble_interface
+{
+    assemble_cpu_class_t       cpu_class;
+    const char                *name;                 /* eg "arm32" */
+    const char                *description;
+    assemble_line_fn            assemble_line;         /* eg assemble_arm32_line */
+    uint32_t                    max_instruction_length; /* minimum output buffer size, in bytes */
+    const assemble_opt_flag_t  *opt_flags;             /* CPU-specific OPT bits, or NULL */
+    size_t                      opt_flag_count;
+} assemble_interface_t;
+
+const assemble_interface_t *assemble_get_interfaces(size_t *out_count);
+const assemble_interface_t *assemble_find_by_class(assemble_cpu_class_t cpu_class);
+const assemble_interface_t *assemble_find_by_name(const char *name, uint32_t *out_default_opt);
+```
+
+`max_instruction_length` is the worst case for a genuine fixed-shape
+instruction or pseudo-instruction on that backend — enough to size a minimum
+output buffer. It deliberately excludes pseudo-ops that take an unbounded
+comma-separated list (`DCB`/`DCW`/`DCD`, `DEFM`) or a string-literal operand,
+which have no fixed upper bound (see each backend's own header, or
+`AGENTS.md`, for exactly which those are and how the figure below was
+derived):
+
+| Backend | `max_instruction_length` | Worst case |
+|---------|--------------------------|------------|
+| 6502    | 4  | 65C816 absolute-long addressing (1 opcode + 3-byte address) |
+| 6809    | 5  | page-2-prefixed opcode (2 bytes) + 16-bit indexed offset, or extended-indirect `[nnnn]` |
+| x86-64  | 13 | segment prefix + REX + opcode + ModRM + SIB + disp32 + imm32 |
+| Z80     | 4  | `DD`/`FD CB`-prefixed bit/rotate/shift on `(IX+d)`/`(IY+d)`, or `LD (IX+d),n` |
+| ARM32   | 4  | any ARM-state instruction word, or Thumb `BL`/`BLX`'s two-halfword pair (also 4 bytes, from one call) |
+| RISC-V  | 8  | the `LI`/`CALL` pseudo-instructions, which always expand to a fixed two-instruction pair |
+
+`assemble_find_by_name()` also matches a small table of CLI-style aliases —
+a name that selects a backend plus a preset default OPT value, eg `65c02`,
+`65c816`, `arm32-fpa`, `arm32-vfp` and `arm32-thumb` — returned via
+`out_default_opt` so a caller (typically parsing a `-cpu` argument) doesn't
+need its own copy of that mapping. `assemble_get_aliases()` returns that
+table directly for enumeration. The `*Assemble` command-line tool (`c.main`)
+uses this registry for its own `-cpu` handling, and `*Assemble -list` prints
+the full enumeration.
 
 ## Building and testing
 

@@ -41,12 +41,14 @@ OBJS       = o.tests \
              o.assemble_z80 \
              o.assemble_arm32 \
              o.assemble_riscv \
+             o.assemble_registry \
              o.tests_6502 \
              o.tests_6809 \
              o.tests_x86_64 \
              o.tests_z80 \
              o.tests_arm32 \
-             o.tests_riscv
+             o.tests_riscv \
+             o.tests_registry
 
 # Space separated list of XML files for building documentation.
 #DOCSRC = <prm-in-xml-sources>

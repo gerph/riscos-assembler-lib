@@ -1,0 +1,144 @@
+/*******************************************************************
+ * File:        assemble_registry
+ * Purpose:     A directory of every assembler backend in this
+ *              library -- see h/assemble_registry.
+ * Author:      Charles Ferguson (Gerph)
+ ******************************************************************/
+
+#include <string.h>
+
+#include "assemble_registry.h"
+#include "assemble_6502.h"
+#include "assemble_6809.h"
+#include "assemble_x86_64.h"
+#include "assemble_z80.h"
+#include "assemble_arm32.h"
+#include "assemble_riscv.h"
+
+#define OPT_FLAG_COUNT(array) (sizeof(array) / sizeof((array)[0]))
+
+static const assemble_opt_flag_t opt_flags_6502[] = {
+    { ASSEMBLE_6502_OPT_65C02,  "65c02",  "Enable 65C02 instructions" },
+    { ASSEMBLE_6502_OPT_65C816, "65c816", "Enable 65C816 instructions (also enables 65C02)" }
+};
+
+static const assemble_opt_flag_t opt_flags_arm32[] = {
+    { ASSEMBLE_ARM32_OPT_FPA,   "fpa",   "Enable legacy FPA floating-point coprocessor instructions" },
+    { ASSEMBLE_ARM32_OPT_VFP,   "vfp",   "Enable classic VFP scalar and NEON/Advanced SIMD instructions" },
+    { ASSEMBLE_ARM32_OPT_THUMB, "thumb", "Assemble as classic 16-bit Thumb instead of 32-bit ARM" }
+};
+
+/* max_instruction_length is the worst case for a genuine fixed-shape
+   instruction or pseudo-instruction on that backend, excluding
+   unbounded comma-list/string-literal pseudo-ops -- see AGENTS.md for
+   how each of these was derived:
+     6502   4 -- 65C816 absolute-long addressing (1 opcode + 3-byte address)
+     6809   5 -- page-2-prefixed opcode (2 bytes) + 16-bit indexed offset
+                 or extended-indirect '[nnnn]' (postbyte + 2 bytes)
+     x86-64 13 -- segment prefix + REX + opcode + ModRM + SIB + disp32 + imm32
+     z80    4 -- DDCB/FDCB-prefixed bit/rotate/shift on (IX+d)/(IY+d),
+                 or 'LD (IX+d),n'
+     arm32  4 -- any ARM-state instruction word, or Thumb BL/BLX's
+                 two-halfword pair (also 4 bytes, from one call)
+     riscv  8 -- the LI/CALL pseudo-instructions, which always expand
+                 to a fixed two-instruction LUI+ADDI/AUIPC+JALR pair
+                 regardless of the value */
+static const assemble_interface_t interfaces[] = {
+    {
+        ASSEMBLE_CPU_6502, "6502",
+        "MOS 6502 / WDC 65C02 / 65C816 (dialect via OPT bits)",
+        assemble_6502_line, 4,
+        opt_flags_6502, OPT_FLAG_COUNT(opt_flags_6502)
+    },
+    {
+        ASSEMBLE_CPU_6809, "6809",
+        "Motorola 6809",
+        assemble_6809_line, 5,
+        NULL, 0
+    },
+    {
+        ASSEMBLE_CPU_X86_64, "x86-64",
+        "x86-64, limited subset (no privileged instructions, no SSSE3/SSE4/AVX)",
+        assemble_x86_64_line, 13,
+        NULL, 0
+    },
+    {
+        ASSEMBLE_CPU_Z80, "z80",
+        "Zilog Z80 (including common undocumented forms)",
+        assemble_z80_line, 4,
+        NULL, 0
+    },
+    {
+        ASSEMBLE_CPU_ARM32, "arm32",
+        "32-bit ARM (ARMv4 - AArch32 subset of ARMv8), + legacy FPA/VFP/NEON via OPT bits",
+        assemble_arm32_line, 4,
+        opt_flags_arm32, OPT_FLAG_COUNT(opt_flags_arm32)
+    },
+    {
+        ASSEMBLE_CPU_RISCV, "riscv",
+        "RV32I base integer ISA + Zicsr",
+        assemble_riscv_line, 8,
+        NULL, 0
+    }
+};
+
+#define NUM_INTERFACES (sizeof(interfaces) / sizeof(interfaces[0]))
+
+static const assemble_alias_t aliases[] = {
+    { "65c02",       ASSEMBLE_CPU_6502,  ASSEMBLE_6502_OPT_65C02 },
+    { "65c816",      ASSEMBLE_CPU_6502,  ASSEMBLE_6502_OPT_65C816 },
+    { "arm32-fpa",   ASSEMBLE_CPU_ARM32, ASSEMBLE_ARM32_OPT_FPA },
+    { "arm32-vfp",   ASSEMBLE_CPU_ARM32, ASSEMBLE_ARM32_OPT_VFP },
+    { "arm32-thumb", ASSEMBLE_CPU_ARM32, ASSEMBLE_ARM32_OPT_THUMB }
+};
+
+#define NUM_ALIASES (sizeof(aliases) / sizeof(aliases[0]))
+
+const assemble_interface_t *assemble_get_interfaces(size_t *out_count)
+{
+    *out_count = NUM_INTERFACES;
+    return interfaces;
+}
+
+const assemble_alias_t *assemble_get_aliases(size_t *out_count)
+{
+    *out_count = NUM_ALIASES;
+    return aliases;
+}
+
+const assemble_interface_t *assemble_find_by_class(assemble_cpu_class_t cpu_class)
+{
+    size_t i;
+
+    for (i = 0; i < NUM_INTERFACES; i++)
+    {
+        if (interfaces[i].cpu_class == cpu_class)
+        {
+            return &interfaces[i];
+        }
+    }
+    return NULL;
+}
+
+const assemble_interface_t *assemble_find_by_name(const char *name, uint32_t *out_default_opt)
+{
+    size_t i;
+
+    for (i = 0; i < NUM_ALIASES; i++)
+    {
+        if (strcmp(aliases[i].name, name) == 0)
+        {
+            *out_default_opt = aliases[i].opt;
+            return assemble_find_by_class(aliases[i].cpu_class);
+        }
+    }
+    for (i = 0; i < NUM_INTERFACES; i++)
+    {
+        if (strcmp(interfaces[i].name, name) == 0)
+        {
+            *out_default_opt = 0;
+            return &interfaces[i];
+        }
+    }
+    return NULL;
+}
