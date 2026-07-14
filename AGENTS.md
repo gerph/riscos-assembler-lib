@@ -1057,6 +1057,19 @@ across the existing backends and worth keeping consistent if you add another:
   are ordinary table-driven mnemonics there, not special-cased) use the
   backend's native endianness (little-endian for 6502/x86-64/RISC-V,
   big-endian for 6809).
+- Every header (`h/assemble_common` and every backend/registry header) has
+  a "Known deficiencies"/"Known limitation(s)" comment, placed right after
+  the `#include`s and before the main type declarations, stating plainly
+  what the file doesn't do rather than leaving a gap for a reader to
+  discover the hard way (eg x86-64's missing privileged/SSSE3/SSE4/AVX
+  coverage, ARM32's omitted DSP-multiply/banked-MSR/FPA-LFM-SFM
+  instructions, RISC-V's missing RV32M/RV32A/RV32F/RV32D/RV32C/RV64 and
+  LI/CALL never relaxing to a shorter encoding, the registry's static
+  compiled-in-only backend/alias tables). A backend with nothing currently
+  known to be missing still gets the comment, saying so explicitly (eg
+  6502, 6809) — add one when you add a header, and update it when you
+  learn of (or deliberately accept) a new gap, rather than letting the
+  gap go undocumented until someone hits it.
 
 ## Git workflow
 

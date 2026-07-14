@@ -17,6 +17,16 @@
 #include "kernel.h"
 #include "assemble_common.h"
 
+/* Known deficiencies:
+   - This is a deliberately limited subset: privileged instructions and
+     SSSE3, SSE4 and AVX instructions are not supported.
+   - MOV reg64,name cannot resolve a BASIC/OS routine name, because this
+     library has no live runtime function registry. Use a numeric address;
+     this form raises ASSEMBLE_X86_64_ERR_SYSTEM_CALL_UNSUPPORTED.
+   - Immediate values are represented as signed 32-bit integers by the
+     shared interface, so a general 64-bit immediate cannot be represented.
+     A qword immediate is emitted by sign-extending that 32-bit value. */
+
 /* CPU-specific detail for errors raised by this backend; see
    ASSEMBLE_ERRNUM_VARIANT(). x86-64 has a single dialect, so
    (unlike assemble_6502) context->opt carries no CPU-specific bits;

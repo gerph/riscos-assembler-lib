@@ -19,6 +19,17 @@
 #include "kernel.h"
 #include "assemble_common.h"
 
+/* Known deficiencies:
+   - Base ARM32 omits the ARMv5TE/v6 'xy' DSP multiply family,
+     SMMLA/SMMLS/SMMUL, MRRC/MCRR, ARMv8 LDA/STL/LDAEX/STLEX, and
+     banked-register MSR/MRS.
+   - FPA omits LFM and SFM. Classic VFP omits VCVT, VMOV immediate, and
+     the two-core-register VMOV forms; ARMv8 VFP additions are absent.
+   - NEON/Advanced SIMD coverage is partial. In particular, structure
+     load/store single-lane and replicate forms are absent.
+   - Thumb support is classic 16-bit pre-Thumb-2 only. Literal-pool
+     LDR Rd,=const and ADR pseudo-instructions are not provided. */
+
 /* Dialect selection lives in the top bits of assemble_context_t's
    'opt' field, following the convention used elsewhere in this
    library (eg assemble_6502.h). The base ARM32 instruction set is

@@ -13,6 +13,9 @@
 #include "kernel.h"
 #include "assemble_common.h"
 
+/* Known deficiencies:
+   None are currently known within the declared 6809 instruction-set scope. */
+
 /* CPU-specific detail for errors raised by this backend; see
    ASSEMBLE_ERRNUM_VARIANT(). The 6809 has a single dialect, so
    (unlike assemble_6502) context->opt carries no CPU-specific bits;

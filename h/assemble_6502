@@ -14,6 +14,10 @@
 #include "kernel.h"
 #include "assemble_common.h"
 
+/* Known deficiencies:
+   None are currently known within the declared 6502, 65C02 and 65C816
+   instruction-set scope. */
+
 /* Dialect selection lives in the top bits of assemble_context_t's
    'opt' field, following the convention used by the historical
    Basic6502 patch: bit 5 selects 65C816 (which implies 65C02 too),

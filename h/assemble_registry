@@ -18,6 +18,9 @@
 #include "kernel.h"
 #include "assemble_common.h"
 
+/* Known limitation: the backend and alias lists are static tables compiled
+   into the library. Backends cannot be registered dynamically at run time. */
+
 /* The shape shared by every assemble_<name>_line() entry point. */
 typedef _kernel_oserror *(*assemble_line_fn)(assemble_context_t *context,
                                               const uint8_t *line,

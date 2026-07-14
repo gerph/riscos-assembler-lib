@@ -20,6 +20,15 @@
 #define ASSEMBLE_OPT_LIST  (1u << 0)  /* Produce an assembly listing */
 #define ASSEMBLE_OPT_ERROR (1u << 1)  /* Raise errors (rather than ignoring undefined labels) */
 
+/* Known shared limitations:
+   - The interface is line-at-a-time: callers provide parsing, source-line
+     iteration, multi-pass control, label storage and output-buffer storage.
+   - Values are limited to signed 32 bits so the common source builds with
+     the 32-bit Norcroft compiler. assemble_emit_qword() sign-extends a
+     32-bit value; it does not accept a general 64-bit integer.
+   - Error reporting uses one shared static error block, so it is not
+     re-entrant or thread-safe. RISC OS use of this library is single-threaded. */
+
 /*
  * Error reporting.
  *

@@ -18,6 +18,12 @@
 #include "kernel.h"
 #include "assemble_common.h"
 
+/* Known deficiencies:
+   - Only RV32I and Zicsr are implemented. RV32M, RV32A, RV32F, RV32D,
+     RV32C and other extensions, and all RV64 instruction sets, are absent.
+   - LI and CALL always use their fixed two-instruction expansions; no
+     relaxation selects shorter encodings when an immediate or target fits. */
+
 /* RV32I has a single dialect, so (unlike assemble_6502) context->opt
    carries no CPU-specific bits; only the standard ASSEMBLE_OPT_*
    bits apply. There is no RV32M/RV64I support -- see AGENTS.md. */

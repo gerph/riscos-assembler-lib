@@ -13,6 +13,12 @@
 #include "kernel.h"
 #include "assemble_common.h"
 
+/* Known deficiencies:
+   - EQU is not supported, matching the original BBC BASIC (Z80)
+     assembler on which this backend's pseudo-op behaviour is based.
+   - Undocumented instructions are always enabled; there is no dialect
+     option to restrict assembly to documented Z80 instructions. */
+
 /* The Z80 has a single dialect, so (unlike assemble_6502)
    context->opt carries no CPU-specific bits; only the standard
    ASSEMBLE_OPT_* bits apply. Undocumented instructions (IXH/IXL/
