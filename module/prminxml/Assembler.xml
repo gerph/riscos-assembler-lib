@@ -1,0 +1,47 @@
+<?xml version="1.0"?>
+<!DOCTYPE riscos-prm PUBLIC "-//Gerph//DTD PRM documentation 1.03//EN"
+                            "http://gerph.org/dtd/103/prm.dtd">
+<riscos-prm>
+<chapter title="Assembler module">
+<section title="Introduction and Overview">
+<p>The Assembler module provides a stateful SWI interface to the Assemble instruction-set library. A caller creates a context for a CPU, supplies values and source lines, and controls the usual one or two assembly passes.</p>
+<p>Contexts own their symbols but never own assembled output. The caller supplies the output location, capacity and logical P% at the start of each pass.</p>
+</section>
+<section title="Technical Details">
+<p>Contexts are opaque non-zero handles. Source lines are length-delimited plain ASCII and use the syntax accepted by the selected CPU backend. The caller passes every OPT value unchanged to <reference type='swi' name='Assembler_AssembleLine'/>.</p>
+<p>Begin the first pass with a null destination and length -1 to measure only, or supply writable memory to retain provisional output. The second-pass call returns the number of forward references encountered in pass one; when this is zero, retained pass-one output is final and replay may be skipped.</p>
+<p>Each line is transactional. On failure the output buffer, P%, symbols and pass state remain unchanged. <reference type='swi' name='Assembler_LastError'/> supplies the translated module error, original library classifier and detailed diagnostic.</p>
+<p>Values use a 16-byte block containing magic word <userinput>&amp;41535631</userinput>, type, signed 32-bit integer and a reserved word. Only integer type 1 is currently supported. The evaluator accepts decimal and &amp;hexadecimal values, identifiers, parentheses, unary plus/minus, arithmetic, MOD, shifts, AND, EOR and OR.</p>
+</section>
+<section title="SWI Calls">
+<swi-definition name='Assembler_Create' number='C0000' description='Creates an assembler context'>
+<entry><register-use number='0'>CPU ID: 1 6502, 2 6809, 3 x86-64, 4 Z80 or 5 ARM32.</register-use></entry>
+<exit><register-use number='0'>New context handle.</register-use></exit>
+<use><p>CPU-specific features are selected later through OPT bits.</p></use>
+</swi-definition>
+<swi-definition name='Assembler_Destroy' number='C0001' description='Destroys an assembler context'><entry><register-use number='0'>Context handle.</register-use></entry><use><p>Releases all values and assembler symbols owned by the context.</p></use></swi-definition>
+<swi-definition name='Assembler_BeginPass' number='C0002' description='Initialises an assembly pass'>
+<entry><register-use number='0'>Context handle.</register-use><register-use number='1'>Pass: 1 first or 2 second.</register-use><register-use number='2'>Output buffer address, or zero for first-pass measurement.</register-use><register-use number='3'>Output capacity, or -1 for first-pass measurement.</register-use><register-use number='4'>Initial logical P%.</register-use></entry>
+<exit><register-use number='0'>For pass two, number of pass-one forward references; otherwise zero.</register-use></exit>
+<use><p>Sets the destination and logical address for the selected pass.</p></use>
+</swi-definition>
+<swi-definition name='Assembler_AssembleLine' number='C0003' description='Assembles one source line'>
+<entry><register-use number='0'>Context handle.</register-use><register-use number='1'>Source address.</register-use><register-use number='2'>Source length.</register-use><register-use number='3'>Caller OPT value.</register-use></entry>
+<exit><register-use number='0'>Bytes emitted.</register-use><register-use number='1'>Next logical P%.</register-use><register-use number='2'>Next output address.</register-use><register-use number='3'>Remaining output capacity.</register-use></exit>
+<use><p>Assembles exactly one source line and advances the context on success.</p></use>
+</swi-definition>
+<swi-definition name='Assembler_Value' number='C0004' description='Reads, writes or deletes a context value'><entry><register-use number='0'>Context handle.</register-use><register-use number='1'>Operation: 0 read, 1 write or 2 delete.</register-use><register-use number='2'>Name address.</register-use><register-use number='3'>Name length.</register-use><register-use number='4'>Value block address.</register-use></entry><use><p>Writes and deletes are available before the first assembled line of a pass.</p></use></swi-definition>
+<swi-definition name='Assembler_Evaluate' number='C0005' description='Evaluates a complete expression'><entry><register-use number='0'>Context handle.</register-use><register-use number='1'>Expression address.</register-use><register-use number='2'>Expression length.</register-use><register-use number='3'>Result value block address.</register-use></entry><use><p>Evaluates the complete source expression using the context values.</p></use></swi-definition>
+<swi-definition name='Assembler_Capabilities' number='C0006' description='Queries API and CPU capabilities'><entry><register-use number='0'>Query 0 for API/CPU/value masks, or 1 for a CPU ID in R1.</register-use></entry><use><p>Allows callers to discover supported CPUs and future extensions.</p></use></swi-definition>
+<swi-definition name='Assembler_LastError' number='C0007' description='Reads the saved context diagnostic'><entry><register-use number='0'>Context handle.</register-use><register-use number='1'>Message buffer address, or zero to query size.</register-use><register-use number='2'>Message buffer capacity.</register-use></entry><exit><register-use number='0'>Translated module error number.</register-use><register-use number='1'>Original packed backend classifier.</register-use><register-use number='2'>Message size including terminator.</register-use></exit><use><p>Does not clear the saved diagnostic.</p></use></swi-definition>
+</section>
+<section title="Error Messages"><p>Module errors report invalid handles, CPU IDs, pass state, values, memory and assembly operations. Backend failures are translated to the assembly error while their original classifier and message remain available through Assembler_LastError.</p></section>
+<section title="Examples"><extended-example type='pseudo'>handle = Assembler_Create(ASSEMBLER_CPU_6502)
+Assembler_BeginPass(handle, first, output, capacity, address)
+Assembler_AssembleLine(handle, " LDA #value", opt)
+if Assembler_BeginPass(handle, second, output, capacity, address) != 0
+    replay every source line
+Assembler_Destroy(handle)</extended-example></section>
+</chapter>
+<meta><maintainer><email name="Gerph" address="gerph@gerph.org"/></maintainer><disclaimer><p>&copy; Gerph 2026.</p></disclaimer><history><revision number="1" author="Gerph" date="14 Jul 2026" title="Initial version"><change>Documented the Assembler module SWI interface.</change></revision></history></meta>
+</riscos-prm>

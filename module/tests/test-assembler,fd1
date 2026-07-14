@@ -1,0 +1,29 @@
+REM >test-assembler
+REM Smoke test for the Assembler module SWI interface.
+ON ERROR ERROR EXT ERR, REPORT$ + " at line " + STR$(ERL/10)
+
+DIM output% 64
+DIM value% 16
+
+SYS "Assembler_Create", 1 TO handle%
+
+value%!0 = &41535631
+value%!4 = 1
+value%!8 = 5
+value%!12 = 0
+name$ = "value"
+SYS "Assembler_Value", handle%, 1, name$, LEN(name$), value%
+
+expression$ = "value+3"
+SYS "Assembler_Evaluate", handle%, expression$, LEN(expression$), value%
+IF value%!8 <> 8 THEN ERROR 0, "Evaluate returned the wrong value"
+
+SYS "Assembler_BeginPass", handle%, 1, output%, 64, &8000 TO references%
+line$ = " LDA #value"
+SYS "Assembler_AssembleLine", handle%, line$, LEN(line$), 0 TO bytes%, address%, next%, remaining%
+IF bytes% <> 2 OR ?output% <> &A9 OR output%?1 <> 5 THEN ERROR 0, "6502 output is wrong"
+
+SYS "Assembler_BeginPass", handle%, 2, output%, 64, &8000 TO references%
+IF references% <> 0 THEN ERROR 0, "Unexpected forward reference"
+SYS "Assembler_Destroy", handle%
+PRINT "Assembler module smoke test passed"

@@ -24,16 +24,27 @@ TYPE       = aif
 
 # Comma-separated list of paths to use for includes, such as:
 #	C:LibName.
-INCLUDES   = C:Assemble.
+INCLUDES   =
 
 # Space separated list of defines to set, eg -DDEBUG
 CDEFINES   =
 
 # Space separated list of libraries to link against, eg C:LibName.o.libLibName
-LIBS       = ${CLIB} C:Assemble.o.libAssemble
+LIBS       = ${CLIB}
 
 # Objects to build, using the format o.<name> (will be varied for build type)
-OBJS       = o.main
+OBJS       = o.tests \
+             o.assemble_common \
+             o.assemble_6502 \
+             o.assemble_6809 \
+             o.assemble_x86_64 \
+             o.assemble_z80 \
+             o.assemble_arm32 \
+             o.tests_6502 \
+             o.tests_6809 \
+             o.tests_x86_64 \
+             o.tests_z80 \
+             o.tests_arm32
 
 # Space separated list of XML files for building documentation.
 #DOCSRC = <prm-in-xml-sources>
