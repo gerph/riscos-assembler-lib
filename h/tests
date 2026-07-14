@@ -1,8 +1,8 @@
 /*******************************************************************
  * File:        tests
  * Purpose:     Self-tests for the assemble_6502, assemble_6809,
- *              assemble_x86_64, assemble_z80 and assemble_arm32
- *              libraries.
+ *              assemble_x86_64, assemble_z80, assemble_arm32 and
+ *              assemble_riscv libraries.
  * Author:      Charles Ferguson (Gerph)
  ******************************************************************/
 
@@ -53,5 +53,14 @@ int run_tests_z80(void);
  Returns:       the number of failing tests (0 if all passed)
  ******************************************************************/
 int run_tests_arm32(void);
+
+/*******************************************************************
+ Function:      run_tests_riscv
+ Description:   Runs all assemble_riscv self-tests, printing a line
+                per failure and a summary at the end.
+ Parameters:    none
+ Returns:       the number of failing tests (0 if all passed)
+ ******************************************************************/
+int run_tests_riscv(void);
 
 #endif

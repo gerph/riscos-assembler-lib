@@ -21,6 +21,7 @@ EXPORTS    = ${EXP_LIB}.${COMPONENT}.h.assemble_6502 \
 		     ${EXP_LIB}.${COMPONENT}.h.assemble_arm32 \
 		     ${EXP_LIB}.${COMPONENT}.h.assemble_x86_64 \
 		     ${EXP_LIB}.${COMPONENT}.h.assemble_z80 \
+		     ${EXP_LIB}.${COMPONENT}.h.assemble_riscv \
 		     ${EXP_LIB}.${COMPONENT}.h.assemble_common \
 
 # Comma-separated list of paths to use for includes, such as:
@@ -38,6 +39,7 @@ OBJS       = \
              o.assemble_x86_64 \
              o.assemble_z80 \
              o.assemble_arm32 \
+             o.assemble_riscv \
 
 
 include LibExport
@@ -50,6 +52,7 @@ ${EXP_LIB}.${COMPONENT}.h.assemble_6809:   h.assemble_6809;       ${CP} $?  $@  
 ${EXP_LIB}.${COMPONENT}.h.assemble_arm32:  h.assemble_arm32;      ${CP} $?  $@  ${CPFLAGS}
 ${EXP_LIB}.${COMPONENT}.h.assemble_x86_64: h.assemble_x86_64;     ${CP} $?  $@  ${CPFLAGS}
 ${EXP_LIB}.${COMPONENT}.h.assemble_z80:    h.assemble_z80;        ${CP} $?  $@  ${CPFLAGS}
+${EXP_LIB}.${COMPONENT}.h.assemble_riscv:  h.assemble_riscv;      ${CP} $?  $@  ${CPFLAGS}
 ${EXP_LIB}.${COMPONENT}.h.assemble_common: h.assemble_common;     ${CP} $?  $@  ${CPFLAGS}
 
 #---------------------------------------------------------------------------

@@ -17,11 +17,12 @@ int main(int argc, char *argv[])
     printf("AssembleTest " Module_FullVersionAndDate "\n");
     printf("Syntax: *AssembleTest\n");
 
-    failed = run_tests_6502();
+    failed = run_tests();
     failed += run_tests_6809();
     failed += run_tests_x86_64();
     failed += run_tests_z80();
     failed += run_tests_arm32();
+    failed += run_tests_riscv();
 
     exit(failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE);
 }

@@ -16,6 +16,7 @@
 #include "assemble_z80.h"
 #include "assemble_x86_64.h"
 #include "assemble_arm32.h"
+#include "assemble_riscv.h"
 
 #define MAX_SYMBOLS 256
 #define MAX_NAME 64
@@ -426,6 +427,7 @@ static int select_cpu(command_options_t *options, const char *name)
     else if (strcmp(name, "arm32") == 0) options->assembler = assemble_arm32_line;
     else if (strcmp(name, "arm32-fpa") == 0) { options->assembler = assemble_arm32_line; options->initial_opt = ASSEMBLE_ARM32_OPT_FPA; }
     else if (strcmp(name, "arm32-vfp") == 0) { options->assembler = assemble_arm32_line; options->initial_opt = ASSEMBLE_ARM32_OPT_VFP; }
+    else if (strcmp(name, "riscv") == 0) options->assembler = assemble_riscv_line;
     else return 0;
     return 1;
 }

@@ -21,6 +21,7 @@ interface is designed to make that straightforward for a future caller.
 | x86-64  | `h.assemble_x86_64`| `c.assemble_x86_64`   | x86-64 (limited subset, see below)            |
 | Z80     | `h.assemble_z80`   | `c.assemble_z80`      | Z80 (including common undocumented forms)     |
 | ARM32   | `h.assemble_arm32` | `c.assemble_arm32`    | Base ARM (ARMv4 through the AArch32 subset of ARMv8) + legacy FPA + classic VFP scalar + partial NEON/SIMD (dialect via `opt` bits, see below) |
+| RISC-V  | `h.assemble_riscv` | `c.assemble_riscv`    | RV32I base integer ISA + Zicsr, plus the standard NOP/MV/LI/J/JR/RET/CALL/branch-vs-zero pseudo-instructions |
 
 Shared infrastructure (the assembly context, error reporting, byte/word
 emission helpers) lives in `h.assemble_common` / `c.assemble_common`.
@@ -347,6 +348,31 @@ The 32-bit build has no `long long`/`int64_t`/`uint64_t` (the Norcroft
 builds from the same source. `assemble_emit_qword` emits a 64-bit value by
 sign-extending a 32-bit one for this reason — there is no way to pass a
 genuine 64-bit immediate through this interface.
+
+### RISC-V (RV32I + Zicsr)
+
+Covers the full RV32I base integer instruction set (including
+`FENCE`/`FENCE.TSO`, `ECALL`, `EBREAK`) plus the six Zicsr CSR
+instructions (`CSRRW`/`CSRRS`/`CSRRC`/`CSRRWI`/`CSRRSI`/`CSRRCI`).
+There is no RV32M/RV64I support and no `opt` dialect bits -- RV32I is
+a single, fixed dialect for this backend. Registers may be written as
+`x0`-`x31`, by their standard ABI names (`zero`, `ra`, `sp`, `gp`,
+`tp`, `t0`-`t6`, `s0`-`s11`, `a0`-`a7`, `fp` as an alias for `s0`), or
+as any expression evaluating to 0-31 (eg a BASIC variable holding a
+register number). Loads, stores and `JALR` use the standard
+`rd, imm(rs1)` / `rs2, imm(rs1)` syntax; branch and jump targets are
+ordinary expressions (typically a `.label`), with the PC-relative
+offset computed automatically against the instruction's own address.
+
+The standard `NOP`, `MV`, `LI`, `J`, `JR`, `RET`, `CALL` and
+zero-compare branch (`BEQZ`/`BNEZ`/`BLEZ`/`BGEZ`/`BLTZ`/`BGTZ`)
+pseudo-instructions are supported. `LI` and `CALL` always expand to a
+fixed two-instruction sequence (`LUI`+`ADDI` / `AUIPC`+`JALR`)
+regardless of the value involved, rather than shrinking to one
+instruction when the value happens to fit -- this keeps a line's
+assembled size independent of whether a forward-referenced label has
+been resolved yet, which matters because this library assembles one
+line at a time across multiple passes (see `AGENTS.md`).
 
 ## Licence
 

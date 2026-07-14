@@ -1,0 +1,671 @@
+/*******************************************************************
+ * File:        tests_riscv
+ * Purpose:     Self-tests for the assemble_riscv library. Provides a
+ *              minimal stand-in for BASIC's expression evaluator and
+ *              variable table so lines can be assembled and checked
+ *              against expected byte sequences.
+ * Author:      Charles Ferguson (Gerph)
+ ******************************************************************/
+
+#include <stdio.h>
+#include <string.h>
+#include <ctype.h>
+
+#include "tests.h"
+#include "assemble_riscv.h"
+
+#define MAX_SYMBOLS 32
+#define MAX_OUTPUT  64
+
+typedef struct symbol
+{
+    char             name[32];
+    assemble_value_t value;
+} symbol_t;
+
+typedef struct test_state
+{
+    symbol_t symbols[MAX_SYMBOLS];
+    size_t   symbol_count;
+} test_state_t;
+
+static _kernel_oserror test_error_block;
+
+static _kernel_oserror *test_error(const char *message)
+{
+    test_error_block.errnum = 0;
+    strncpy(test_error_block.errmess, message, sizeof(test_error_block.errmess) - 1);
+    test_error_block.errmess[sizeof(test_error_block.errmess) - 1] = '\0';
+    return &test_error_block;
+}
+
+static int hex_digit_value(uint8_t ch)
+{
+    if (ch >= '0' && ch <= '9')
+    {
+        return ch - '0';
+    }
+    return toupper((int) ch) - 'A' + 10;
+}
+
+static assemble_result_t test_parse_primary(test_state_t *state, const uint8_t *text, size_t length,
+                                             size_t *pos_inout, int32_t *out_value, _kernel_oserror **error)
+{
+    size_t pos = *pos_inout;
+
+    while (pos < length && text[pos] == ' ')
+    {
+        pos += 1;
+    }
+
+    if (pos < length && text[pos] == '&')
+    {
+        int32_t v = 0;
+
+        pos += 1;
+        while (pos < length && isxdigit((int) text[pos]))
+        {
+            v = v * 16 + hex_digit_value(text[pos]);
+            pos += 1;
+        }
+        *out_value = v;
+        *pos_inout = pos;
+        return ASSEMBLE_RESULT_OK;
+    }
+
+    if (pos < length && text[pos] >= '0' && text[pos] <= '9')
+    {
+        int32_t v = 0;
+
+        while (pos < length && text[pos] >= '0' && text[pos] <= '9')
+        {
+            v = v * 10 + (text[pos] - '0');
+            pos += 1;
+        }
+        *out_value = v;
+        *pos_inout = pos;
+        return ASSEMBLE_RESULT_OK;
+    }
+
+    if (pos < length && (isalpha((int) text[pos]) || text[pos] == '_' || text[pos] == '`'))
+    {
+        size_t start = pos;
+        size_t namelen;
+        char name[32];
+        size_t i;
+
+        while (pos < length &&
+               (isalnum((int) text[pos]) || text[pos] == '_' || text[pos] == '`' ||
+                text[pos] == '%' || text[pos] == '$'))
+        {
+            pos += 1;
+        }
+        namelen = pos - start;
+        if (namelen >= sizeof(name))
+        {
+            namelen = sizeof(name) - 1;
+        }
+        memcpy(name, text + start, namelen);
+        name[namelen] = '\0';
+
+        for (i = 0; i < state->symbol_count; i++)
+        {
+            if (strcmp(state->symbols[i].name, name) == 0)
+            {
+                *out_value = state->symbols[i].value.value.as_integer;
+                *pos_inout = pos;
+                return ASSEMBLE_RESULT_OK;
+            }
+        }
+        *error = test_error("Undefined test symbol");
+        return ASSEMBLE_RESULT_ERROR;
+    }
+
+    *error = test_error("Expected a value");
+    return ASSEMBLE_RESULT_ERROR;
+}
+
+static assemble_result_t test_resolve_expr(void *user_data, const uint8_t *text, size_t length,
+                                            assemble_value_t *value, size_t *consumed, _kernel_oserror **error)
+{
+    test_state_t *state = (test_state_t *) user_data;
+    size_t pos = 0;
+    int32_t result;
+    int negate = 0;
+
+    while (pos < length && text[pos] == ' ')
+    {
+        pos += 1;
+    }
+    if (pos < length && text[pos] == '-')
+    {
+        negate = 1;
+        pos += 1;
+    }
+
+    if (test_parse_primary(state, text, length, &pos, &result, error) != ASSEMBLE_RESULT_OK)
+    {
+        return ASSEMBLE_RESULT_ERROR;
+    }
+    if (negate)
+    {
+        result = -result;
+    }
+
+    for (;;)
+    {
+        size_t save = pos;
+        int op;
+        int32_t rhs;
+
+        while (pos < length && text[pos] == ' ')
+        {
+            pos += 1;
+        }
+        if (!(pos < length && (text[pos] == '+' || text[pos] == '-')))
+        {
+            pos = save;
+            break;
+        }
+        op = text[pos];
+        pos += 1;
+        while (pos < length && text[pos] == ' ')
+        {
+            pos += 1;
+        }
+        if (test_parse_primary(state, text, length, &pos, &rhs, error) != ASSEMBLE_RESULT_OK)
+        {
+            return ASSEMBLE_RESULT_ERROR;
+        }
+        result = (op == '+') ? (result + rhs) : (result - rhs);
+    }
+
+    value->type = ASSEMBLE_VALUE_INTEGER;
+    value->value.as_integer = result;
+    *consumed = pos;
+    return ASSEMBLE_RESULT_OK;
+}
+
+static assemble_result_t test_assign_var(void *user_data, const char *name, size_t name_length,
+                                          const assemble_value_t *value, _kernel_oserror **error)
+{
+    test_state_t *state = (test_state_t *) user_data;
+    char namebuf[32];
+    size_t len = name_length;
+    size_t i;
+
+    if (len >= sizeof(namebuf))
+    {
+        len = sizeof(namebuf) - 1;
+    }
+    memcpy(namebuf, name, len);
+    namebuf[len] = '\0';
+
+    for (i = 0; i < state->symbol_count; i++)
+    {
+        if (strcmp(state->symbols[i].name, namebuf) == 0)
+        {
+            state->symbols[i].value = *value;
+            return ASSEMBLE_RESULT_OK;
+        }
+    }
+    if (state->symbol_count >= MAX_SYMBOLS)
+    {
+        *error = test_error("Test symbol table is full");
+        return ASSEMBLE_RESULT_ERROR;
+    }
+    strcpy(state->symbols[state->symbol_count].name, namebuf);
+    state->symbols[state->symbol_count].value = *value;
+    state->symbol_count += 1;
+    return ASSEMBLE_RESULT_OK;
+}
+
+typedef struct test_case
+{
+    const char        *description;
+    const char *const *lines;      /* NULL-terminated */
+    const uint8_t      *expected;  /* concatenated bytes across all lines */
+    size_t              expected_length;
+    int                 expect_error;
+} test_case_t;
+
+static int run_case(const test_case_t *test)
+{
+    test_state_t state;
+    assemble_context_t context;
+    uint8_t output[MAX_OUTPUT];
+    uint32_t offset = 0;
+    size_t i;
+    _kernel_oserror *error = NULL;
+    int saw_error = 0;
+
+    state.symbol_count = 0;
+
+    context.buffer = output;
+    context.buffer_length = (int32_t) sizeof(output);
+    context.address = 0x8000;
+    context.opt = 0;
+    context.resolve_expr = test_resolve_expr;
+    context.assign_var = test_assign_var;
+    context.user_data = &state;
+    context.bytes_used = 0;
+
+    for (i = 0; test->lines[i] != NULL; i++)
+    {
+        const uint8_t *line = (const uint8_t *) test->lines[i];
+        size_t line_length = strlen(test->lines[i]);
+
+        error = assemble_riscv_line(&context, line, line_length);
+        if (error != NULL)
+        {
+            saw_error = 1;
+            break;
+        }
+
+        if (offset + context.bytes_used > sizeof(output))
+        {
+            printf("FAIL: %s (test output buffer too small)\n", test->description);
+            return 0;
+        }
+        offset += context.bytes_used;
+        context.address += context.bytes_used;
+        context.buffer = output + offset;
+        context.buffer_length = (int32_t) (sizeof(output) - offset);
+    }
+
+    if (test->expect_error)
+    {
+        if (!saw_error)
+        {
+            printf("FAIL: %s (expected an error, none was raised)\n", test->description);
+            return 0;
+        }
+        return 1;
+    }
+
+    if (saw_error)
+    {
+        printf("FAIL: %s (unexpected error: %s)\n", test->description, error->errmess);
+        return 0;
+    }
+
+    if (offset != test->expected_length || memcmp(output, test->expected, offset) != 0)
+    {
+        size_t j;
+
+        printf("FAIL: %s (byte mismatch, got:", test->description);
+        for (j = 0; j < offset; j++)
+        {
+            printf(" %02X", output[j]);
+        }
+        printf(" expected:");
+        for (j = 0; j < test->expected_length; j++)
+        {
+            printf(" %02X", test->expected[j]);
+        }
+        printf(")\n");
+        return 0;
+    }
+
+    return 1;
+}
+
+/* ---- Test case data ------------------------------------------------ */
+/* Expected bytes were cross-checked against an independent Python
+   re-implementation of the R/I/S/B/U/J bit layouts (not this backend's
+   own code), and several against well-known reference encodings
+   (eg "add x1,x2,x3" = 0x003100b3, "addi x1,x0,5" = 0x00500093,
+   "lw x1,4(x2)" = 0x00412083, ECALL = 0x00000073, plain FENCE =
+   0x0ff0000f) -- see AGENTS.md. */
+
+static const char *const lines_add[]  = { "ADD x1,x2,x3", NULL };
+static const uint8_t     bytes_add[]  = { 0xB3, 0x00, 0x31, 0x00 };
+
+static const char *const lines_sub[]  = { "SUB x1,x2,x3", NULL };
+static const uint8_t     bytes_sub[]  = { 0xB3, 0x00, 0x31, 0x40 };
+
+static const char *const lines_sll[]  = { "SLL x5,x6,x7", NULL };
+static const uint8_t     bytes_sll[]  = { 0xB3, 0x12, 0x73, 0x00 };
+
+static const char *const lines_slt[]  = { "SLT x5,x6,x7", NULL };
+static const uint8_t     bytes_slt[]  = { 0xB3, 0x22, 0x73, 0x00 };
+
+static const char *const lines_sltu[] = { "SLTU x5,x6,x7", NULL };
+static const uint8_t     bytes_sltu[] = { 0xB3, 0x32, 0x73, 0x00 };
+
+static const char *const lines_xor[]  = { "XOR x5,x6,x7", NULL };
+static const uint8_t     bytes_xor[]  = { 0xB3, 0x42, 0x73, 0x00 };
+
+static const char *const lines_srl[]  = { "SRL x5,x6,x7", NULL };
+static const uint8_t     bytes_srl[]  = { 0xB3, 0x52, 0x73, 0x00 };
+
+static const char *const lines_sra[]  = { "SRA x5,x6,x7", NULL };
+static const uint8_t     bytes_sra[]  = { 0xB3, 0x52, 0x73, 0x40 };
+
+static const char *const lines_or[]   = { "OR x5,x6,x7", NULL };
+static const uint8_t     bytes_or[]   = { 0xB3, 0x62, 0x73, 0x00 };
+
+static const char *const lines_and[]  = { "AND x5,x6,x7", NULL };
+static const uint8_t     bytes_and[]  = { 0xB3, 0x72, 0x73, 0x00 };
+
+/* Tokenised AND/OR: BASIC tokenises the keywords AND/OR as single
+   bytes; the mnemonic reader must expand them back before lookup. */
+static const char lines_and_token_raw[] = { (char) 0x80, ' ', 'x', '5', ',', 'x', '6', ',', 'x', '7', '\0' };
+static const char *const lines_and_token[] = { lines_and_token_raw, NULL };
+
+static const char lines_or_token_raw[] = { (char) 0x84, ' ', 'x', '5', ',', 'x', '6', ',', 'x', '7', '\0' };
+static const char *const lines_or_token[] = { lines_or_token_raw, NULL };
+
+static const char lines_andi_token_raw[] = { (char) 0x80, 'I', ' ', 'x', '1', ',', 'x', '2', ',', '3', '\0' };
+static const char *const lines_andi_token[] = { lines_andi_token_raw, NULL };
+static const uint8_t     bytes_andi_token[] = { 0x93, 0x70, 0x31, 0x00 };
+
+static const char *const lines_addi[]  = { "ADDI x1,x0,5", NULL };
+static const uint8_t     bytes_addi[]  = { 0x93, 0x00, 0x50, 0x00 };
+
+static const char *const lines_addi_neg[] = { "ADDI x1,x2,-1", NULL };
+static const uint8_t     bytes_addi_neg[] = { 0x93, 0x00, 0xF1, 0xFF };
+
+static const char *const lines_slti[]  = { "SLTI x1,x2,3", NULL };
+static const uint8_t     bytes_slti[]  = { 0x93, 0x20, 0x31, 0x00 };
+
+static const char *const lines_sltiu[] = { "SLTIU x1,x2,3", NULL };
+static const uint8_t     bytes_sltiu[] = { 0x93, 0x30, 0x31, 0x00 };
+
+static const char *const lines_xori[]  = { "XORI x1,x2,3", NULL };
+static const uint8_t     bytes_xori[]  = { 0x93, 0x40, 0x31, 0x00 };
+
+static const char *const lines_ori[]   = { "ORI x1,x2,3", NULL };
+static const uint8_t     bytes_ori[]   = { 0x93, 0x60, 0x31, 0x00 };
+
+static const char *const lines_andi[]  = { "ANDI x1,x2,3", NULL };
+static const uint8_t     bytes_andi[]  = { 0x93, 0x70, 0x31, 0x00 };
+
+static const char *const lines_slli[]  = { "SLLI x1,x2,3", NULL };
+static const uint8_t     bytes_slli[]  = { 0x93, 0x10, 0x31, 0x00 };
+
+static const char *const lines_srli[]  = { "SRLI x1,x2,3", NULL };
+static const uint8_t     bytes_srli[]  = { 0x93, 0x50, 0x31, 0x00 };
+
+static const char *const lines_srai[]  = { "SRAI x1,x2,3", NULL };
+static const uint8_t     bytes_srai[]  = { 0x93, 0x50, 0x31, 0x40 };
+
+static const char *const lines_lb[]  = { "LB x1,4(x2)", NULL };
+static const uint8_t     bytes_lb[]  = { 0x83, 0x00, 0x41, 0x00 };
+
+static const char *const lines_lh[]  = { "LH x1,4(x2)", NULL };
+static const uint8_t     bytes_lh[]  = { 0x83, 0x10, 0x41, 0x00 };
+
+static const char *const lines_lw[]  = { "LW x1,4(x2)", NULL };
+static const uint8_t     bytes_lw[]  = { 0x83, 0x20, 0x41, 0x00 };
+
+static const char *const lines_lbu[] = { "LBU x1,4(x2)", NULL };
+static const uint8_t     bytes_lbu[] = { 0x83, 0x40, 0x41, 0x00 };
+
+static const char *const lines_lhu[] = { "LHU x1,4(x2)", NULL };
+static const uint8_t     bytes_lhu[] = { 0x83, 0x50, 0x41, 0x00 };
+
+/* Register operand may also be the ABI name, eg 'a0' for x2/'t0' for x5. */
+static const char *const lines_lw_abi[] = { "LW a0,4(sp)", NULL };
+static const uint8_t     bytes_lw_abi[] = { 0x03, 0x25, 0x41, 0x00 };
+
+static const char *const lines_sb[] = { "SB x1,8(x2)", NULL };
+static const uint8_t     bytes_sb[] = { 0x23, 0x04, 0x11, 0x00 };
+
+static const char *const lines_sh[] = { "SH x1,8(x2)", NULL };
+static const uint8_t     bytes_sh[] = { 0x23, 0x14, 0x11, 0x00 };
+
+static const char *const lines_sw[] = { "SW x1,8(x2)", NULL };
+static const uint8_t     bytes_sw[] = { 0x23, 0x24, 0x11, 0x00 };
+
+static const char *const lines_jalr[] = { "JALR x1,4(x2)", NULL };
+static const uint8_t     bytes_jalr[] = { 0xE7, 0x00, 0x41, 0x00 };
+
+static const char *const lines_beq[]  = { ".loop", "NOP", "BEQ x1,x2,loop", NULL };
+static const uint8_t     bytes_beq[]  = { 0x13, 0x00, 0x00, 0x00, 0xE3, 0x8E, 0x20, 0xFE };
+
+static const char *const lines_bne[]  = { ".loop", "NOP", "BNE x1,x2,loop", NULL };
+static const uint8_t     bytes_bne[]  = { 0x13, 0x00, 0x00, 0x00, 0xE3, 0x9E, 0x20, 0xFE };
+
+static const char *const lines_blt[]  = { ".loop", "NOP", "BLT x1,x2,loop", NULL };
+static const uint8_t     bytes_blt[]  = { 0x13, 0x00, 0x00, 0x00, 0xE3, 0xCE, 0x20, 0xFE };
+
+static const char *const lines_bge[]  = { ".loop", "NOP", "BGE x1,x2,loop", NULL };
+static const uint8_t     bytes_bge[]  = { 0x13, 0x00, 0x00, 0x00, 0xE3, 0xDE, 0x20, 0xFE };
+
+static const char *const lines_bltu[] = { ".loop", "NOP", "BLTU x1,x2,loop", NULL };
+static const uint8_t     bytes_bltu[] = { 0x13, 0x00, 0x00, 0x00, 0xE3, 0xEE, 0x20, 0xFE };
+
+static const char *const lines_bgeu[] = { ".loop", "NOP", "BGEU x1,x2,loop", NULL };
+static const uint8_t     bytes_bgeu[] = { 0x13, 0x00, 0x00, 0x00, 0xE3, 0xFE, 0x20, 0xFE };
+
+static const char *const lines_beqz[] = { ".loop", "NOP", "BEQZ x1,loop", NULL };
+static const uint8_t     bytes_beqz[] = { 0x13, 0x00, 0x00, 0x00, 0xE3, 0x8E, 0x00, 0xFE };
+
+static const char *const lines_bnez[] = { ".loop", "NOP", "BNEZ x1,loop", NULL };
+static const uint8_t     bytes_bnez[] = { 0x13, 0x00, 0x00, 0x00, 0xE3, 0x9E, 0x00, 0xFE };
+
+static const char *const lines_blez[] = { ".loop", "NOP", "BLEZ x1,loop", NULL };
+static const uint8_t     bytes_blez[] = { 0x13, 0x00, 0x00, 0x00, 0xE3, 0x5E, 0x10, 0xFE };
+
+static const char *const lines_bgez[] = { ".loop", "NOP", "BGEZ x1,loop", NULL };
+static const uint8_t     bytes_bgez[] = { 0x13, 0x00, 0x00, 0x00, 0xE3, 0xDE, 0x00, 0xFE };
+
+static const char *const lines_bltz[] = { ".loop", "NOP", "BLTZ x1,loop", NULL };
+static const uint8_t     bytes_bltz[] = { 0x13, 0x00, 0x00, 0x00, 0xE3, 0xCE, 0x00, 0xFE };
+
+static const char *const lines_bgtz[] = { ".loop", "NOP", "BGTZ x1,loop", NULL };
+static const uint8_t     bytes_bgtz[] = { 0x13, 0x00, 0x00, 0x00, 0xE3, 0x4E, 0x10, 0xFE };
+
+static const char *const lines_lui[]   = { "LUI x1,1", NULL };
+static const uint8_t     bytes_lui[]   = { 0xB7, 0x10, 0x00, 0x00 };
+
+static const char *const lines_auipc[] = { "AUIPC x1,1", NULL };
+static const uint8_t     bytes_auipc[] = { 0x97, 0x10, 0x00, 0x00 };
+
+static const char *const lines_jal[] = { ".loop", "NOP", "JAL x1,loop", NULL };
+static const uint8_t     bytes_jal[] = { 0x13, 0x00, 0x00, 0x00, 0xEF, 0xF0, 0xDF, 0xFF };
+
+static const char *const lines_j[] = { ".loop", "NOP", "J loop", NULL };
+static const uint8_t     bytes_j[] = { 0x13, 0x00, 0x00, 0x00, 0x6F, 0xF0, 0xDF, 0xFF };
+
+static const char *const lines_ecall[]  = { "ECALL", NULL };
+static const uint8_t     bytes_ecall[]  = { 0x73, 0x00, 0x00, 0x00 };
+
+static const char *const lines_ebreak[] = { "EBREAK", NULL };
+static const uint8_t     bytes_ebreak[] = { 0x73, 0x00, 0x10, 0x00 };
+
+static const char *const lines_csrrw[]  = { "CSRRW x1,&300,x2", NULL };
+static const uint8_t     bytes_csrrw[]  = { 0xF3, 0x10, 0x01, 0x30 };
+
+static const char *const lines_csrrs[]  = { "CSRRS x1,&300,x2", NULL };
+static const uint8_t     bytes_csrrs[]  = { 0xF3, 0x20, 0x01, 0x30 };
+
+static const char *const lines_csrrc[]  = { "CSRRC x1,&300,x2", NULL };
+static const uint8_t     bytes_csrrc[]  = { 0xF3, 0x30, 0x01, 0x30 };
+
+static const char *const lines_csrrwi[] = { "CSRRWI x1,&300,5", NULL };
+static const uint8_t     bytes_csrrwi[] = { 0xF3, 0xD0, 0x02, 0x30 };
+
+static const char *const lines_csrrsi[] = { "CSRRSI x1,&300,5", NULL };
+static const uint8_t     bytes_csrrsi[] = { 0xF3, 0xE0, 0x02, 0x30 };
+
+static const char *const lines_csrrci[] = { "CSRRCI x1,&300,5", NULL };
+static const uint8_t     bytes_csrrci[] = { 0xF3, 0xF0, 0x02, 0x30 };
+
+static const char *const lines_fence[]     = { "FENCE", NULL };
+static const uint8_t     bytes_fence[]     = { 0x0F, 0x00, 0xF0, 0x0F };
+
+static const char *const lines_fence_op[]  = { "FENCE rw,rw", NULL };
+static const uint8_t     bytes_fence_op[]  = { 0x0F, 0x00, 0x30, 0x03 };
+
+static const char *const lines_fence_tso[] = { "FENCE.TSO", NULL };
+static const uint8_t     bytes_fence_tso[] = { 0x0F, 0x00, 0x30, 0x83 };
+
+static const char *const lines_nop[] = { "NOP", NULL };
+static const uint8_t     bytes_nop[] = { 0x13, 0x00, 0x00, 0x00 };
+
+static const char *const lines_mv[]  = { "MV x1,x2", NULL };
+static const uint8_t     bytes_mv[]  = { 0x93, 0x00, 0x01, 0x00 };
+
+static const char *const lines_jr[]  = { "JR x1", NULL };
+static const uint8_t     bytes_jr[]  = { 0x67, 0x80, 0x00, 0x00 };
+
+static const char *const lines_ret[] = { "RET", NULL };
+static const uint8_t     bytes_ret[] = { 0x67, 0x80, 0x00, 0x00 };
+
+static const char *const lines_li_small[] = { "LI x1,5", NULL };
+static const uint8_t     bytes_li_small[] = { 0xB7, 0x00, 0x00, 0x00, 0x93, 0x80, 0x50, 0x00 };
+
+static const char *const lines_li_neg[] = { "LI x1,-1", NULL };
+static const uint8_t     bytes_li_neg[] = { 0xB7, 0x00, 0x00, 0x00, 0x93, 0x80, 0xF0, 0xFF };
+
+static const char *const lines_li_big[] = { "LI x1,&123456", NULL };
+static const uint8_t     bytes_li_big[] = { 0xB7, 0x30, 0x12, 0x00, 0x93, 0x80, 0x60, 0x45 };
+
+static const char *const lines_call[] = { ".loop", "NOP", "CALL loop", NULL };
+static const uint8_t     bytes_call[] = { 0x13, 0x00, 0x00, 0x00, 0x97, 0x00, 0x00, 0x00, 0xE7, 0x80, 0xC0, 0xFF };
+
+/* LI is used here (rather than eg ADDI) because the label's value is
+   an absolute address (0x8000, the harness's fixed test address),
+   which does not fit a 12-bit immediate -- LI's LUI+ADDI split
+   handles any 32-bit value. */
+static const char *const lines_label_addr[] = { ".here", "LI x1,here", NULL };
+static const uint8_t     bytes_label_addr[] = { 0xB7, 0x80, 0x00, 0x00, 0x93, 0x80, 0x00, 0x00 };
+
+static const char *const lines_equ[] = { ".const EQU 42", "ADDI x1,x0,const", NULL };
+static const uint8_t     bytes_equ[] = { 0x93, 0x00, 0xA0, 0x02 };
+
+static const char *const lines_dcb[] = { "DCB 1,2,3", NULL };
+static const uint8_t     bytes_dcb[] = { 0x01, 0x02, 0x03 };
+
+static const char *const lines_dcw[] = { "DCW &1234,&5678", NULL };
+static const uint8_t     bytes_dcw[] = { 0x34, 0x12, 0x78, 0x56 };
+
+static const char *const lines_dcd[] = { "DCD &12345678", NULL };
+static const uint8_t     bytes_dcd[] = { 0x78, 0x56, 0x34, 0x12 };
+
+static const char *const lines_opt[] = { "OPT 3", "NOP", NULL };
+static const uint8_t     bytes_opt[] = { 0x13, 0x00, 0x00, 0x00 };
+
+/* ---- Error cases ----------------------------------------------------- */
+
+static const char *const lines_err_bad_mnemonic[]  = { "FOO x1,x2,x3", NULL };
+static const char *const lines_err_bad_register[]  = { "ADD x1,x2,x32", NULL };
+static const char *const lines_err_imm_overflow[]  = { "ADDI x1,x2,4096", NULL };
+static const char *const lines_err_shamt[]         = { "SLLI x1,x2,32", NULL };
+static const char *const lines_err_missing_paren[] = { "LW x1,4 x2", NULL };
+static const char *const lines_err_equ_no_label[]  = { "EQU 10", NULL };
+static const char *const lines_err_csr_range[]     = { "CSRRW x1,4096,x2", NULL };
+static const char *const lines_err_fence_letter[]  = { "FENCE q,rw", NULL };
+static const char *const lines_err_branch_misalign[] = { "BEQ x1,x2,1", NULL };
+
+static const test_case_t tests[] = {
+    { "R-type ADD",                     lines_add,          bytes_add,          sizeof(bytes_add),          0 },
+    { "R-type SUB",                     lines_sub,          bytes_sub,          sizeof(bytes_sub),          0 },
+    { "R-type SLL",                     lines_sll,          bytes_sll,          sizeof(bytes_sll),          0 },
+    { "R-type SLT",                     lines_slt,          bytes_slt,          sizeof(bytes_slt),          0 },
+    { "R-type SLTU",                    lines_sltu,         bytes_sltu,         sizeof(bytes_sltu),         0 },
+    { "R-type XOR",                     lines_xor,          bytes_xor,          sizeof(bytes_xor),          0 },
+    { "R-type SRL",                     lines_srl,          bytes_srl,          sizeof(bytes_srl),          0 },
+    { "R-type SRA",                     lines_sra,          bytes_sra,          sizeof(bytes_sra),          0 },
+    { "R-type OR",                      lines_or,           bytes_or,           sizeof(bytes_or),           0 },
+    { "R-type AND",                     lines_and,          bytes_and,          sizeof(bytes_and),          0 },
+    { "tokenised AND -> AND",           lines_and_token,    bytes_and,          sizeof(bytes_and),          0 },
+    { "tokenised OR -> OR",             lines_or_token,     bytes_or,           sizeof(bytes_or),           0 },
+    { "tokenised AND + I -> ANDI",      lines_andi_token,   bytes_andi_token,   sizeof(bytes_andi_token),   0 },
+    { "I-type ADDI",                    lines_addi,         bytes_addi,         sizeof(bytes_addi),         0 },
+    { "I-type ADDI negative",           lines_addi_neg,     bytes_addi_neg,     sizeof(bytes_addi_neg),     0 },
+    { "I-type SLTI",                    lines_slti,         bytes_slti,         sizeof(bytes_slti),         0 },
+    { "I-type SLTIU",                   lines_sltiu,        bytes_sltiu,        sizeof(bytes_sltiu),        0 },
+    { "I-type XORI",                    lines_xori,         bytes_xori,         sizeof(bytes_xori),         0 },
+    { "I-type ORI",                     lines_ori,          bytes_ori,          sizeof(bytes_ori),          0 },
+    { "I-type ANDI",                    lines_andi,         bytes_andi,         sizeof(bytes_andi),         0 },
+    { "shift SLLI",                     lines_slli,         bytes_slli,         sizeof(bytes_slli),         0 },
+    { "shift SRLI",                     lines_srli,         bytes_srli,         sizeof(bytes_srli),         0 },
+    { "shift SRAI",                     lines_srai,         bytes_srai,         sizeof(bytes_srai),         0 },
+    { "load LB",                        lines_lb,           bytes_lb,           sizeof(bytes_lb),           0 },
+    { "load LH",                        lines_lh,           bytes_lh,           sizeof(bytes_lh),           0 },
+    { "load LW",                        lines_lw,           bytes_lw,           sizeof(bytes_lw),           0 },
+    { "load LBU",                       lines_lbu,          bytes_lbu,          sizeof(bytes_lbu),          0 },
+    { "load LHU",                       lines_lhu,          bytes_lhu,          sizeof(bytes_lhu),          0 },
+    { "load with ABI register names",   lines_lw_abi,       bytes_lw_abi,       sizeof(bytes_lw_abi),       0 },
+    { "store SB",                       lines_sb,           bytes_sb,           sizeof(bytes_sb),           0 },
+    { "store SH",                       lines_sh,           bytes_sh,           sizeof(bytes_sh),           0 },
+    { "store SW",                       lines_sw,           bytes_sw,           sizeof(bytes_sw),           0 },
+    { "JALR (real, 3-operand)",         lines_jalr,         bytes_jalr,         sizeof(bytes_jalr),         0 },
+    { "branch BEQ",                     lines_beq,          bytes_beq,          sizeof(bytes_beq),          0 },
+    { "branch BNE",                     lines_bne,          bytes_bne,          sizeof(bytes_bne),          0 },
+    { "branch BLT",                     lines_blt,          bytes_blt,          sizeof(bytes_blt),          0 },
+    { "branch BGE",                     lines_bge,          bytes_bge,          sizeof(bytes_bge),          0 },
+    { "branch BLTU",                    lines_bltu,         bytes_bltu,         sizeof(bytes_bltu),         0 },
+    { "branch BGEU",                    lines_bgeu,         bytes_bgeu,         sizeof(bytes_bgeu),         0 },
+    { "pseudo BEQZ",                    lines_beqz,         bytes_beqz,         sizeof(bytes_beqz),         0 },
+    { "pseudo BNEZ",                    lines_bnez,         bytes_bnez,         sizeof(bytes_bnez),         0 },
+    { "pseudo BLEZ",                    lines_blez,         bytes_blez,         sizeof(bytes_blez),         0 },
+    { "pseudo BGEZ",                    lines_bgez,         bytes_bgez,         sizeof(bytes_bgez),         0 },
+    { "pseudo BLTZ",                    lines_bltz,         bytes_bltz,         sizeof(bytes_bltz),         0 },
+    { "pseudo BGTZ",                    lines_bgtz,         bytes_bgtz,         sizeof(bytes_bgtz),         0 },
+    { "U-type LUI",                     lines_lui,          bytes_lui,          sizeof(bytes_lui),          0 },
+    { "U-type AUIPC",                   lines_auipc,        bytes_auipc,        sizeof(bytes_auipc),        0 },
+    { "J-type JAL",                     lines_jal,          bytes_jal,          sizeof(bytes_jal),          0 },
+    { "pseudo J",                       lines_j,            bytes_j,            sizeof(bytes_j),            0 },
+    { "ECALL",                          lines_ecall,        bytes_ecall,        sizeof(bytes_ecall),        0 },
+    { "EBREAK",                         lines_ebreak,       bytes_ebreak,       sizeof(bytes_ebreak),       0 },
+    { "CSRRW",                          lines_csrrw,        bytes_csrrw,        sizeof(bytes_csrrw),        0 },
+    { "CSRRS",                          lines_csrrs,        bytes_csrrs,        sizeof(bytes_csrrs),        0 },
+    { "CSRRC",                          lines_csrrc,        bytes_csrrc,        sizeof(bytes_csrrc),        0 },
+    { "CSRRWI",                         lines_csrrwi,       bytes_csrrwi,       sizeof(bytes_csrrwi),       0 },
+    { "CSRRSI",                         lines_csrrsi,       bytes_csrrsi,       sizeof(bytes_csrrsi),       0 },
+    { "CSRRCI",                         lines_csrrci,       bytes_csrrci,       sizeof(bytes_csrrci),       0 },
+    { "FENCE (implied iorw,iorw)",      lines_fence,        bytes_fence,        sizeof(bytes_fence),        0 },
+    { "FENCE rw,rw",                    lines_fence_op,     bytes_fence_op,     sizeof(bytes_fence_op),     0 },
+    { "FENCE.TSO",                      lines_fence_tso,    bytes_fence_tso,    sizeof(bytes_fence_tso),    0 },
+    { "pseudo NOP",                     lines_nop,          bytes_nop,          sizeof(bytes_nop),          0 },
+    { "pseudo MV",                      lines_mv,           bytes_mv,           sizeof(bytes_mv),           0 },
+    { "pseudo JR",                      lines_jr,           bytes_jr,           sizeof(bytes_jr),           0 },
+    { "pseudo RET",                     lines_ret,          bytes_ret,          sizeof(bytes_ret),          0 },
+    { "pseudo LI (fits in ADDI range)", lines_li_small,     bytes_li_small,     sizeof(bytes_li_small),     0 },
+    { "pseudo LI negative",             lines_li_neg,       bytes_li_neg,       sizeof(bytes_li_neg),       0 },
+    { "pseudo LI large value",          lines_li_big,       bytes_li_big,       sizeof(bytes_li_big),       0 },
+    { "pseudo CALL",                    lines_call,         bytes_call,         sizeof(bytes_call),         0 },
+    { "label address reference",       lines_label_addr,   bytes_label_addr,   sizeof(bytes_label_addr),   0 },
+    { "EQU pseudo-op",                  lines_equ,          bytes_equ,          sizeof(bytes_equ),          0 },
+    { "DCB pseudo-op",                  lines_dcb,          bytes_dcb,          sizeof(bytes_dcb),          0 },
+    { "DCW pseudo-op (little-endian)",  lines_dcw,          bytes_dcw,          sizeof(bytes_dcw),          0 },
+    { "DCD pseudo-op (little-endian)",  lines_dcd,          bytes_dcd,          sizeof(bytes_dcd),          0 },
+    { "OPT pseudo-op is a no-op",       lines_opt,          bytes_opt,          sizeof(bytes_opt),          0 },
+
+    { "error: bad mnemonic",            lines_err_bad_mnemonic,    NULL, 0, 1 },
+    { "error: register out of range",   lines_err_bad_register,   NULL, 0, 1 },
+    { "error: I-type immediate overflow", lines_err_imm_overflow, NULL, 0, 1 },
+    { "error: shift amount out of range", lines_err_shamt,        NULL, 0, 1 },
+    { "error: missing '(' before base register", lines_err_missing_paren, NULL, 0, 1 },
+    { "error: EQU without a label",     lines_err_equ_no_label,   NULL, 0, 1 },
+    { "error: CSR number out of range", lines_err_csr_range,      NULL, 0, 1 },
+    { "error: bad FENCE letter",        lines_err_fence_letter,   NULL, 0, 1 },
+    { "error: branch target misaligned",lines_err_branch_misalign,NULL, 0, 1 }
+};
+
+int run_tests_riscv(void)
+{
+    size_t i;
+    int passed = 0;
+    int failed = 0;
+
+    for (i = 0; i < sizeof(tests) / sizeof(tests[0]); i++)
+    {
+        if (run_case(&tests[i]))
+        {
+            passed += 1;
+        }
+        else
+        {
+            failed += 1;
+        }
+    }
+
+    printf("assemble_riscv: %d passed, %d failed (of %d)\n", passed, failed, passed + failed);
+
+    return failed;
+}

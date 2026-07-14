@@ -5,15 +5,20 @@ Guidance for AI agents (and humans) working on this repository.
 ## What this is
 
 `Assemble` is a RISC OS library providing **line-at-a-time assemblers** for
-several CPU instruction sets, all built against one shared interface. It is
-built as a `command` type project (`riscos-project create --type command`);
-the resulting `Assemble` binary's `main()` currently just runs the self-test
-suites for every backend and exits with a non-zero status on failure. There
+several CPU instruction sets, all built against one shared interface. There
 is no BASIC integration yet — the library is designed to be callable from a
 future BASIC inline-assembler patch (or any other caller), one source line
 at a time, but nothing currently wires it into BASIC itself.
 
-Five backends exist today:
+The project builds as three separate pieces, each with its own Makefile:
+
+| Makefile             | Type      | Produces                                              |
+|-----------------------|-----------|--------------------------------------------------------|
+| `MakefileLib,fe1`     | `LibExport` | `libAssemble` — the backends themselves, plus exported headers |
+| `MakefileTests,fe1`   | `command` (`aif`) | `AssembleTest` — `c/main` calls each backend's `run_tests_<name>()` in sequence and returns the total failure count as the exit code |
+| `Makefile,fe1`        | `command` (`aif`) | `Assemble` — a real `*Assemble -cpu <cpu> -input <source> -output <binary>` command-line tool, linking against the built `libAssemble` |
+
+Six backends exist today:
 
 | Backend      | Files                                    | Instruction set(s)              |
 |--------------|-------------------------------------------|----------------------------------|
@@ -22,17 +27,20 @@ Five backends exist today:
 | x86-64       | `h/assemble_x86_64`, `c/assemble_x86_64`   | x86-64, limited (see below)      |
 | Z80          | `h/assemble_z80`, `c/assemble_z80`         | Z80, including common undocumented forms |
 | ARM32        | `h/assemble_arm32`, `c/assemble_arm32`     | base ARM (ARMv4-ARMv8 AArch32 subset) + legacy FPA + classic VFP scalar + partial NEON/SIMD (dialect via OPT bits, see below) |
+| RISC-V       | `h/assemble_riscv`, `c/assemble_riscv`     | RV32I base integer ISA + Zicsr (single dialect, see below) |
 
 Shared infrastructure lives in `h/assemble_common` / `c/assemble_common`.
 
 ## Building and testing
 
 ```
-riscos-amu                # 32-bit build
-riscos-amu BUILD64=1      # 64-bit build
+riscos-amu -f MakefileLib                # build the library, 32-bit
+riscos-amu -f MakefileLib BUILD64=1      # build the library, 64-bit
+riscos-amu -f MakefileTests              # build the self-test AIF (needs the library built first)
+riscos-amu -f Makefile                   # build the *Assemble command tool (needs the library built first)
 
-riscos-build-run aif32 --command "run aif32.Assemble"          # run all self-tests, 32-bit (aarch32)
-riscos-build-run --64 aif64 --command "run aif64.Assemble"     # run all self-tests, 64-bit (aarch64)
+riscos-build-run aif32 --command "run aif32.AssembleTest"       # run all self-tests, 32-bit (aarch32)
+riscos-build-run --64 aif64 --command "run aif64.AssembleTest"  # run all self-tests, 64-bit (aarch64)
 ```
 
 `riscos-build-run` defaults to an aarch32 (32-bit) system, which can't
@@ -42,12 +50,11 @@ the full test suite and should show identical pass counts; run both when
 changing anything that could plausibly behave differently by word size
 (pointer-sized types, the no-64-bit-integer workarounds below, etc).
 
-There is no separate test runner — `c/main` calls `run_tests()` /
-`run_tests_6809()` / `run_tests_x86_64()` in sequence and returns the total
-failure count as the exit code. Each backend's test file prints a one-line
-`passed/failed` summary. Add a new backend's tests the same way: a
-`run_tests_<name>()` entry point declared in `h/tests`, called from
-`c/main`, with its object added to `OBJS` in `Makefile,fe1`.
+Each backend's test file prints a one-line `passed/failed` summary. Add a
+new backend's tests the same way: a `run_tests_<name>()` entry point
+declared in `h/tests`, called from `c/tests`, with `o.<name>` and
+`o.tests_<name>` added to `MakefileTests,fe1`'s `OBJS` (and `o.<name>`
+plus an `EXPORTS`/export-rule line added to `MakefileLib,fe1`).
 
 ## Architecture
 
@@ -844,15 +851,84 @@ setting `ASSEMBLE_ARM32_OPT_THUMB` makes `ASSEMBLE_ARM32_OPT_FPA`/
   `ADD Rd,SP,#imm`, which is what armips' own mask strings actually
   spell it as regardless of the internal placeholder name used for it).
 
+### RISC-V (`assemble_riscv`)
+
+Not ported or reverse-engineered from a single source the way the other
+backends are — `RISCV-RV32I-Assembler` (the reference clone alongside this
+project — see "Source material handling" below) was read for instruction
+coverage and general shape only; it's a teaching project implementing a
+narrow subset of RV32I (no `FENCE`/`ECALL`/`EBREAK`/CSR, no
+pseudo-instructions, and a non-standard three-operand comma syntax for
+loads/stores/branches instead of the near-universal `rd, imm(rs1)` form).
+This backend instead implements the complete RV32I base integer ISA per
+the official spec, plus the six Zicsr CSR instructions, using the
+standard assembly syntax real RISC-V toolchains use, and a mnemonic
+table shaped like `assemble_6809`'s (one row per real mnemonic, since
+unlike 6502/6809 every RV32I mnemonic has exactly one fixed operand
+shape — no per-addressing-mode row multiplicity is needed).
+
+Every encoding in `c/tests_riscv` was cross-checked against an
+independent Python re-implementation of the R/I/S/B/U/J bit layouts
+(not this backend's own code) before being written into the test table,
+and several against well-known reference encodings (`add x1,x2,x3` =
+`0x003100b3`, `addi x1,x0,5` = `0x00500093`, `ECALL` = `0x00000073`,
+plain `FENCE` = `0x0ff0000f`) — the same "verify against something that
+isn't the port itself" discipline as the x86-64 lessons above, applied
+from the start rather than after a wrong first pass.
+
+- RV32I has a single dialect; `context->opt` carries no CPU-specific
+  bits (same convention as `assemble_6809`). There is no RV32M or
+  RV64I support.
+- Registers accept `x0`-`x31`, the standard ABI names (`zero`, `ra`,
+  `sp`, `gp`, `tp`, `t0`-`t6`, `s0`-`s11`, `a0`-`a7`, `fp` as an alias
+  for `s0`), or — matching `assemble_arm32`'s convention for computed
+  register numbers — any expression evaluating to 0-31 (eg a BASIC
+  variable).
+- `AND`/`OR` are real three-operand RV32I mnemonics that collide with
+  BASIC's own tokenised `AND`/`OR` keywords (`ANDI`/`ORI` too, since
+  BASIC's tokeniser matches the keyword substring regardless of what
+  follows) — handled the same way `assemble_6502`/`assemble_6809`/
+  `assemble_z80` handle `AND`/`OR`/`EOR`: the token byte is expanded
+  back to its ASCII spelling before the normal mnemonic reader runs.
+  There's no RV32I `EOR` (it uses `XOR`), so only two tokens need this.
+- Loads, stores and `JALR` all share one `rd`/`rs2`, `imm(rs1)` operand
+  parser (`FMT_I_MEM`/`FMT_S`), since the "paren offset" syntax and
+  12-bit signed range are identical across all of them; only the
+  opcode/funct3 and which register slot is the destination differ.
+- Branch and jump offsets are PC-relative to *the branch/jump
+  instruction's own address*, per the RV32I spec — unlike eg 6809's
+  short branches, there is no "address after the instruction" fixup to
+  apply, since RISC-V's `JAL`/`Bxx` offsets are defined relative to the
+  instruction itself.
+- `LI` and `CALL` are the only pseudo-instructions that expand to more
+  than one real instruction (`LUI`+`ADDI`, `AUIPC`+`JALR`). Both always
+  emit the full two-instruction (8 byte) form regardless of whether the
+  value would fit in one instruction — deliberately, not an
+  unoptimised port: this library assembles one source line at a time
+  across multiple passes, and a line whose *size* depended on a
+  forward-referenced label's eventual value would make the standard
+  two-pass "size in pass 1, re-assemble in pass 2" flow unsound (the
+  same reasoning that keeps `assemble_arm32` from ever supporting an
+  `LDR Rd,=const` literal-pool pseudo-op). Fixing the size at 8 bytes
+  regardless of value sidesteps the problem entirely, at the cost of
+  never emitting the shorter 4-byte form when the value happens to fit.
+- The zero-compare branch pseudo-instructions (`BEQZ`/`BNEZ`/`BGEZ`/
+  `BLTZ`/`BLEZ`/`BGTZ`) are implemented as a small table mapping each
+  to a real branch mnemonic plus which operand slot `x0` occupies,
+  looked up via the same `find_opcode()` used for real mnemonics —
+  avoids duplicating each real branch's opcode/funct3 a second time.
+
 ## Source material handling
 
 Reference material lives alongside the project but is **not part of the
 build and not tracked in git**: `6502/`, `6809/` (the tokenised `.ffb`
 patches and their `Guide,fff` docs), `riscos64-rtrussell-bbcbasic/` (a
-full clone of the BBC BASIC source this port is based on), and `armips/`
+full clone of the BBC BASIC source this port is based on), `armips/`
 (a clone of the armips cross-assembler, whose `Archs/ARM/ThumbOpcodes.cpp`/
 `CThumbInstruction.cpp` were read as ground truth for the classic Thumb
-backend). Don't add these to git, and don't treat anything under
+backend), and `RISCV-RV32I-Assembler` (a teaching RV32I assembler read
+for instruction coverage and general shape, not syntax — see the
+RISC-V section above). Don't add these to git, and don't treat anything under
 `/riscos-built/Sources` as canonical (per the global project instructions)
 — if you need to re-examine the 6502/6809 patches, detokenise with
 `riscos-basicdetokenise -i <file>` first (see the `using-bbcbasic` skill).
@@ -862,7 +938,7 @@ backend). Don't add these to git, and don't treat anything under
 Standard project conventions apply (see `writing-c` skill): C89, 4-space
 indent, braces on their own line, function prologue comments in headers, no
 trailing whitespace. A few conventions specific to this library, established
-across all three backends and worth keeping consistent if you add a fourth:
+across the existing backends and worth keeping consistent if you add another:
 
 - One `assemble_<name>_line()` entry point per backend, handling `.label`
   definitions (assigning the current address) and falling through to parse
@@ -871,10 +947,11 @@ across all three backends and worth keeping consistent if you add a fourth:
   same line and assigns the expression's *value*, not the address.
 - `OPT <expr>` is always a no-op that just validates/consumes its
   expression — pass/listing control is the caller's responsibility.
-- Pseudo-ops that emit raw data (`DCB`/`DCW`/`DCD` for 6502/6809, or
-  `DB`/`DW`/`DD`/`DQ`/`EQUB`/`EQUD`/`EQUQ`/`EQUW` for x86-64, which are
-  ordinary table-driven mnemonics there, not special-cased) use the
-  backend's native endianness.
+- Pseudo-ops that emit raw data (`DCB`/`DCW`/`DCD` for 6502/6809/RISC-V,
+  or `DB`/`DW`/`DD`/`DQ`/`EQUB`/`EQUD`/`EQUQ`/`EQUW` for x86-64, which
+  are ordinary table-driven mnemonics there, not special-cased) use the
+  backend's native endianness (little-endian for 6502/x86-64/RISC-V,
+  big-endian for 6809).
 
 ## Git workflow
 

@@ -1,0 +1,85 @@
+/*******************************************************************
+ * File:        assemble_riscv
+ * Purpose:     Assembler backend for the RV32I base integer
+ *              instruction set (plus the Zicsr CSR instructions),
+ *              modelled on the RISCV-RV32I-Assembler reference
+ *              project for instruction coverage, but written to
+ *              this library's own line-at-a-time interface and
+ *              syntax conventions.
+ * Author:      Charles Ferguson (Gerph)
+ ******************************************************************/
+
+#ifndef ASSEMBLE_RISCV_H
+#define ASSEMBLE_RISCV_H
+
+#include <stdint.h>
+#include <stddef.h>
+
+#include "kernel.h"
+#include "assemble_common.h"
+
+/* RV32I has a single dialect, so (unlike assemble_6502) context->opt
+   carries no CPU-specific bits; only the standard ASSEMBLE_OPT_*
+   bits apply. There is no RV32M/RV64I support -- see AGENTS.md. */
+
+/* CPU-specific detail for errors raised by this backend; see
+   ASSEMBLE_ERRNUM_VARIANT(). */
+typedef enum assemble_riscv_error_variant
+{
+    ASSEMBLE_RISCV_ERR_NONE = 0,
+    ASSEMBLE_RISCV_ERR_BAD_REGISTER,        /* Register name/number expected, or out of range x0-x31 */
+    ASSEMBLE_RISCV_ERR_BAD_IMMEDIATE,       /* I/S-type immediate out of range [-2048..2047] */
+    ASSEMBLE_RISCV_ERR_BAD_SHAMT,           /* SLLI/SRLI/SRAI shift amount out of range [0..31] */
+    ASSEMBLE_RISCV_ERR_BAD_UTYPE_IMMEDIATE, /* LUI/AUIPC immediate does not fit in 20 bits */
+    ASSEMBLE_RISCV_ERR_BRANCH_RANGE,        /* Branch target out of +-4KB range or not 2-byte aligned */
+    ASSEMBLE_RISCV_ERR_JUMP_RANGE,          /* JAL/J target out of +-1MB range or not 2-byte aligned */
+    ASSEMBLE_RISCV_ERR_BAD_ADDRESS_OFFSET,  /* Load/store/JALR operand missing '(' or ')' around the base register */
+    ASSEMBLE_RISCV_ERR_BAD_CSR,             /* CSR number out of range [0..4095] */
+    ASSEMBLE_RISCV_ERR_BAD_UIMM,            /* CSRRWI/CSRRSI/CSRRCI immediate out of range [0..31] */
+    ASSEMBLE_RISCV_ERR_BAD_FENCE_OPERAND    /* FENCE predecessor/successor set is not made up of i, o, r, w */
+} assemble_riscv_error_variant_t;
+
+/*******************************************************************
+ Function:      assemble_riscv_line
+ Description:   Assembles one line of tokenised BASIC source as an
+                RV32I instruction, label definition or data pseudo-op
+                (EQU, DCB, DCW, DCD, OPT), writing the result to
+                context->buffer (or just measuring it, if
+                context->buffer_length is -1). context->bytes_used is
+                set to the number of bytes written or that would have
+                been written. All values are little-endian, matching
+                RISC-V's default byte order.
+
+                Registers may be written as x0-x31 or by their
+                standard ABI names (zero, ra, sp, gp, tp, t0-t6,
+                s0-s11 (s0 also accepted as fp), a0-a7), or as any
+                expression evaluating to 0-31 (eg a BASIC variable
+                holding a register number).
+
+                Loads, stores and JALR use the standard
+                'rd, imm(rs1)' / 'rs2, imm(rs1)' offset syntax.
+                Branch and jump targets are ordinary expressions
+                (typically a '.label'); the PC-relative offset is
+                computed automatically against context->address.
+
+                The following pseudo-instructions are supported:
+                NOP, MV, LI, J, JR, RET, CALL, and the zero-compare
+                branches BEQZ/BNEZ/BLEZ/BGEZ/BLTZ/BGTZ. LI and CALL
+                always expand to a fixed two-instruction (8 byte)
+                LUI+ADDI / AUIPC+JALR sequence regardless of the
+                value involved, so a line's size never depends on
+                whether a forward-referenced label has been resolved
+                yet -- see AGENTS.md.
+ Parameters:    context = the assembly context; address, buffer,
+                          buffer_length and opt must be filled in
+                line = tokenised BASIC source for the line, not
+                       including the terminating CR/LF
+                line_length = number of bytes at 'line'
+ Returns:       NULL if successful, otherwise a pointer to a static
+                error block (see assemble_common.h)
+ ******************************************************************/
+_kernel_oserror *assemble_riscv_line(assemble_context_t *context,
+                                      const uint8_t *line,
+                                      size_t line_length);
+
+#endif

@@ -1,0 +1,1315 @@
+/*******************************************************************
+ * File:        assemble_riscv
+ * Purpose:     Assembler backend for the RV32I base integer
+ *              instruction set (plus the Zicsr CSR instructions).
+ *              Parses one tokenised BASIC source line at a time into
+ *              machine code, using the callbacks in the assembly
+ *              context to evaluate expressions and to assign labels.
+ *              All values are little-endian, matching RISC-V itself.
+ * Author:      Charles Ferguson (Gerph)
+ ******************************************************************/
+
+#include <string.h>
+#include <ctype.h>
+
+#include "assemble_riscv.h"
+
+/* BASIC tokenises AND/OR as single bytes; since bare AND/OR (and,
+   with a following letter picked up by the normal read loop below,
+   ANDI/ORI) are real RV32I mnemonics, these tokens must be expanded
+   back to their mnemonic spelling before normal mnemonic lookup
+   (the same technique assemble_6809 and assemble_6502 use). RISC-V
+   has no EOR mnemonic (it uses XOR), so there is no third token to
+   handle here. */
+#define TOKEN_AND 0x80
+#define TOKEN_OR  0x84
+
+#define OPC_LOAD     0x03u
+#define OPC_OP_IMM   0x13u
+#define OPC_AUIPC    0x17u
+#define OPC_STORE    0x23u
+#define OPC_OP       0x33u
+#define OPC_LUI      0x37u
+#define OPC_BRANCH   0x63u
+#define OPC_JALR     0x67u
+#define OPC_JAL      0x6Fu
+#define OPC_SYSTEM   0x73u
+#define OPC_MISC_MEM 0x0Fu
+
+typedef enum riscv_format
+{
+    FMT_R,          /* rd, rs1, rs2 */
+    FMT_I_ARITH,    /* rd, rs1, imm (12-bit signed) */
+    FMT_I_SHAMT,    /* rd, rs1, shamt (5-bit unsigned); funct7 selects SLLI/SRLI vs SRAI */
+    FMT_I_MEM,      /* rd, imm(rs1) -- loads and JALR share this shape */
+    FMT_S,          /* rs2, imm(rs1) -- stores */
+    FMT_B,          /* rs1, rs2, target -- PC-relative branch */
+    FMT_U,          /* rd, imm (20-bit) */
+    FMT_J,          /* rd, target -- PC-relative jump */
+    FMT_SYSTEM,     /* no operand; fixed_imm gives the ECALL/EBREAK imm12 */
+    FMT_FENCE,      /* optional pred,succ letter sets */
+    FMT_FENCE_TSO,  /* no operand; fixed_imm gives the whole imm12 */
+    FMT_CSR,        /* rd, csr, rs1 */
+    FMT_CSRI        /* rd, csr, uimm (5-bit unsigned) */
+} riscv_format_t;
+
+typedef struct opcode_entry
+{
+    const char     *mnemonic;
+    riscv_format_t  format;
+    uint32_t        opcode;
+    uint32_t        funct3;
+    uint32_t        funct7;    /* R-type funct7, or SLLI/SRLI/SRAI's top 7 bits */
+    uint32_t        fixed_imm; /* FMT_SYSTEM/FMT_FENCE_TSO only: the whole imm12 */
+} opcode_entry_t;
+
+static const opcode_entry_t opcode_table[] = {
+    /* R-type arithmetic/logic */
+    { "ADD",  FMT_R, OPC_OP, 0x0, 0x00, 0 },
+    { "SUB",  FMT_R, OPC_OP, 0x0, 0x20, 0 },
+    { "SLL",  FMT_R, OPC_OP, 0x1, 0x00, 0 },
+    { "SLT",  FMT_R, OPC_OP, 0x2, 0x00, 0 },
+    { "SLTU", FMT_R, OPC_OP, 0x3, 0x00, 0 },
+    { "XOR",  FMT_R, OPC_OP, 0x4, 0x00, 0 },
+    { "SRL",  FMT_R, OPC_OP, 0x5, 0x00, 0 },
+    { "SRA",  FMT_R, OPC_OP, 0x5, 0x20, 0 },
+    { "OR",   FMT_R, OPC_OP, 0x6, 0x00, 0 },
+    { "AND",  FMT_R, OPC_OP, 0x7, 0x00, 0 },
+
+    /* I-type arithmetic/logic immediate */
+    { "ADDI",  FMT_I_ARITH, OPC_OP_IMM, 0x0, 0x00, 0 },
+    { "SLTI",  FMT_I_ARITH, OPC_OP_IMM, 0x2, 0x00, 0 },
+    { "SLTIU", FMT_I_ARITH, OPC_OP_IMM, 0x3, 0x00, 0 },
+    { "XORI",  FMT_I_ARITH, OPC_OP_IMM, 0x4, 0x00, 0 },
+    { "ORI",   FMT_I_ARITH, OPC_OP_IMM, 0x6, 0x00, 0 },
+    { "ANDI",  FMT_I_ARITH, OPC_OP_IMM, 0x7, 0x00, 0 },
+
+    /* Shift-by-immediate */
+    { "SLLI", FMT_I_SHAMT, OPC_OP_IMM, 0x1, 0x00, 0 },
+    { "SRLI", FMT_I_SHAMT, OPC_OP_IMM, 0x5, 0x00, 0 },
+    { "SRAI", FMT_I_SHAMT, OPC_OP_IMM, 0x5, 0x20, 0 },
+
+    /* Loads */
+    { "LB",  FMT_I_MEM, OPC_LOAD, 0x0, 0, 0 },
+    { "LH",  FMT_I_MEM, OPC_LOAD, 0x1, 0, 0 },
+    { "LW",  FMT_I_MEM, OPC_LOAD, 0x2, 0, 0 },
+    { "LBU", FMT_I_MEM, OPC_LOAD, 0x4, 0, 0 },
+    { "LHU", FMT_I_MEM, OPC_LOAD, 0x5, 0, 0 },
+
+    /* JALR (same operand shape as a load) */
+    { "JALR", FMT_I_MEM, OPC_JALR, 0x0, 0, 0 },
+
+    /* Stores */
+    { "SB", FMT_S, OPC_STORE, 0x0, 0, 0 },
+    { "SH", FMT_S, OPC_STORE, 0x1, 0, 0 },
+    { "SW", FMT_S, OPC_STORE, 0x2, 0, 0 },
+
+    /* Branches */
+    { "BEQ",  FMT_B, OPC_BRANCH, 0x0, 0, 0 },
+    { "BNE",  FMT_B, OPC_BRANCH, 0x1, 0, 0 },
+    { "BLT",  FMT_B, OPC_BRANCH, 0x4, 0, 0 },
+    { "BGE",  FMT_B, OPC_BRANCH, 0x5, 0, 0 },
+    { "BLTU", FMT_B, OPC_BRANCH, 0x6, 0, 0 },
+    { "BGEU", FMT_B, OPC_BRANCH, 0x7, 0, 0 },
+
+    /* U-type */
+    { "LUI",   FMT_U, OPC_LUI,   0, 0, 0 },
+    { "AUIPC", FMT_U, OPC_AUIPC, 0, 0, 0 },
+
+    /* J-type */
+    { "JAL", FMT_J, OPC_JAL, 0, 0, 0 },
+
+    /* System */
+    { "ECALL",  FMT_SYSTEM, OPC_SYSTEM, 0x0, 0, 0x000 },
+    { "EBREAK", FMT_SYSTEM, OPC_SYSTEM, 0x0, 0, 0x001 },
+
+    /* Zicsr */
+    { "CSRRW",  FMT_CSR,  OPC_SYSTEM, 0x1, 0, 0 },
+    { "CSRRS",  FMT_CSR,  OPC_SYSTEM, 0x2, 0, 0 },
+    { "CSRRC",  FMT_CSR,  OPC_SYSTEM, 0x3, 0, 0 },
+    { "CSRRWI", FMT_CSRI, OPC_SYSTEM, 0x5, 0, 0 },
+    { "CSRRSI", FMT_CSRI, OPC_SYSTEM, 0x6, 0, 0 },
+    { "CSRRCI", FMT_CSRI, OPC_SYSTEM, 0x7, 0, 0 },
+
+    /* Fences */
+    { "FENCE",     FMT_FENCE,     OPC_MISC_MEM, 0x0, 0, 0 },
+    { "FENCE.TSO", FMT_FENCE_TSO, OPC_MISC_MEM, 0x0, 0, 0x833 }
+};
+
+#define NUM_OPCODES (sizeof(opcode_table) / sizeof(opcode_table[0]))
+
+typedef struct abi_register
+{
+    const char *name;
+    uint32_t    reg;
+} abi_register_t;
+
+/* Standard RV32I ABI register names; s0 is also accepted as 'fp'. */
+static const abi_register_t abi_registers[] = {
+    { "ZERO", 0 },  { "RA", 1 },   { "SP", 2 },   { "GP", 3 },   { "TP", 4 },
+    { "T0", 5 },    { "T1", 6 },   { "T2", 7 },
+    { "S0", 8 },    { "FP", 8 },   { "S1", 9 },
+    { "A0", 10 },   { "A1", 11 },  { "A2", 12 },  { "A3", 13 },
+    { "A4", 14 },   { "A5", 15 },  { "A6", 16 },  { "A7", 17 },
+    { "S2", 18 },   { "S3", 19 },  { "S4", 20 },  { "S5", 21 },
+    { "S6", 22 },   { "S7", 23 },  { "S8", 24 },  { "S9", 25 },
+    { "S10", 26 },  { "S11", 27 },
+    { "T3", 28 },   { "T4", 29 },  { "T5", 30 },  { "T6", 31 }
+};
+
+#define NUM_ABI_REGISTERS (sizeof(abi_registers) / sizeof(abi_registers[0]))
+
+typedef struct branch_zero_entry
+{
+    const char *mnemonic;      /* eg "BEQZ" */
+    const char *real_mnemonic; /* the opcode_table entry to reuse, eg "BEQ" */
+    int         swap;          /* 1 => tested register goes in rs2, x0 in rs1 */
+} branch_zero_entry_t;
+
+static const branch_zero_entry_t branch_zero_table[] = {
+    { "BEQZ", "BEQ", 0 },
+    { "BNEZ", "BNE", 0 },
+    { "BGEZ", "BGE", 0 },
+    { "BLTZ", "BLT", 0 },
+    { "BLEZ", "BGE", 1 },
+    { "BGTZ", "BLT", 1 }
+};
+
+#define NUM_BRANCH_ZERO (sizeof(branch_zero_table) / sizeof(branch_zero_table[0]))
+
+/* ---- Encoding helpers ---------------------------------------------- */
+
+static uint32_t encode_r(uint32_t opcode, uint32_t funct3, uint32_t funct7,
+                          uint32_t rd, uint32_t rs1, uint32_t rs2)
+{
+    return (funct7 << 25) | (rs2 << 20) | (rs1 << 15) | (funct3 << 12) | (rd << 7) | opcode;
+}
+
+static uint32_t encode_i(uint32_t opcode, uint32_t funct3, uint32_t rd, uint32_t rs1, int32_t imm12)
+{
+    uint32_t uimm = ((uint32_t) imm12) & 0xFFFu;
+    return (uimm << 20) | (rs1 << 15) | (funct3 << 12) | (rd << 7) | opcode;
+}
+
+static uint32_t encode_s(uint32_t opcode, uint32_t funct3, uint32_t rs1, uint32_t rs2, int32_t imm12)
+{
+    uint32_t uimm = ((uint32_t) imm12) & 0xFFFu;
+    uint32_t hi   = (uimm >> 5) & 0x7Fu;
+    uint32_t lo   = uimm & 0x1Fu;
+    return (hi << 25) | (rs2 << 20) | (rs1 << 15) | (funct3 << 12) | (lo << 7) | opcode;
+}
+
+static uint32_t encode_b(uint32_t opcode, uint32_t funct3, uint32_t rs1, uint32_t rs2, int32_t offset)
+{
+    uint32_t uoff  = (uint32_t) offset;
+    uint32_t b12   = (uoff >> 12) & 0x1u;
+    uint32_t b10_5 = (uoff >> 5)  & 0x3Fu;
+    uint32_t b4_1  = (uoff >> 1)  & 0xFu;
+    uint32_t b11   = (uoff >> 11) & 0x1u;
+    return (b12 << 31) | (b10_5 << 25) | (rs2 << 20) | (rs1 << 15) | (funct3 << 12) | (b4_1 << 8) | (b11 << 7) | opcode;
+}
+
+static uint32_t encode_u(uint32_t opcode, uint32_t rd, int32_t imm20)
+{
+    uint32_t uimm = ((uint32_t) imm20) & 0xFFFFFu;
+    return (uimm << 12) | (rd << 7) | opcode;
+}
+
+static uint32_t encode_j(uint32_t opcode, uint32_t rd, int32_t offset)
+{
+    uint32_t uoff    = (uint32_t) offset;
+    uint32_t b20     = (uoff >> 20) & 0x1u;
+    uint32_t b10_1   = (uoff >> 1)  & 0x3FFu;
+    uint32_t b11     = (uoff >> 11) & 0x1u;
+    uint32_t b19_12  = (uoff >> 12) & 0xFFu;
+    return (b20 << 31) | (b10_1 << 21) | (b11 << 20) | (b19_12 << 12) | (rd << 7) | opcode;
+}
+
+/* Splits a full 32-bit value into a 20-bit "hi" part and a 12-bit signed
+   "lo" part such that (hi << 12) + lo == value exactly, for the LUI+ADDI
+   (LI) and AUIPC+JALR (CALL) pseudo-instruction expansions. Only the low
+   20 bits of '*hi20' are meaningful; encode_u() masks to that width
+   anyway, so its wider representation is never inspected as a signed
+   quantity. */
+static void split_hi_lo(int32_t value, uint32_t *hi20, int32_t *lo12)
+{
+    uint32_t uvalue = (uint32_t) value;
+    int32_t  low    = (int32_t) (uvalue & 0xFFFu);
+
+    if (low & 0x800)
+    {
+        low -= 0x1000;
+    }
+    *hi20 = (uvalue - (uint32_t) low) >> 12;
+    *lo12 = low;
+}
+
+/* ---- Small parsing helpers ------------------------------------------ */
+
+static int32_t value_to_integer(const assemble_value_t *value)
+{
+    switch (value->type)
+    {
+        case ASSEMBLE_VALUE_FLOAT:
+            return (int32_t) value->value.as_float;
+        case ASSEMBLE_VALUE_INTEGER:
+        default:
+            return value->value.as_integer;
+    }
+}
+
+static _kernel_oserror *eval_expr(assemble_context_t *context,
+                                   const uint8_t *text, size_t length,
+                                   assemble_value_t *value, size_t *consumed)
+{
+    _kernel_oserror *error = NULL;
+
+    if (context->resolve_expr(context->user_data, text, length, value, consumed, &error) != ASSEMBLE_RESULT_OK)
+    {
+        if (error != NULL)
+        {
+            return error;
+        }
+        return assemble_set_error(ASSEMBLE_CPU_RISCV, ASSEMBLE_ERROR_TYPE_EXPRESSION, ASSEMBLE_RISCV_ERR_NONE,
+                                   "Expression could not be evaluated");
+    }
+    if (value->type == ASSEMBLE_VALUE_STRING)
+    {
+        return assemble_set_error(ASSEMBLE_CPU_RISCV, ASSEMBLE_ERROR_TYPE_EXPRESSION, ASSEMBLE_RISCV_ERR_NONE,
+                                   "Expected a numeric value");
+    }
+    return NULL;
+}
+
+static _kernel_oserror *eval_numeric(assemble_context_t *context,
+                                      const uint8_t *text, size_t length,
+                                      size_t *pos_inout, int32_t *out_value)
+{
+    assemble_value_t value;
+    size_t consumed;
+    _kernel_oserror *error;
+
+    error = eval_expr(context, text + *pos_inout, length - *pos_inout, &value, &consumed);
+    if (error != NULL)
+    {
+        return error;
+    }
+    *pos_inout += consumed;
+    *out_value = value_to_integer(&value);
+    return NULL;
+}
+
+static _kernel_oserror *check_trailing(const uint8_t *text, size_t length, size_t pos)
+{
+    pos += assemble_skip_spaces(text + pos, length - pos);
+    if (pos != length)
+    {
+        return assemble_set_error(ASSEMBLE_CPU_RISCV, ASSEMBLE_ERROR_TYPE_SYNTAX, ASSEMBLE_RISCV_ERR_NONE,
+                                   "Unexpected text after operand");
+    }
+    return NULL;
+}
+
+static _kernel_oserror *error_bad_register(void)
+{
+    return assemble_set_error(ASSEMBLE_CPU_RISCV, ASSEMBLE_ERROR_TYPE_BAD_OPERAND, ASSEMBLE_RISCV_ERR_BAD_REGISTER,
+                               "Register name or number expected");
+}
+
+static int continues_identifier(const uint8_t *text, size_t length, size_t pos)
+{
+    return pos < length && assemble_is_ident_char(text[pos]);
+}
+
+/*******************************************************************
+ Function:      parse_register
+ Description:   Parses a register operand: x0-x31, a standard ABI
+                name (zero, ra, sp, gp, tp, t0-t6, s0-s11, a0-a7, fp
+                as an alias for s0), or (falling back) any expression
+                evaluating to 0-31, eg a BASIC variable holding a
+                register number.
+ Parameters:    context = the assembly context
+                text/length = source text
+                pos_inout = [[inout]] position within text
+                out_reg = [[out]] register number 0-31
+ Returns:       NULL if successful, otherwise a static error block
+ ******************************************************************/
+static _kernel_oserror *parse_register(assemble_context_t *context,
+                                        const uint8_t *text, size_t length,
+                                        size_t *pos_inout, uint32_t *out_reg)
+{
+    size_t pos = *pos_inout;
+    uint8_t c0, c1;
+    int32_t value;
+    _kernel_oserror *error;
+
+    pos += assemble_skip_spaces(text + pos, length - pos);
+    c0 = (pos < length) ? (uint8_t) toupper((int) text[pos]) : 0;
+    c1 = (pos + 1 < length) ? (uint8_t) toupper((int) text[pos + 1]) : 0;
+
+    if (c0 == 'X' && c1 >= '0' && c1 <= '9')
+    {
+        size_t end = pos + 2;
+        uint32_t regnum = (uint32_t) (c1 - '0');
+
+        if (end < length && text[end] >= '0' && text[end] <= '9' && regnum <= 3)
+        {
+            regnum = regnum * 10 + (uint32_t) (text[end] - '0');
+            end += 1;
+        }
+        if (regnum <= 31 && !continues_identifier(text, length, end))
+        {
+            *out_reg = regnum;
+            *pos_inout = end;
+            return NULL;
+        }
+    }
+
+    if (assemble_is_ident_start(c0))
+    {
+        size_t start = pos;
+        size_t end = pos + 1;
+        char name[8];
+        size_t namelen;
+        size_t i;
+
+        while (end < length && assemble_is_ident_char(text[end]))
+        {
+            end += 1;
+        }
+        namelen = end - start;
+        if (namelen < sizeof(name))
+        {
+            for (i = 0; i < namelen; i++)
+            {
+                name[i] = (char) toupper((int) text[start + i]);
+            }
+            name[namelen] = '\0';
+
+            for (i = 0; i < NUM_ABI_REGISTERS; i++)
+            {
+                if (strcmp(name, abi_registers[i].name) == 0)
+                {
+                    *out_reg = abi_registers[i].reg;
+                    *pos_inout = end;
+                    return NULL;
+                }
+            }
+        }
+    }
+
+    *pos_inout = pos;
+    error = eval_numeric(context, text, length, pos_inout, &value);
+    if (error != NULL)
+    {
+        return error;
+    }
+    if (value < 0 || value > 31)
+    {
+        return error_bad_register();
+    }
+    *out_reg = (uint32_t) value;
+    return NULL;
+}
+
+static _kernel_oserror *expect_comma(const uint8_t *text, size_t length, size_t *pos_inout)
+{
+    *pos_inout += assemble_skip_spaces(text + *pos_inout, length - *pos_inout);
+    if (*pos_inout >= length || text[*pos_inout] != ',')
+    {
+        return assemble_set_error(ASSEMBLE_CPU_RISCV, ASSEMBLE_ERROR_TYPE_SYNTAX, ASSEMBLE_RISCV_ERR_NONE,
+                                   "Expected ','");
+    }
+    *pos_inout += 1;
+    *pos_inout += assemble_skip_spaces(text + *pos_inout, length - *pos_inout);
+    return NULL;
+}
+
+/* Parses the 'imm(rs1)' shape shared by loads, stores and JALR. */
+static _kernel_oserror *parse_mem_operand(assemble_context_t *context,
+                                           const uint8_t *text, size_t length, size_t *pos_inout,
+                                           int32_t *out_imm, uint32_t *out_base)
+{
+    _kernel_oserror *error;
+
+    error = eval_numeric(context, text, length, pos_inout, out_imm);
+    if (error != NULL)
+    {
+        return error;
+    }
+    *pos_inout += assemble_skip_spaces(text + *pos_inout, length - *pos_inout);
+    if (*pos_inout >= length || text[*pos_inout] != '(')
+    {
+        return assemble_set_error(ASSEMBLE_CPU_RISCV, ASSEMBLE_ERROR_TYPE_BAD_OPERAND,
+                                   ASSEMBLE_RISCV_ERR_BAD_ADDRESS_OFFSET, "Expected '(' before base register");
+    }
+    *pos_inout += 1;
+    *pos_inout += assemble_skip_spaces(text + *pos_inout, length - *pos_inout);
+    error = parse_register(context, text, length, pos_inout, out_base);
+    if (error != NULL)
+    {
+        return error;
+    }
+    *pos_inout += assemble_skip_spaces(text + *pos_inout, length - *pos_inout);
+    if (*pos_inout >= length || text[*pos_inout] != ')')
+    {
+        return assemble_set_error(ASSEMBLE_CPU_RISCV, ASSEMBLE_ERROR_TYPE_BAD_OPERAND,
+                                   ASSEMBLE_RISCV_ERR_BAD_ADDRESS_OFFSET, "Expected ')' after base register");
+    }
+    *pos_inout += 1;
+    return NULL;
+}
+
+static _kernel_oserror *error_bad_fence(void)
+{
+    return assemble_set_error(ASSEMBLE_CPU_RISCV, ASSEMBLE_ERROR_TYPE_BAD_OPERAND,
+                               ASSEMBLE_RISCV_ERR_BAD_FENCE_OPERAND,
+                               "FENCE predecessor/successor must use only i, o, r, w");
+}
+
+static _kernel_oserror *parse_fence_set(const uint8_t *text, size_t length, size_t *pos_inout, uint32_t *out_bits)
+{
+    uint32_t bits = 0;
+    size_t pos = *pos_inout;
+
+    while (pos < length && assemble_is_ident_char(text[pos]))
+    {
+        switch (toupper((int) text[pos]))
+        {
+            case 'I': bits |= 8u; break;
+            case 'O': bits |= 4u; break;
+            case 'R': bits |= 2u; break;
+            case 'W': bits |= 1u; break;
+            default:  return error_bad_fence();
+        }
+        pos += 1;
+    }
+    *pos_inout = pos;
+    *out_bits = bits;
+    return NULL;
+}
+
+/* ---- Range checks ---------------------------------------------------- */
+
+static _kernel_oserror *check_imm12(int32_t value)
+{
+    if (value < -2048 || value > 2047)
+    {
+        return assemble_set_error(ASSEMBLE_CPU_RISCV, ASSEMBLE_ERROR_TYPE_RANGE, ASSEMBLE_RISCV_ERR_BAD_IMMEDIATE,
+                                   "Immediate out of range [-2048..2047]");
+    }
+    return NULL;
+}
+
+static _kernel_oserror *check_shamt(int32_t value)
+{
+    if (value < 0 || value > 31)
+    {
+        return assemble_set_error(ASSEMBLE_CPU_RISCV, ASSEMBLE_ERROR_TYPE_RANGE, ASSEMBLE_RISCV_ERR_BAD_SHAMT,
+                                   "Shift amount out of range [0..31]");
+    }
+    return NULL;
+}
+
+static _kernel_oserror *check_utype_imm(int32_t value)
+{
+    if (value < -524288 || value > 1048575)
+    {
+        return assemble_set_error(ASSEMBLE_CPU_RISCV, ASSEMBLE_ERROR_TYPE_RANGE,
+                                   ASSEMBLE_RISCV_ERR_BAD_UTYPE_IMMEDIATE, "Immediate does not fit in 20 bits");
+    }
+    return NULL;
+}
+
+static _kernel_oserror *check_branch_offset(int32_t offset)
+{
+    if ((offset & 1) != 0)
+    {
+        return assemble_set_error(ASSEMBLE_CPU_RISCV, ASSEMBLE_ERROR_TYPE_RANGE, ASSEMBLE_RISCV_ERR_BRANCH_RANGE,
+                                   "Branch target is not 2-byte aligned");
+    }
+    if (offset < -4096 || offset > 4094)
+    {
+        return assemble_set_error(ASSEMBLE_CPU_RISCV, ASSEMBLE_ERROR_TYPE_RANGE, ASSEMBLE_RISCV_ERR_BRANCH_RANGE,
+                                   "Branch target out of range [-4096..4094]");
+    }
+    return NULL;
+}
+
+static _kernel_oserror *check_jump_offset(int32_t offset)
+{
+    if ((offset & 1) != 0)
+    {
+        return assemble_set_error(ASSEMBLE_CPU_RISCV, ASSEMBLE_ERROR_TYPE_RANGE, ASSEMBLE_RISCV_ERR_JUMP_RANGE,
+                                   "Jump target is not 2-byte aligned");
+    }
+    if (offset < -1048576 || offset > 1048574)
+    {
+        return assemble_set_error(ASSEMBLE_CPU_RISCV, ASSEMBLE_ERROR_TYPE_RANGE, ASSEMBLE_RISCV_ERR_JUMP_RANGE,
+                                   "Jump target out of range [-1048576..1048574]");
+    }
+    return NULL;
+}
+
+static _kernel_oserror *check_csr(int32_t value)
+{
+    if (value < 0 || value > 4095)
+    {
+        return assemble_set_error(ASSEMBLE_CPU_RISCV, ASSEMBLE_ERROR_TYPE_RANGE, ASSEMBLE_RISCV_ERR_BAD_CSR,
+                                   "CSR number out of range [0..4095]");
+    }
+    return NULL;
+}
+
+static _kernel_oserror *check_uimm5(int32_t value)
+{
+    if (value < 0 || value > 31)
+    {
+        return assemble_set_error(ASSEMBLE_CPU_RISCV, ASSEMBLE_ERROR_TYPE_RANGE, ASSEMBLE_RISCV_ERR_BAD_UIMM,
+                                   "CSR immediate out of range [0..31]");
+    }
+    return NULL;
+}
+
+/* ---- Real instruction assembly --------------------------------------- */
+
+static const opcode_entry_t *find_opcode(const char *mnemonic)
+{
+    size_t i;
+
+    for (i = 0; i < NUM_OPCODES; i++)
+    {
+        if (strcmp(opcode_table[i].mnemonic, mnemonic) == 0)
+        {
+            return &opcode_table[i];
+        }
+    }
+    return NULL;
+}
+
+/*******************************************************************
+ Function:      assemble_real
+ Description:   Parses the operand(s) for a real RV32I/Zicsr mnemonic
+                and emits its 32-bit encoding.
+ Parameters:    context = the assembly context
+                entry = the opcode table entry matched for this mnemonic
+                text/length = the operand text following the mnemonic
+ Returns:       NULL if successful, otherwise a static error block
+ ******************************************************************/
+static _kernel_oserror *assemble_real(assemble_context_t *context, const opcode_entry_t *entry,
+                                       const uint8_t *text, size_t length)
+{
+    size_t pos = 0;
+    uint32_t word;
+    _kernel_oserror *error;
+
+    pos += assemble_skip_spaces(text, length);
+
+    switch (entry->format)
+    {
+        case FMT_R:
+        {
+            uint32_t rd, rs1, rs2;
+
+            error = parse_register(context, text, length, &pos, &rd);
+            if (error != NULL) return error;
+            error = expect_comma(text, length, &pos);
+            if (error != NULL) return error;
+            error = parse_register(context, text, length, &pos, &rs1);
+            if (error != NULL) return error;
+            error = expect_comma(text, length, &pos);
+            if (error != NULL) return error;
+            error = parse_register(context, text, length, &pos, &rs2);
+            if (error != NULL) return error;
+            word = encode_r(entry->opcode, entry->funct3, entry->funct7, rd, rs1, rs2);
+            break;
+        }
+
+        case FMT_I_ARITH:
+        {
+            uint32_t rd, rs1;
+            int32_t imm;
+
+            error = parse_register(context, text, length, &pos, &rd);
+            if (error != NULL) return error;
+            error = expect_comma(text, length, &pos);
+            if (error != NULL) return error;
+            error = parse_register(context, text, length, &pos, &rs1);
+            if (error != NULL) return error;
+            error = expect_comma(text, length, &pos);
+            if (error != NULL) return error;
+            error = eval_numeric(context, text, length, &pos, &imm);
+            if (error != NULL) return error;
+            error = check_imm12(imm);
+            if (error != NULL) return error;
+            word = encode_i(entry->opcode, entry->funct3, rd, rs1, imm);
+            break;
+        }
+
+        case FMT_I_SHAMT:
+        {
+            uint32_t rd, rs1;
+            int32_t shamt;
+
+            error = parse_register(context, text, length, &pos, &rd);
+            if (error != NULL) return error;
+            error = expect_comma(text, length, &pos);
+            if (error != NULL) return error;
+            error = parse_register(context, text, length, &pos, &rs1);
+            if (error != NULL) return error;
+            error = expect_comma(text, length, &pos);
+            if (error != NULL) return error;
+            error = eval_numeric(context, text, length, &pos, &shamt);
+            if (error != NULL) return error;
+            error = check_shamt(shamt);
+            if (error != NULL) return error;
+            word = encode_i(entry->opcode, entry->funct3, rd, rs1,
+                             (int32_t) ((entry->funct7 << 5) | ((uint32_t) shamt & 0x1Fu)));
+            break;
+        }
+
+        case FMT_I_MEM:
+        {
+            uint32_t rd, rs1;
+            int32_t imm;
+
+            error = parse_register(context, text, length, &pos, &rd);
+            if (error != NULL) return error;
+            error = expect_comma(text, length, &pos);
+            if (error != NULL) return error;
+            error = parse_mem_operand(context, text, length, &pos, &imm, &rs1);
+            if (error != NULL) return error;
+            error = check_imm12(imm);
+            if (error != NULL) return error;
+            word = encode_i(entry->opcode, entry->funct3, rd, rs1, imm);
+            break;
+        }
+
+        case FMT_S:
+        {
+            uint32_t rs2, rs1;
+            int32_t imm;
+
+            error = parse_register(context, text, length, &pos, &rs2);
+            if (error != NULL) return error;
+            error = expect_comma(text, length, &pos);
+            if (error != NULL) return error;
+            error = parse_mem_operand(context, text, length, &pos, &imm, &rs1);
+            if (error != NULL) return error;
+            error = check_imm12(imm);
+            if (error != NULL) return error;
+            word = encode_s(entry->opcode, entry->funct3, rs1, rs2, imm);
+            break;
+        }
+
+        case FMT_B:
+        {
+            uint32_t rs1, rs2;
+            int32_t target, offset;
+
+            error = parse_register(context, text, length, &pos, &rs1);
+            if (error != NULL) return error;
+            error = expect_comma(text, length, &pos);
+            if (error != NULL) return error;
+            error = parse_register(context, text, length, &pos, &rs2);
+            if (error != NULL) return error;
+            error = expect_comma(text, length, &pos);
+            if (error != NULL) return error;
+            error = eval_numeric(context, text, length, &pos, &target);
+            if (error != NULL) return error;
+            offset = target - (int32_t) context->address;
+            error = check_branch_offset(offset);
+            if (error != NULL) return error;
+            word = encode_b(entry->opcode, entry->funct3, rs1, rs2, offset);
+            break;
+        }
+
+        case FMT_U:
+        {
+            uint32_t rd;
+            int32_t imm;
+
+            error = parse_register(context, text, length, &pos, &rd);
+            if (error != NULL) return error;
+            error = expect_comma(text, length, &pos);
+            if (error != NULL) return error;
+            error = eval_numeric(context, text, length, &pos, &imm);
+            if (error != NULL) return error;
+            error = check_utype_imm(imm);
+            if (error != NULL) return error;
+            word = encode_u(entry->opcode, rd, imm);
+            break;
+        }
+
+        case FMT_J:
+        {
+            uint32_t rd;
+            int32_t target, offset;
+
+            error = parse_register(context, text, length, &pos, &rd);
+            if (error != NULL) return error;
+            error = expect_comma(text, length, &pos);
+            if (error != NULL) return error;
+            error = eval_numeric(context, text, length, &pos, &target);
+            if (error != NULL) return error;
+            offset = target - (int32_t) context->address;
+            error = check_jump_offset(offset);
+            if (error != NULL) return error;
+            word = encode_j(entry->opcode, rd, offset);
+            break;
+        }
+
+        case FMT_SYSTEM:
+            word = encode_i(entry->opcode, entry->funct3, 0, 0, (int32_t) entry->fixed_imm);
+            break;
+
+        case FMT_FENCE:
+        {
+            uint32_t pred = 0xFu, succ = 0xFu;
+
+            if (pos < length)
+            {
+                error = parse_fence_set(text, length, &pos, &pred);
+                if (error != NULL) return error;
+                error = expect_comma(text, length, &pos);
+                if (error != NULL) return error;
+                error = parse_fence_set(text, length, &pos, &succ);
+                if (error != NULL) return error;
+            }
+            word = encode_i(entry->opcode, entry->funct3, 0, 0, (int32_t) ((pred << 4) | succ));
+            break;
+        }
+
+        case FMT_FENCE_TSO:
+            word = encode_i(entry->opcode, entry->funct3, 0, 0, (int32_t) entry->fixed_imm);
+            break;
+
+        case FMT_CSR:
+        {
+            uint32_t rd, rs1;
+            int32_t csr;
+
+            error = parse_register(context, text, length, &pos, &rd);
+            if (error != NULL) return error;
+            error = expect_comma(text, length, &pos);
+            if (error != NULL) return error;
+            error = eval_numeric(context, text, length, &pos, &csr);
+            if (error != NULL) return error;
+            error = check_csr(csr);
+            if (error != NULL) return error;
+            error = expect_comma(text, length, &pos);
+            if (error != NULL) return error;
+            error = parse_register(context, text, length, &pos, &rs1);
+            if (error != NULL) return error;
+            word = encode_i(entry->opcode, entry->funct3, rd, rs1, csr);
+            break;
+        }
+
+        case FMT_CSRI:
+        {
+            uint32_t rd;
+            int32_t csr, uimm;
+
+            error = parse_register(context, text, length, &pos, &rd);
+            if (error != NULL) return error;
+            error = expect_comma(text, length, &pos);
+            if (error != NULL) return error;
+            error = eval_numeric(context, text, length, &pos, &csr);
+            if (error != NULL) return error;
+            error = check_csr(csr);
+            if (error != NULL) return error;
+            error = expect_comma(text, length, &pos);
+            if (error != NULL) return error;
+            error = eval_numeric(context, text, length, &pos, &uimm);
+            if (error != NULL) return error;
+            error = check_uimm5(uimm);
+            if (error != NULL) return error;
+            word = encode_i(entry->opcode, entry->funct3, rd, (uint32_t) uimm, csr);
+            break;
+        }
+
+        default:
+            return assemble_set_error(ASSEMBLE_CPU_RISCV, ASSEMBLE_ERROR_TYPE_INTERNAL, ASSEMBLE_RISCV_ERR_NONE,
+                                       "Unhandled instruction format");
+    }
+
+    error = check_trailing(text, length, pos);
+    if (error != NULL)
+    {
+        return error;
+    }
+    return assemble_emit_dword(context, ASSEMBLE_CPU_RISCV, word);
+}
+
+/* ---- Pseudo-instructions ---------------------------------------------- */
+
+static _kernel_oserror *assemble_mv(assemble_context_t *context, const uint8_t *text, size_t length)
+{
+    size_t pos = 0;
+    uint32_t rd, rs;
+    _kernel_oserror *error;
+
+    pos += assemble_skip_spaces(text, length);
+    error = parse_register(context, text, length, &pos, &rd);
+    if (error != NULL) return error;
+    error = expect_comma(text, length, &pos);
+    if (error != NULL) return error;
+    error = parse_register(context, text, length, &pos, &rs);
+    if (error != NULL) return error;
+    error = check_trailing(text, length, pos);
+    if (error != NULL) return error;
+
+    return assemble_emit_dword(context, ASSEMBLE_CPU_RISCV, encode_i(OPC_OP_IMM, 0, rd, rs, 0));
+}
+
+/* LI always expands to a fixed LUI+ADDI pair (8 bytes), regardless of
+   how large the value turns out to be, so a line's size never depends
+   on whether a forward-referenced label has already been resolved --
+   see AGENTS.md. */
+static _kernel_oserror *assemble_li(assemble_context_t *context, const uint8_t *text, size_t length)
+{
+    size_t pos = 0;
+    uint32_t rd;
+    int32_t value, lo12;
+    uint32_t hi20;
+    _kernel_oserror *error;
+
+    pos += assemble_skip_spaces(text, length);
+    error = parse_register(context, text, length, &pos, &rd);
+    if (error != NULL) return error;
+    error = expect_comma(text, length, &pos);
+    if (error != NULL) return error;
+    error = eval_numeric(context, text, length, &pos, &value);
+    if (error != NULL) return error;
+    error = check_trailing(text, length, pos);
+    if (error != NULL) return error;
+
+    split_hi_lo(value, &hi20, &lo12);
+
+    error = assemble_emit_dword(context, ASSEMBLE_CPU_RISCV, encode_u(OPC_LUI, rd, (int32_t) hi20));
+    if (error != NULL) return error;
+    return assemble_emit_dword(context, ASSEMBLE_CPU_RISCV, encode_i(OPC_OP_IMM, 0, rd, rd, lo12));
+}
+
+static _kernel_oserror *assemble_j_pseudo(assemble_context_t *context, const uint8_t *text, size_t length)
+{
+    size_t pos = 0;
+    int32_t target, offset;
+    _kernel_oserror *error;
+
+    pos += assemble_skip_spaces(text, length);
+    error = eval_numeric(context, text, length, &pos, &target);
+    if (error != NULL) return error;
+    error = check_trailing(text, length, pos);
+    if (error != NULL) return error;
+
+    offset = target - (int32_t) context->address;
+    error = check_jump_offset(offset);
+    if (error != NULL) return error;
+
+    return assemble_emit_dword(context, ASSEMBLE_CPU_RISCV, encode_j(OPC_JAL, 0, offset));
+}
+
+static _kernel_oserror *assemble_jr(assemble_context_t *context, const uint8_t *text, size_t length)
+{
+    size_t pos = 0;
+    uint32_t rs;
+    _kernel_oserror *error;
+
+    pos += assemble_skip_spaces(text, length);
+    error = parse_register(context, text, length, &pos, &rs);
+    if (error != NULL) return error;
+    error = check_trailing(text, length, pos);
+    if (error != NULL) return error;
+
+    return assemble_emit_dword(context, ASSEMBLE_CPU_RISCV, encode_i(OPC_JALR, 0, 0, rs, 0));
+}
+
+/* CALL always expands to a fixed AUIPC+JALR pair (8 bytes) -- see the
+   note on assemble_li above; the same reasoning applies here. */
+static _kernel_oserror *assemble_call(assemble_context_t *context, const uint8_t *text, size_t length)
+{
+    size_t pos = 0;
+    int32_t target, offset, lo12;
+    uint32_t hi20;
+    _kernel_oserror *error;
+
+    pos += assemble_skip_spaces(text, length);
+    error = eval_numeric(context, text, length, &pos, &target);
+    if (error != NULL) return error;
+    error = check_trailing(text, length, pos);
+    if (error != NULL) return error;
+
+    offset = target - (int32_t) context->address;
+    split_hi_lo(offset, &hi20, &lo12);
+
+    error = assemble_emit_dword(context, ASSEMBLE_CPU_RISCV, encode_u(OPC_AUIPC, 1, (int32_t) hi20));
+    if (error != NULL) return error;
+    return assemble_emit_dword(context, ASSEMBLE_CPU_RISCV, encode_i(OPC_JALR, 0, 1, 1, lo12));
+}
+
+static const branch_zero_entry_t *find_branch_zero(const char *mnemonic)
+{
+    size_t i;
+
+    for (i = 0; i < NUM_BRANCH_ZERO; i++)
+    {
+        if (strcmp(branch_zero_table[i].mnemonic, mnemonic) == 0)
+        {
+            return &branch_zero_table[i];
+        }
+    }
+    return NULL;
+}
+
+static _kernel_oserror *assemble_branch_zero(assemble_context_t *context, const branch_zero_entry_t *bz,
+                                              const uint8_t *text, size_t length)
+{
+    size_t pos = 0;
+    uint32_t rs, rs1, rs2;
+    int32_t target, offset;
+    const opcode_entry_t *real_entry;
+    _kernel_oserror *error;
+
+    pos += assemble_skip_spaces(text, length);
+    error = parse_register(context, text, length, &pos, &rs);
+    if (error != NULL) return error;
+    error = expect_comma(text, length, &pos);
+    if (error != NULL) return error;
+    error = eval_numeric(context, text, length, &pos, &target);
+    if (error != NULL) return error;
+    error = check_trailing(text, length, pos);
+    if (error != NULL) return error;
+
+    real_entry = find_opcode(bz->real_mnemonic);
+
+    if (bz->swap)
+    {
+        rs1 = 0;
+        rs2 = rs;
+    }
+    else
+    {
+        rs1 = rs;
+        rs2 = 0;
+    }
+
+    offset = target - (int32_t) context->address;
+    error = check_branch_offset(offset);
+    if (error != NULL) return error;
+
+    return assemble_emit_dword(context, ASSEMBLE_CPU_RISCV,
+                                encode_b(real_entry->opcode, real_entry->funct3, rs1, rs2, offset));
+}
+
+/* ---- Data pseudo-op, label assignment and line dispatch --------------- */
+
+/*******************************************************************
+ Function:      assemble_dc
+ Description:   Assembles a DCB/DCW/DCD pseudo-op: a comma-separated
+                list of expressions, each emitted as a byte, 16-bit
+                halfword or 32-bit word respectively, little-endian.
+ Parameters:    context = the assembly context
+                mnemonic = "DCB", "DCW" or "DCD"
+                text/length = the operand text following the mnemonic
+ Returns:       NULL if successful, otherwise a static error block
+ ******************************************************************/
+static _kernel_oserror *assemble_dc(assemble_context_t *context, const char *mnemonic,
+                                     const uint8_t *text, size_t length)
+{
+    size_t pos = 0;
+    _kernel_oserror *error;
+
+    for (;;)
+    {
+        int32_t number;
+
+        pos += assemble_skip_spaces(text + pos, length - pos);
+        error = eval_numeric(context, text, length, &pos, &number);
+        if (error != NULL)
+        {
+            return error;
+        }
+
+        if (strcmp(mnemonic, "DCB") == 0)
+        {
+            error = assemble_emit_byte(context, ASSEMBLE_CPU_RISCV, (uint8_t) (number & 0xFF));
+        }
+        else if (strcmp(mnemonic, "DCW") == 0)
+        {
+            error = assemble_emit_word(context, ASSEMBLE_CPU_RISCV, (uint16_t) (number & 0xFFFF));
+        }
+        else
+        {
+            error = assemble_emit_dword(context, ASSEMBLE_CPU_RISCV, (uint32_t) number);
+        }
+        if (error != NULL)
+        {
+            return error;
+        }
+
+        pos += assemble_skip_spaces(text + pos, length - pos);
+        if (pos < length && text[pos] == ',')
+        {
+            pos += 1;
+            continue;
+        }
+        break;
+    }
+
+    return check_trailing(text, length, pos);
+}
+
+static _kernel_oserror *assign_label(assemble_context_t *context,
+                                      const char *label, size_t label_length,
+                                      const assemble_value_t *value)
+{
+    _kernel_oserror *error = NULL;
+
+    if (context->assign_var(context->user_data, label, label_length, value, &error) != ASSEMBLE_RESULT_OK)
+    {
+        if (error != NULL)
+        {
+            return error;
+        }
+        return assemble_set_error(ASSEMBLE_CPU_RISCV, ASSEMBLE_ERROR_TYPE_BAD_LABEL, ASSEMBLE_RISCV_ERR_NONE,
+                                   "Label could not be assigned");
+    }
+    return NULL;
+}
+
+static size_t read_mnemonic(const uint8_t *text, size_t length, char *out)
+{
+    size_t pos = 0;
+    size_t count = 0;
+
+    if (length == 0)
+    {
+        out[0] = '\0';
+        return 0;
+    }
+
+    if (text[0] == TOKEN_AND)
+    {
+        out[count++] = 'A';
+        out[count++] = 'N';
+        out[count++] = 'D';
+        pos = 1;
+    }
+    else if (text[0] == TOKEN_OR)
+    {
+        out[count++] = 'O';
+        out[count++] = 'R';
+        pos = 1;
+    }
+
+    while (pos < length && count < 10 &&
+           ((text[pos] >= 'A' && text[pos] <= 'Z') || (text[pos] >= 'a' && text[pos] <= 'z')))
+    {
+        out[count] = (char) toupper((int) text[pos]);
+        count += 1;
+        pos += 1;
+    }
+
+    if (count == 5 && memcmp(out, "FENCE", 5) == 0 && pos < length && text[pos] == '.')
+    {
+        size_t save_pos = pos;
+        size_t save_count = count;
+
+        out[count++] = '.';
+        pos += 1;
+        while (pos < length && count < 10 &&
+               ((text[pos] >= 'A' && text[pos] <= 'Z') || (text[pos] >= 'a' && text[pos] <= 'z')))
+        {
+            out[count] = (char) toupper((int) text[pos]);
+            count += 1;
+            pos += 1;
+        }
+        if (!(count == 9 && memcmp(out, "FENCE.TSO", 9) == 0))
+        {
+            pos = save_pos;
+            count = save_count;
+        }
+    }
+
+    out[count] = '\0';
+    return pos;
+}
+
+_kernel_oserror *assemble_riscv_line(assemble_context_t *context,
+                                      const uint8_t *line, size_t line_length)
+{
+    size_t pos;
+    char label[64];
+    size_t label_length = 0;
+    int have_label = 0;
+    char mnemonic[12];
+    size_t consumed;
+    _kernel_oserror *error;
+    const opcode_entry_t *entry;
+    const branch_zero_entry_t *bz;
+
+    context->bytes_used = 0;
+    pos = 0;
+
+    pos += assemble_skip_spaces(line + pos, line_length - pos);
+
+    if (pos < line_length && line[pos] == '.')
+    {
+        size_t start;
+
+        pos += 1;
+        start = pos;
+        if (!(pos < line_length && assemble_is_ident_start(line[pos])))
+        {
+            return assemble_set_error(ASSEMBLE_CPU_RISCV, ASSEMBLE_ERROR_TYPE_BAD_LABEL, ASSEMBLE_RISCV_ERR_NONE,
+                                       "Expected a label name after '.'");
+        }
+        while (pos < line_length && assemble_is_ident_char(line[pos]))
+        {
+            pos += 1;
+        }
+        label_length = pos - start;
+        if (label_length >= sizeof(label))
+        {
+            label_length = sizeof(label) - 1;
+        }
+        memcpy(label, line + start, label_length);
+        label[label_length] = '\0';
+        have_label = 1;
+
+        pos += assemble_skip_spaces(line + pos, line_length - pos);
+    }
+
+    if (pos >= line_length)
+    {
+        if (have_label)
+        {
+            assemble_value_t value;
+
+            value.type = ASSEMBLE_VALUE_INTEGER;
+            value.value.as_integer = (int32_t) context->address;
+            return assign_label(context, label, label_length, &value);
+        }
+        return NULL;
+    }
+
+    consumed = read_mnemonic(line + pos, line_length - pos, mnemonic);
+    if (consumed == 0 || mnemonic[0] == '\0')
+    {
+        return assemble_set_error(ASSEMBLE_CPU_RISCV, ASSEMBLE_ERROR_TYPE_BAD_MNEMONIC, ASSEMBLE_RISCV_ERR_NONE,
+                                   "Mnemonic not recognised");
+    }
+    pos += consumed;
+    pos += assemble_skip_spaces(line + pos, line_length - pos);
+
+    if (strcmp(mnemonic, "EQU") == 0)
+    {
+        assemble_value_t value;
+
+        if (!have_label)
+        {
+            return assemble_set_error(ASSEMBLE_CPU_RISCV, ASSEMBLE_ERROR_TYPE_BAD_LABEL, ASSEMBLE_RISCV_ERR_NONE,
+                                       "EQU used without a preceding label");
+        }
+        error = eval_expr(context, line + pos, line_length - pos, &value, &consumed);
+        if (error != NULL)
+        {
+            return error;
+        }
+        pos += consumed;
+        error = check_trailing(line, line_length, pos);
+        if (error != NULL)
+        {
+            return error;
+        }
+        return assign_label(context, label, label_length, &value);
+    }
+
+    if (have_label)
+    {
+        assemble_value_t value;
+
+        value.type = ASSEMBLE_VALUE_INTEGER;
+        value.value.as_integer = (int32_t) context->address;
+        error = assign_label(context, label, label_length, &value);
+        if (error != NULL)
+        {
+            return error;
+        }
+    }
+
+    if (strcmp(mnemonic, "OPT") == 0)
+    {
+        if (pos < line_length)
+        {
+            assemble_value_t value;
+
+            error = eval_expr(context, line + pos, line_length - pos, &value, &consumed);
+            if (error != NULL)
+            {
+                return error;
+            }
+            pos += consumed;
+        }
+        return check_trailing(line, line_length, pos);
+    }
+
+    if (strcmp(mnemonic, "DCB") == 0 || strcmp(mnemonic, "DCW") == 0 || strcmp(mnemonic, "DCD") == 0)
+    {
+        return assemble_dc(context, mnemonic, line + pos, line_length - pos);
+    }
+
+    if (strcmp(mnemonic, "NOP") == 0)
+    {
+        error = check_trailing(line, line_length, pos);
+        if (error != NULL)
+        {
+            return error;
+        }
+        return assemble_emit_dword(context, ASSEMBLE_CPU_RISCV, encode_i(OPC_OP_IMM, 0, 0, 0, 0));
+    }
+    if (strcmp(mnemonic, "MV") == 0)
+    {
+        return assemble_mv(context, line + pos, line_length - pos);
+    }
+    if (strcmp(mnemonic, "LI") == 0)
+    {
+        return assemble_li(context, line + pos, line_length - pos);
+    }
+    if (strcmp(mnemonic, "J") == 0)
+    {
+        return assemble_j_pseudo(context, line + pos, line_length - pos);
+    }
+    if (strcmp(mnemonic, "JR") == 0)
+    {
+        return assemble_jr(context, line + pos, line_length - pos);
+    }
+    if (strcmp(mnemonic, "RET") == 0)
+    {
+        error = check_trailing(line, line_length, pos);
+        if (error != NULL)
+        {
+            return error;
+        }
+        return assemble_emit_dword(context, ASSEMBLE_CPU_RISCV, encode_i(OPC_JALR, 0, 0, 1, 0));
+    }
+    if (strcmp(mnemonic, "CALL") == 0)
+    {
+        return assemble_call(context, line + pos, line_length - pos);
+    }
+
+    bz = find_branch_zero(mnemonic);
+    if (bz != NULL)
+    {
+        return assemble_branch_zero(context, bz, line + pos, line_length - pos);
+    }
+
+    entry = find_opcode(mnemonic);
+    if (entry == NULL)
+    {
+        return assemble_set_error(ASSEMBLE_CPU_RISCV, ASSEMBLE_ERROR_TYPE_BAD_MNEMONIC, ASSEMBLE_RISCV_ERR_NONE,
+                                   "Mnemonic not recognised");
+    }
+    return assemble_real(context, entry, line + pos, line_length - pos);
+}
