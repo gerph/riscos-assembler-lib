@@ -4544,6 +4544,14 @@ static _kernel_oserror *handle_fpa(assemble_context_t *context,
     return error;
 }
 
+/* Thumb backend, defined near the end of this file (after the VFP/NEON
+   section); forward-declared here so assemble_arm32_line() can hand
+   off to it before the base ARM32 dispatch runs. */
+static _kernel_oserror *assemble_thumb_line(assemble_context_t *context,
+                                             const uint8_t *line, size_t line_length,
+                                             size_t pos, size_t consumed, const char *mnemonic,
+                                             int have_label, const char *label, size_t label_length);
+
 /*******************************************************************
  Function:      assemble_arm32_line
  Description:   see h/assemble_arm32
@@ -4606,6 +4614,17 @@ _kernel_oserror *assemble_arm32_line(assemble_context_t *context,
     if (consumed == 0 || mnemonic[0] == '\0')
     {
         return error_bad_mnemonic();
+    }
+
+    /* Thumb is a wholly separate 16-bit encoding, not an additional
+       set of mnemonics layered on top of 32-bit ARM (see the comment
+       above ASSEMBLE_ARM32_OPT_THUMB in the header) -- once this bit
+       is set, nothing below (the base ARM32 table, FPA, VFP/NEON)
+       applies, so it is checked first and unconditionally hands off. */
+    if (context->opt & ASSEMBLE_ARM32_OPT_THUMB)
+    {
+        return assemble_thumb_line(context, line, line_length, pos, consumed, mnemonic,
+                                    have_label, label, label_length);
     }
 
     /* LDR, STR, LDM, STM, SWP, the long-multiply family, and the
@@ -8003,4 +8022,865 @@ static _kernel_oserror *encode_vfp_cvt_half(assemble_context_t *context, const m
     *out_instr = (cond << 28) | 0x0EB20A40u | (dd << 22) | (op << 16) | (vd << 12) | (sz << 8) |
                  (entry->param1 << 7) | (dm << 5) | vm;
     return NULL;
+}
+
+/* ---------------------------------------------------------------
+ * Classic (pre-Thumb-2) 16-bit Thumb, gated by ASSEMBLE_ARM32_OPT_THUMB
+ * -- see the comment above that #define in the header for why this is
+ * a wholly separate mode rather than an addition to the tables above.
+ * Ported from the 19 Thumb instruction "formats" (THUMB.1 to THUMB.19
+ * in the classic ARM ARM numbering, also used by armips'
+ * Archs/ARM/ThumbOpcodes.cpp/CThumbInstruction.cpp, read as ground
+ * truth for this port's bit layouts and range/scaling rules).
+ *
+ * Register operands reuse parse_register() (R0-R15, PC=15, LR=14,
+ * SP=13) unmodified, so Thumb accepts exactly the same register
+ * spellings as base ARM32; each format's 3-bit register fields are
+ * range-checked to R0-R7 explicitly here rather than silently
+ * truncating, since armips itself has no such check (its fields are
+ * only ever set from mask placeholders it trusts the syntax to have
+ * already constrained).
+ *
+ * Deliberate scope reductions versus armips' own coverage, both
+ * documented in AGENTS.md: no "LDR Rd,=const" literal-pool pseudo-op
+ * (base ARM32 has never supported literal pools either, so this stays
+ * consistent rather than being a Thumb-specific gap), and no "ADR"
+ * pseudo-mnemonic -- format12's PC/SP-relative address generation is
+ * written out explicitly as "ADD Rd,PC,#imm"/"ADD Rd,SP,#imm", which
+ * is what armips' own mask strings spell it as regardless of its
+ * placeholder name.
+ * --------------------------------------------------------------- */
+
+/*******************************************************************
+ Function:      parse_thumb_lowreg
+ Description:   parse_register() plus a check that the result is
+                R0-R7, as required by every 3-bit register field.
+ ******************************************************************/
+static _kernel_oserror *parse_thumb_lowreg(assemble_context_t *context,
+                                            const uint8_t *text, size_t length,
+                                            size_t *pos_inout, uint32_t *out_reg)
+{
+    _kernel_oserror *error = parse_register(context, text, length, pos_inout, out_reg);
+
+    if (error != NULL) return error;
+    if (*out_reg > 7u) return error_bad_register();
+    return NULL;
+}
+
+/* Peeks whether a *named* register (Rn/PC/LR/SP) starts at 'pos',
+ * without consuming it and without parse_register's numeric-expression
+ * fallback -- used only to disambiguate "BLX Rm" (register) from
+ * "BLX label" (branch), where accepting a bare numeric expression as
+ * a possible register would make "BLX 4" ambiguous. */
+static int thumb_peek_named_register(const uint8_t *text, size_t length, size_t pos)
+{
+    uint8_t c0, c1;
+
+    pos += assemble_skip_spaces(text + pos, length - pos);
+    c0 = (pos < length) ? (uint8_t) toupper((int) text[pos]) : 0;
+    c1 = (pos + 1 < length) ? (uint8_t) toupper((int) text[pos + 1]) : 0;
+    if (c0 == 'R' && c1 >= '0' && c1 <= '9') return 1;
+    if (c0 == 'P' && c1 == 'C' && !continues_identifier(text, length, pos + 2)) return 1;
+    if (c0 == 'L' && c1 == 'R' && !continues_identifier(text, length, pos + 2)) return 1;
+    if (c0 == 'S' && c1 == 'P' && !continues_identifier(text, length, pos + 2)) return 1;
+    return 0;
+}
+
+typedef _kernel_oserror *(*thumb_handler_fn)(assemble_context_t *context, uint32_t param,
+                                              const uint8_t *text, size_t length, size_t pos);
+
+typedef struct thumb_mnemonic_entry
+{
+    const char      *name;
+    thumb_handler_fn fn;
+    uint32_t         param;
+} thumb_mnemonic_entry_t;
+
+/* THUMB.1: move shifted register -- LSL/ASL/LSR/ASR Rd,Rs,#imm5 (or
+   Rd,#imm5, rs=rd), and their THUMB.4 register-controlled-shift
+   siblings LSL/LSR/ASR Rd,Rs (no immediate) sharing the same literal
+   root; the two are told apart by whether the last operand is '#imm'
+   or a register. param: 0=LSL, 1=LSR, 2=ASR (ASL is an LSL alias). */
+static _kernel_oserror *thumb_handle_shift(assemble_context_t *context, uint32_t param,
+                                            const uint8_t *text, size_t length, size_t pos)
+{
+    static const uint16_t IMM_BASE[3] = { 0x0000u, 0x0800u, 0x1000u };
+    static const uint16_t REG_BASE[3] = { 0x4080u, 0x40C0u, 0x4100u };
+    uint32_t rd, rs;
+    uint32_t max_shift = (param == 0u) ? 31u : 32u;
+    size_t peek;
+    _kernel_oserror *error;
+
+    error = parse_thumb_lowreg(context, text, length, &pos, &rd);
+    if (error != NULL) return error;
+    error = expect_char(text, length, &pos, ',');
+    if (error != NULL) return error;
+
+    peek = pos + assemble_skip_spaces(text + pos, length - pos);
+    if (peek < length && text[peek] == '#')
+    {
+        int32_t imm;
+        uint16_t encoding;
+
+        pos = peek;
+        error = expect_char(text, length, &pos, '#');
+        if (error != NULL) return error;
+        error = eval_numeric(context, text, length, &pos, &imm);
+        if (error != NULL) return error;
+        error = check_trailing(text, length, pos);
+        if (error != NULL) return error;
+        if (imm < 0 || (uint32_t) imm > max_shift) return error_bad_immediate();
+        if (param != 0u && imm == 32) imm = 0; /* #32 (LSR/ASR only) encodes as 0 */
+
+        encoding = IMM_BASE[param];
+        encoding = (uint16_t) (encoding | (((uint32_t) imm & 0x1Fu) << 6) | (rd << 3) | rd);
+        return assemble_emit_word(context, ASSEMBLE_CPU_ARM32, encoding);
+    }
+
+    error = parse_thumb_lowreg(context, text, length, &pos, &rs);
+    if (error != NULL) return error;
+
+    peek = pos + assemble_skip_spaces(text + pos, length - pos);
+    if (peek < length && text[peek] == ',')
+    {
+        int32_t imm;
+        uint16_t encoding;
+
+        pos = peek + 1;
+        error = expect_char(text, length, &pos, '#');
+        if (error != NULL) return error;
+        error = eval_numeric(context, text, length, &pos, &imm);
+        if (error != NULL) return error;
+        error = check_trailing(text, length, pos);
+        if (error != NULL) return error;
+        if (imm < 0 || (uint32_t) imm > max_shift) return error_bad_immediate();
+        if (param != 0u && imm == 32) imm = 0;
+
+        encoding = IMM_BASE[param];
+        encoding = (uint16_t) (encoding | (((uint32_t) imm & 0x1Fu) << 6) | (rs << 3) | rd);
+        return assemble_emit_word(context, ASSEMBLE_CPU_ARM32, encoding);
+    }
+
+    error = check_trailing(text, length, pos);
+    if (error != NULL) return error;
+    {
+        uint16_t encoding = REG_BASE[param];
+        encoding = (uint16_t) (encoding | (rs << 3) | rd);
+        return assemble_emit_word(context, ASSEMBLE_CPU_ARM32, encoding);
+    }
+}
+
+/* THUMB.2/3/12/13: ADD/SUB, covering register (Rd,Rn,Rm and the
+   Rd,Rn DS-shorthand), 3-bit and 8-bit immediate forms, PC/SP-relative
+   address generation (ADD only, dest must be R0-R7) and SP adjustment
+   (dest and base both SP). Which shape applies is determined entirely
+   by which registers/operand-kinds are written -- SP as the
+   destination can only ever mean the SP-adjust form, since format12's
+   3-bit Rd field cannot hold 13 -- so there is no real ambiguity to
+   resolve, just a lot of shapes to enumerate. param: 0=ADD, 1=SUB. */
+static _kernel_oserror *thumb_handle_addsub(assemble_context_t *context, uint32_t param,
+                                             const uint8_t *text, size_t length, size_t pos)
+{
+    int is_sub = (param != 0u);
+    uint32_t rd, rn, rm;
+    int32_t imm;
+    uint16_t encoding;
+    size_t peek;
+    _kernel_oserror *error;
+
+    error = parse_register(context, text, length, &pos, &rd);
+    if (error != NULL) return error;
+    error = expect_char(text, length, &pos, ',');
+    if (error != NULL) return error;
+
+    peek = pos + assemble_skip_spaces(text + pos, length - pos);
+    if (peek < length && text[peek] == '#')
+    {
+        pos = peek;
+        error = expect_char(text, length, &pos, '#');
+        if (error != NULL) return error;
+        error = eval_numeric(context, text, length, &pos, &imm);
+        if (error != NULL) return error;
+        error = check_trailing(text, length, pos);
+        if (error != NULL) return error;
+
+        if (rd == 13u)
+        {
+            if (imm < 0 || (imm & 3) != 0 || (imm >> 2) > 0x7F) return error_bad_immediate();
+            encoding = (uint16_t) (0xB000u | (is_sub ? 0x0080u : 0u) | ((uint32_t) imm >> 2));
+            return assemble_emit_word(context, ASSEMBLE_CPU_ARM32, encoding);
+        }
+        if (rd > 7u) return error_bad_register();
+        if (imm < 0 || imm > 0xFF) return error_bad_immediate();
+        encoding = (uint16_t) ((is_sub ? 0x3800u : 0x3000u) | (rd << 8) | ((uint32_t) imm & 0xFFu));
+        return assemble_emit_word(context, ASSEMBLE_CPU_ARM32, encoding);
+    }
+
+    error = parse_register(context, text, length, &pos, &rn);
+    if (error != NULL) return error;
+
+    peek = pos + assemble_skip_spaces(text + pos, length - pos);
+    if (peek >= length || text[peek] != ',')
+    {
+        error = check_trailing(text, length, pos);
+        if (error != NULL) return error;
+        if (rd > 7u || rn > 7u) return error_bad_register();
+        encoding = (uint16_t) ((is_sub ? 0x1A00u : 0x1800u) | (rn << 6) | (rd << 3) | rd);
+        return assemble_emit_word(context, ASSEMBLE_CPU_ARM32, encoding);
+    }
+
+    pos = peek + 1;
+    peek = pos + assemble_skip_spaces(text + pos, length - pos);
+    if (peek < length && text[peek] == '#')
+    {
+        pos = peek;
+        error = expect_char(text, length, &pos, '#');
+        if (error != NULL) return error;
+        error = eval_numeric(context, text, length, &pos, &imm);
+        if (error != NULL) return error;
+        error = check_trailing(text, length, pos);
+        if (error != NULL) return error;
+
+        if (rd == 13u && rn == 13u)
+        {
+            if (imm < 0 || (imm & 3) != 0 || (imm >> 2) > 0x7F) return error_bad_immediate();
+            encoding = (uint16_t) (0xB000u | (is_sub ? 0x0080u : 0u) | ((uint32_t) imm >> 2));
+            return assemble_emit_word(context, ASSEMBLE_CPU_ARM32, encoding);
+        }
+        if (!is_sub && rd <= 7u && (rn == 15u || rn == 13u))
+        {
+            if (imm < 0 || (imm & 3) != 0 || (imm >> 2) > 0xFF) return error_bad_immediate();
+            encoding = (uint16_t) (((rn == 15u) ? 0xA000u : 0xA800u) | (rd << 8) | ((uint32_t) imm >> 2));
+            return assemble_emit_word(context, ASSEMBLE_CPU_ARM32, encoding);
+        }
+        if (rd > 7u || rn > 7u) return error_bad_register();
+        if (imm < 0 || imm > 7) return error_bad_immediate();
+        encoding = (uint16_t) ((is_sub ? 0x1E00u : 0x1C00u) | ((uint32_t) imm << 6) | (rn << 3) | rd);
+        return assemble_emit_word(context, ASSEMBLE_CPU_ARM32, encoding);
+    }
+
+    error = parse_register(context, text, length, &pos, &rm);
+    if (error != NULL) return error;
+    error = check_trailing(text, length, pos);
+    if (error != NULL) return error;
+    if (rd > 7u || rn > 7u || rm > 7u) return error_bad_register();
+    encoding = (uint16_t) ((is_sub ? 0x1A00u : 0x1800u) | (rm << 6) | (rn << 3) | rd);
+    return assemble_emit_word(context, ASSEMBLE_CPU_ARM32, encoding);
+}
+
+/* THUMB.3/5: MOV Rd,#imm8 (Rd low); MOV Rd,Rs where either is a hi
+   register (R8-R15) uses THUMB.5's D/S encoding; MOV Rd,Rs with both
+   low has no dedicated low-register encoding at all in real Thumb --
+   it is synthesised as "ADD Rd,Rs,#0" (THUMB.2's immediate sub-form),
+   exactly as armips' own table does it. */
+static _kernel_oserror *thumb_handle_mov(assemble_context_t *context, uint32_t param,
+                                          const uint8_t *text, size_t length, size_t pos)
+{
+    uint32_t rd, rs;
+    uint16_t encoding;
+    size_t peek;
+    _kernel_oserror *error;
+
+    (void) param;
+    error = parse_register(context, text, length, &pos, &rd);
+    if (error != NULL) return error;
+    error = expect_char(text, length, &pos, ',');
+    if (error != NULL) return error;
+
+    peek = pos + assemble_skip_spaces(text + pos, length - pos);
+    if (peek < length && text[peek] == '#')
+    {
+        int32_t imm;
+
+        if (rd > 7u) return error_bad_register();
+        pos = peek;
+        error = expect_char(text, length, &pos, '#');
+        if (error != NULL) return error;
+        error = eval_numeric(context, text, length, &pos, &imm);
+        if (error != NULL) return error;
+        error = check_trailing(text, length, pos);
+        if (error != NULL) return error;
+        if (imm < 0 || imm > 0xFF) return error_bad_immediate();
+        encoding = (uint16_t) (0x2000u | (rd << 8) | ((uint32_t) imm & 0xFFu));
+        return assemble_emit_word(context, ASSEMBLE_CPU_ARM32, encoding);
+    }
+
+    error = parse_register(context, text, length, &pos, &rs);
+    if (error != NULL) return error;
+    error = check_trailing(text, length, pos);
+    if (error != NULL) return error;
+
+    if (rd > 7u || rs > 7u)
+    {
+        encoding = 0x4600u;
+        if (rd > 7u) encoding = (uint16_t) (encoding | (1u << 7));
+        encoding = (uint16_t) (encoding | (rd & 7u));
+        if (rs > 7u) encoding = (uint16_t) (encoding | (1u << 6));
+        encoding = (uint16_t) (encoding | ((rs & 7u) << 3));
+    }
+    else
+    {
+        encoding = (uint16_t) (0x1C00u | (rs << 3) | rd);
+    }
+    return assemble_emit_word(context, ASSEMBLE_CPU_ARM32, encoding);
+}
+
+/* THUMB.3/4/5: CMP Rd,#imm8 (Rd low); CMP Rd,Rs, low-low via THUMB.4's
+   plain ALU-op encoding, hi-either via THUMB.5's D/S encoding. */
+static _kernel_oserror *thumb_handle_cmp(assemble_context_t *context, uint32_t param,
+                                          const uint8_t *text, size_t length, size_t pos)
+{
+    uint32_t rd, rs;
+    uint16_t encoding;
+    size_t peek;
+    _kernel_oserror *error;
+
+    (void) param;
+    error = parse_register(context, text, length, &pos, &rd);
+    if (error != NULL) return error;
+    error = expect_char(text, length, &pos, ',');
+    if (error != NULL) return error;
+
+    peek = pos + assemble_skip_spaces(text + pos, length - pos);
+    if (peek < length && text[peek] == '#')
+    {
+        int32_t imm;
+
+        if (rd > 7u) return error_bad_register();
+        pos = peek;
+        error = expect_char(text, length, &pos, '#');
+        if (error != NULL) return error;
+        error = eval_numeric(context, text, length, &pos, &imm);
+        if (error != NULL) return error;
+        error = check_trailing(text, length, pos);
+        if (error != NULL) return error;
+        if (imm < 0 || imm > 0xFF) return error_bad_immediate();
+        encoding = (uint16_t) (0x2800u | (rd << 8) | ((uint32_t) imm & 0xFFu));
+        return assemble_emit_word(context, ASSEMBLE_CPU_ARM32, encoding);
+    }
+
+    error = parse_register(context, text, length, &pos, &rs);
+    if (error != NULL) return error;
+    error = check_trailing(text, length, pos);
+    if (error != NULL) return error;
+
+    if (rd > 7u || rs > 7u)
+    {
+        encoding = 0x4500u;
+        if (rd > 7u) encoding = (uint16_t) (encoding | (1u << 7));
+        encoding = (uint16_t) (encoding | (rd & 7u));
+        if (rs > 7u) encoding = (uint16_t) (encoding | (1u << 6));
+        encoding = (uint16_t) (encoding | ((rs & 7u) << 3));
+    }
+    else
+    {
+        encoding = (uint16_t) (0x4280u | (rs << 3) | rd);
+    }
+    return assemble_emit_word(context, ASSEMBLE_CPU_ARM32, encoding);
+}
+
+/* THUMB.4: the plain two-low-register ALU operations that have no
+   other format sharing their root -- AND EOR/XOR ADC SBC ROR TST NEG
+   CMN ORR MUL BIC MVN (LSL/LSR/ASR's register form is handled by
+   thumb_handle_shift above instead, since that root also has an
+   immediate form; CMP's register form is handled by thumb_handle_cmp,
+   since that root also has hi-register and immediate forms).
+   param is the complete base encoding (opcode nibble already
+   positioned). */
+static _kernel_oserror *thumb_handle_alu4(assemble_context_t *context, uint32_t param,
+                                           const uint8_t *text, size_t length, size_t pos)
+{
+    uint32_t rd, rs;
+    uint16_t encoding;
+    _kernel_oserror *error;
+
+    error = parse_thumb_lowreg(context, text, length, &pos, &rd);
+    if (error != NULL) return error;
+    error = expect_char(text, length, &pos, ',');
+    if (error != NULL) return error;
+    error = parse_thumb_lowreg(context, text, length, &pos, &rs);
+    if (error != NULL) return error;
+    error = check_trailing(text, length, pos);
+    if (error != NULL) return error;
+
+    encoding = (uint16_t) (param | (rs << 3) | rd);
+    return assemble_emit_word(context, ASSEMBLE_CPU_ARM32, encoding);
+}
+
+/* NOP -- THUMB.5's fixed "MOV R8,R8" encoding, no operands. */
+static _kernel_oserror *thumb_handle_nop(assemble_context_t *context, uint32_t param,
+                                          const uint8_t *text, size_t length, size_t pos)
+{
+    _kernel_oserror *error;
+
+    (void) param;
+    error = check_trailing(text, length, pos);
+    if (error != NULL) return error;
+    return assemble_emit_word(context, ASSEMBLE_CPU_ARM32, 0x46C0u);
+}
+
+/* THUMB.5: BX Rm / BLX Rm (register form -- interworking branch,
+   optionally with link). param is the base encoding (0x4700=BX,
+   0x4780=BLX); BLX's label form is a completely different encoding
+   (THUMB.19) and is handled separately -- see thumb_handle_bl and the
+   dispatch in assemble_thumb_line. */
+static _kernel_oserror *thumb_handle_bx(assemble_context_t *context, uint32_t param,
+                                         const uint8_t *text, size_t length, size_t pos)
+{
+    uint32_t rs;
+    uint16_t encoding;
+    _kernel_oserror *error;
+
+    error = parse_register(context, text, length, &pos, &rs);
+    if (error != NULL) return error;
+    error = check_trailing(text, length, pos);
+    if (error != NULL) return error;
+
+    encoding = (uint16_t) param;
+    if (rs > 7u) encoding = (uint16_t) (encoding | (1u << 6));
+    encoding = (uint16_t) (encoding | ((rs & 7u) << 3));
+    return assemble_emit_word(context, ASSEMBLE_CPU_ARM32, encoding);
+}
+
+/* THUMB.6/7/8/9/10/11: LDR/STR and friends. Addressing shape --
+   [Rn], [Rn,#imm] or [Rn,Rm] -- and which of Rn's special values
+   (PC, SP) are legal is entirely mnemonic- and shape-dependent, so
+   this one function parses the address generically and then picks
+   the right one of six encodings by (mnemonic size/sign class, base
+   register identity, immediate-vs-register offset).
+   param: bit0 = is_load; bits3:1 = size class (0=word, 1=byte,
+   2=halfword, 3=signed byte, 4=signed halfword). */
+static _kernel_oserror *thumb_handle_ldr_str(assemble_context_t *context, uint32_t param,
+                                              const uint8_t *text, size_t length, size_t pos)
+{
+    int is_load = (param & 1u) != 0;
+    uint32_t size_class = (param >> 1) & 7u;
+    uint32_t rd, rn, ro = 0;
+    int32_t imm = 0;
+    int has_offset_reg = 0, has_offset_imm = 0;
+    size_t peek;
+    _kernel_oserror *error;
+
+    error = parse_thumb_lowreg(context, text, length, &pos, &rd);
+    if (error != NULL) return error;
+    error = expect_char(text, length, &pos, ',');
+    if (error != NULL) return error;
+    error = expect_char(text, length, &pos, '[');
+    if (error != NULL) return error;
+    error = parse_register(context, text, length, &pos, &rn);
+    if (error != NULL) return error;
+
+    peek = pos + assemble_skip_spaces(text + pos, length - pos);
+    if (peek < length && text[peek] == ',')
+    {
+        pos = peek + 1;
+        peek = pos + assemble_skip_spaces(text + pos, length - pos);
+        if (peek < length && text[peek] == '#')
+        {
+            pos = peek;
+            error = expect_char(text, length, &pos, '#');
+            if (error != NULL) return error;
+            error = eval_numeric(context, text, length, &pos, &imm);
+            if (error != NULL) return error;
+            has_offset_imm = 1;
+        }
+        else
+        {
+            error = parse_register(context, text, length, &pos, &ro);
+            if (error != NULL) return error;
+            has_offset_reg = 1;
+        }
+    }
+    error = expect_char(text, length, &pos, ']');
+    if (error != NULL) return error;
+    error = check_trailing(text, length, pos);
+    if (error != NULL) return error;
+
+    if (has_offset_reg)
+    {
+        uint16_t encoding;
+
+        if (rn > 7u || ro > 7u) return error_bad_register();
+        switch (size_class)
+        {
+            case 0: encoding = (uint16_t) (is_load ? 0x5800u : 0x5000u); break;
+            case 1: encoding = (uint16_t) (is_load ? 0x5C00u : 0x5400u); break;
+            case 2: encoding = (uint16_t) (is_load ? 0x5A00u : 0x5200u); break;
+            case 3: encoding = 0x5600u; break; /* LDRSB (no STRSB) */
+            default: encoding = 0x5E00u; break; /* LDRSH (no STRSH) */
+        }
+        encoding = (uint16_t) (encoding | (ro << 6) | (rn << 3) | rd);
+        return assemble_emit_word(context, ASSEMBLE_CPU_ARM32, encoding);
+    }
+
+    if (!has_offset_imm) imm = 0;
+
+    if (size_class == 3u || size_class == 4u)
+    {
+        return assemble_set_error(ASSEMBLE_CPU_ARM32, ASSEMBLE_ERROR_TYPE_BAD_OPERAND,
+                                   ASSEMBLE_ARM32_ERR_BAD_ADDRESS_OFFSET,
+                                   "LDRSB/LDRSH only support register-offset addressing, eg [Rn,Rm]");
+    }
+
+    if (rn == 15u)
+    {
+        uint16_t encoding;
+
+        if (!is_load || size_class != 0u) return error_bad_register();
+        if (imm < 0 || (imm & 3) != 0 || (imm >> 2) > 0xFF) return error_bad_immediate();
+        encoding = (uint16_t) (0x4800u | (rd << 8) | ((uint32_t) imm >> 2));
+        return assemble_emit_word(context, ASSEMBLE_CPU_ARM32, encoding);
+    }
+
+    if (rn == 13u)
+    {
+        uint16_t encoding;
+
+        if (size_class != 0u) return error_bad_register();
+        if (imm < 0 || (imm & 3) != 0 || (imm >> 2) > 0xFF) return error_bad_immediate();
+        encoding = (uint16_t) ((is_load ? 0x9800u : 0x9000u) | (rd << 8) | ((uint32_t) imm >> 2));
+        return assemble_emit_word(context, ASSEMBLE_CPU_ARM32, encoding);
+    }
+
+    if (rn > 7u) return error_bad_register();
+
+    if (size_class == 2u)
+    {
+        uint16_t encoding;
+
+        if (imm < 0 || (imm & 1) != 0 || (imm >> 1) > 0x1F) return error_bad_immediate();
+        encoding = (uint16_t) ((is_load ? 0x8800u : 0x8000u) | ((((uint32_t) imm >> 1) & 0x1Fu) << 6) |
+                                (rn << 3) | rd);
+        return assemble_emit_word(context, ASSEMBLE_CPU_ARM32, encoding);
+    }
+
+    {
+        uint16_t encoding;
+        uint32_t field;
+
+        if (size_class == 0u)
+        {
+            if (imm < 0 || (imm & 3) != 0 || (imm >> 2) > 0x1F) return error_bad_immediate();
+            field = (uint32_t) imm >> 2;
+            encoding = (uint16_t) (is_load ? 0x6800u : 0x6000u);
+        }
+        else
+        {
+            if (imm < 0 || imm > 0x1F) return error_bad_immediate();
+            field = (uint32_t) imm;
+            encoding = (uint16_t) (is_load ? 0x7800u : 0x7000u);
+        }
+        encoding = (uint16_t) (encoding | ((field & 0x1Fu) << 6) | (rn << 3) | rd);
+        return assemble_emit_word(context, ASSEMBLE_CPU_ARM32, encoding);
+    }
+}
+
+/* THUMB.14: PUSH {list}/POP {list} -- R0-R7 plus LR (push) or PC
+   (pop). Reuses parse_register_list wholesale (the same '{...}',
+   'Rn-Rm' range and duplicate-detection logic LDM/STM use), then
+   checks the resulting mask is restricted to what Thumb can actually
+   encode. param: 0=PUSH, 1=POP. */
+static _kernel_oserror *thumb_handle_push_pop(assemble_context_t *context, uint32_t param,
+                                               const uint8_t *text, size_t length, size_t pos)
+{
+    int is_pop = (param != 0u);
+    uint32_t mask, extra_bit = is_pop ? (1u << 15) : (1u << 14);
+    int caret;
+    uint16_t encoding;
+    _kernel_oserror *error;
+
+    error = parse_register_list(context, text, length, &pos, &mask, &caret);
+    if (error != NULL) return error;
+    error = check_trailing(text, length, pos);
+    if (error != NULL) return error;
+    if (caret) return error_bad_register_list("PUSH/POP does not support the '^' suffix");
+    if (mask == 0u) return error_bad_register_list("Register list must not be empty");
+    if (mask & ~(0xFFu | extra_bit))
+    {
+        return error_bad_register_list(is_pop ? "POP register list may only contain R0-R7 and PC" :
+                                                 "PUSH register list may only contain R0-R7 and LR");
+    }
+
+    encoding = (uint16_t) (is_pop ? 0xBC00u : 0xB400u);
+    if (mask & extra_bit) encoding = (uint16_t) (encoding | (1u << 8));
+    encoding = (uint16_t) (encoding | (mask & 0xFFu));
+    return assemble_emit_word(context, ASSEMBLE_CPU_ARM32, encoding);
+}
+
+/* THUMB.15: STMIA/LDMIA Rn!,{list} -- Rn and every register in the
+   list must be R0-R7; writeback ('!') is mandatory (THUMB.15 has no
+   non-writeback form), matching real Thumb syntax. */
+static _kernel_oserror *thumb_handle_ldm_stm(assemble_context_t *context, uint32_t param,
+                                              const uint8_t *text, size_t length, size_t pos)
+{
+    int is_load = (param != 0u);
+    uint32_t rn, mask;
+    int caret;
+    uint16_t encoding;
+    _kernel_oserror *error;
+
+    error = parse_thumb_lowreg(context, text, length, &pos, &rn);
+    if (error != NULL) return error;
+    error = expect_char(text, length, &pos, '!');
+    if (error != NULL) return error;
+    error = expect_char(text, length, &pos, ',');
+    if (error != NULL) return error;
+    error = parse_register_list(context, text, length, &pos, &mask, &caret);
+    if (error != NULL) return error;
+    error = check_trailing(text, length, pos);
+    if (error != NULL) return error;
+    if (caret) return error_bad_register_list("STMIA/LDMIA does not support the '^' suffix");
+    if (mask == 0u) return error_bad_register_list("Register list must not be empty");
+    if (mask & ~0xFFu) return error_bad_register_list("STMIA/LDMIA register list may only contain R0-R7");
+
+    encoding = (uint16_t) ((is_load ? 0xC800u : 0xC000u) | (rn << 8) | (mask & 0xFFu));
+    return assemble_emit_word(context, ASSEMBLE_CPU_ARM32, encoding);
+}
+
+/* THUMB.17: SWI #imm8 / BKPT #imm8. param is the base encoding. */
+static _kernel_oserror *thumb_handle_swi_bkpt(assemble_context_t *context, uint32_t param,
+                                               const uint8_t *text, size_t length, size_t pos)
+{
+    int32_t imm;
+    uint16_t encoding;
+    _kernel_oserror *error;
+
+    error = expect_char(text, length, &pos, '#');
+    if (error != NULL) return error;
+    error = eval_numeric(context, text, length, &pos, &imm);
+    if (error != NULL) return error;
+    error = check_trailing(text, length, pos);
+    if (error != NULL) return error;
+    if (imm < 0 || imm > 0xFF) return error_bad_immediate();
+
+    encoding = (uint16_t) (param | ((uint32_t) imm & 0xFFu));
+    return assemble_emit_word(context, ASSEMBLE_CPU_ARM32, encoding);
+}
+
+/* THUMB.16/18: conditional and unconditional short branch. 'base' has
+   the opcode/condition bits already positioned; 'bits' is the width of
+   the signed halfword-count field (8 for Bcc, 11 for B), so the
+   addressable byte range is -2^bits to (2^bits)-2, PC read as
+   address+4 as Thumb architecturally defines it. Not called through
+   the mnemonic table -- see the dispatch in assemble_thumb_line. */
+static _kernel_oserror *thumb_encode_short_branch(assemble_context_t *context, uint32_t base, int bits,
+                                                    const uint8_t *text, size_t length, size_t pos)
+{
+    int32_t target, offset;
+    uint32_t field;
+    uint16_t encoding;
+    _kernel_oserror *error;
+
+    error = eval_numeric(context, text, length, &pos, &target);
+    if (error != NULL) return error;
+    error = check_trailing(text, length, pos);
+    if (error != NULL) return error;
+
+    offset = target - (int32_t) (context->address + 4);
+    if ((offset & 1) != 0) return error_branch_range();
+    if (offset < -(1 << bits) || offset > ((1 << bits) - 2)) return error_branch_range();
+
+    field = ((uint32_t) offset >> 1) & ((1u << bits) - 1u);
+    encoding = (uint16_t) (base | field);
+    return assemble_emit_word(context, ASSEMBLE_CPU_ARM32, encoding);
+}
+
+/* THUMB.19: BL label (stays in Thumb state) / BLX label (ARMv5+,
+   switches to ARM state -- so the target must already be word
+   aligned; unlike armips this does not silently round it). Both are
+   a 22-bit signed halfword-count branch offset split across two
+   halfwords (high 11 bits first, low 11 bits second, the second
+   halfword's top nibble distinguishing BL from BLX). is_blx: 0=BL,
+   1=BLX. Not called through the mnemonic table -- see the dispatch in
+   assemble_thumb_line. */
+static _kernel_oserror *thumb_handle_bl(assemble_context_t *context, uint32_t is_blx,
+                                         const uint8_t *text, size_t length, size_t pos)
+{
+    int32_t target, offset;
+    uint32_t off22;
+    uint16_t hi, lo;
+    _kernel_oserror *error;
+
+    error = eval_numeric(context, text, length, &pos, &target);
+    if (error != NULL) return error;
+    error = check_trailing(text, length, pos);
+    if (error != NULL) return error;
+
+    offset = target - (int32_t) (context->address + 4);
+    if (is_blx)
+    {
+        if ((offset & 3) != 0) return error_branch_range();
+    }
+    else if ((offset & 1) != 0)
+    {
+        return error_branch_range();
+    }
+    if (offset < -(1 << 22) || offset > ((1 << 22) - 2)) return error_branch_range();
+
+    off22 = ((uint32_t) offset >> 1) & 0x3FFFFFu;
+    hi = (uint16_t) (0xF000u | ((off22 >> 11) & 0x7FFu));
+    lo = (uint16_t) ((is_blx ? 0xE800u : 0xF800u) | (off22 & 0x7FFu));
+
+    error = assemble_emit_word(context, ASSEMBLE_CPU_ARM32, hi);
+    if (error != NULL) return error;
+    return assemble_emit_word(context, ASSEMBLE_CPU_ARM32, lo);
+}
+
+/* param packs is_load (bit0) and size class (bits3:1) for
+   thumb_handle_ldr_str -- see that function's comment. */
+#define THUMB_LS(load, class) (((uint32_t) (load)) | (((uint32_t) (class)) << 1))
+
+static const thumb_mnemonic_entry_t thumb_mnemonic_table[] = {
+    { "LSL", thumb_handle_shift, 0u }, { "ASL", thumb_handle_shift, 0u },
+    { "LSR", thumb_handle_shift, 1u }, { "ASR", thumb_handle_shift, 2u },
+
+    { "ADD", thumb_handle_addsub, 0u }, { "SUB", thumb_handle_addsub, 1u },
+    { "MOV", thumb_handle_mov, 0u }, { "CMP", thumb_handle_cmp, 0u },
+
+    { "AND", thumb_handle_alu4, 0x4000u }, { "EOR", thumb_handle_alu4, 0x4040u },
+    { "XOR", thumb_handle_alu4, 0x4040u }, { "ADC", thumb_handle_alu4, 0x4140u },
+    { "SBC", thumb_handle_alu4, 0x4180u }, { "ROR", thumb_handle_alu4, 0x41C0u },
+    { "TST", thumb_handle_alu4, 0x4200u }, { "NEG", thumb_handle_alu4, 0x4240u },
+    { "CMN", thumb_handle_alu4, 0x42C0u }, { "ORR", thumb_handle_alu4, 0x4300u },
+    { "MUL", thumb_handle_alu4, 0x4340u }, { "BIC", thumb_handle_alu4, 0x4380u },
+    { "MVN", thumb_handle_alu4, 0x43C0u },
+
+    { "NOP", thumb_handle_nop, 0u },
+
+    { "LDR",   thumb_handle_ldr_str, THUMB_LS(1, 0) }, { "STR",   thumb_handle_ldr_str, THUMB_LS(0, 0) },
+    { "LDRB",  thumb_handle_ldr_str, THUMB_LS(1, 1) }, { "STRB",  thumb_handle_ldr_str, THUMB_LS(0, 1) },
+    { "LDRH",  thumb_handle_ldr_str, THUMB_LS(1, 2) }, { "STRH",  thumb_handle_ldr_str, THUMB_LS(0, 2) },
+    { "LDRSB", thumb_handle_ldr_str, THUMB_LS(1, 3) }, { "LDSB",  thumb_handle_ldr_str, THUMB_LS(1, 3) },
+    { "LDRSH", thumb_handle_ldr_str, THUMB_LS(1, 4) }, { "LDSH",  thumb_handle_ldr_str, THUMB_LS(1, 4) },
+
+    { "PUSH", thumb_handle_push_pop, 0u }, { "POP", thumb_handle_push_pop, 1u },
+    { "STMIA", thumb_handle_ldm_stm, 0u }, { "LDMIA", thumb_handle_ldm_stm, 1u },
+
+    { "SWI", thumb_handle_swi_bkpt, 0xDF00u }
+};
+#define NUM_THUMB_MNEMONICS (sizeof(thumb_mnemonic_table) / sizeof(thumb_mnemonic_table[0]))
+
+/*******************************************************************
+ Function:      assemble_thumb_line
+ Description:   Entry point for ASSEMBLE_ARM32_OPT_THUMB, called from
+                assemble_arm32_line() once the mnemonic token has been
+                read (label handling, EQU and the shared pseudo-ops
+                are re-checked here since Thumb mode never falls
+                through to the ARM32 code that normally handles them).
+ Parameters:    pos/consumed = position and length of the already-read
+                               mnemonic token within 'line'
+                mnemonic = the upper-cased mnemonic token
+                have_label/label/label_length = as parsed by the caller
+ Returns:       NULL if successful, otherwise a static error block
+ ******************************************************************/
+static _kernel_oserror *assemble_thumb_line(assemble_context_t *context,
+                                             const uint8_t *line, size_t line_length,
+                                             size_t pos, size_t consumed, const char *mnemonic,
+                                             int have_label, const char *label, size_t label_length)
+{
+    size_t opstart = pos + consumed;
+    _kernel_oserror *error;
+    size_t i;
+
+    if (strcmp(mnemonic, "EQU") == 0)
+    {
+        assemble_value_t value;
+        size_t p2 = opstart;
+        size_t used;
+
+        if (!have_label)
+        {
+            return assemble_set_error(ASSEMBLE_CPU_ARM32, ASSEMBLE_ERROR_TYPE_BAD_LABEL,
+                                       ASSEMBLE_ARM32_ERR_NEED_LABEL_FOR_EQU,
+                                       "EQU used without a preceding label");
+        }
+        error = eval_expr(context, line + p2, line_length - p2, &value, &used);
+        if (error != NULL) return error;
+        p2 += used;
+        error = check_trailing(line, line_length, p2);
+        if (error != NULL) return error;
+        return assign_label(context, label, label_length, &value);
+    }
+
+    if (have_label)
+    {
+        assemble_value_t value;
+
+        value.type = ASSEMBLE_VALUE_INTEGER;
+        value.value.as_integer = (int32_t) context->address;
+        error = assign_label(context, label, label_length, &value);
+        if (error != NULL) return error;
+    }
+
+    if (strcmp(mnemonic, "OPT") == 0)
+    {
+        size_t p2 = opstart;
+
+        p2 += assemble_skip_spaces(line + p2, line_length - p2);
+        if (p2 < line_length)
+        {
+            assemble_value_t value;
+            size_t used;
+
+            error = eval_expr(context, line + p2, line_length - p2, &value, &used);
+            if (error != NULL) return error;
+            p2 += used;
+        }
+        return check_trailing(line, line_length, p2);
+    }
+    if (strcmp(mnemonic, "ALIGN") == 0)
+    {
+        return assemble_align(context, line + opstart, line_length - opstart);
+    }
+    if (strcmp(mnemonic, "DCB") == 0 || strcmp(mnemonic, "DCW") == 0 || strcmp(mnemonic, "DCD") == 0)
+    {
+        return assemble_dc(context, mnemonic, line + opstart, line_length - opstart);
+    }
+
+    /* B/BL/BX/BLX/Bcc/BKPT all share the 'B' prefix but need different
+       parsing (register vs label operand, condition-code suffix vs
+       none), so they are special-cased here rather than fitting the
+       flat name+handler table below. */
+    if (strcmp(mnemonic, "B") == 0)
+    {
+        return thumb_encode_short_branch(context, 0xE000u, 11, line, line_length, opstart);
+    }
+    if (strcmp(mnemonic, "BL") == 0)
+    {
+        return thumb_handle_bl(context, 0u, line, line_length, opstart);
+    }
+    if (strcmp(mnemonic, "BX") == 0)
+    {
+        return thumb_handle_bx(context, 0x4700u, line, line_length, opstart);
+    }
+    if (strcmp(mnemonic, "BLX") == 0)
+    {
+        if (thumb_peek_named_register(line, line_length, opstart))
+        {
+            return thumb_handle_bx(context, 0x4780u, line, line_length, opstart);
+        }
+        return thumb_handle_bl(context, 1u, line, line_length, opstart);
+    }
+    if (strcmp(mnemonic, "BKPT") == 0)
+    {
+        return thumb_handle_swi_bkpt(context, 0xBE00u, line, line_length, opstart);
+    }
+    if (strlen(mnemonic) == 3 && mnemonic[0] == 'B')
+    {
+        uint32_t cond;
+
+        if (match_condition((const uint8_t *) mnemonic + 1, 2, &cond) && cond < 0xEu)
+        {
+            return thumb_encode_short_branch(context, 0xD000u | (cond << 8), 8, line, line_length, opstart);
+        }
+    }
+
+    for (i = 0; i < NUM_THUMB_MNEMONICS; i++)
+    {
+        if (strcmp(mnemonic, thumb_mnemonic_table[i].name) == 0)
+        {
+            return thumb_mnemonic_table[i].fn(context, thumb_mnemonic_table[i].param, line, line_length, opstart);
+        }
+    }
+    return error_bad_mnemonic();
 }

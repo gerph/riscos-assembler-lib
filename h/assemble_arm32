@@ -30,9 +30,21 @@
    implemented so far). Using a gated mnemonic without the relevant
    bit set raises ASSEMBLE_ERROR_TYPE_UNSUPPORTED_ON_VARIANT rather
    than "mnemonic not recognised", so a caller can tell the two cases
-   apart. */
-#define ASSEMBLE_ARM32_OPT_FPA (1u << 4)  /* 0x10 */
-#define ASSEMBLE_ARM32_OPT_VFP (1u << 5)  /* 0x20 -- VFP scalar and NEON/Advanced SIMD */
+   apart.
+
+   ASSEMBLE_ARM32_OPT_THUMB is different in kind from the other two:
+   Thumb is a wholly separate 16-bit instruction encoding, not an
+   additional set of mnemonics layered on top of 32-bit ARM the way
+   FPA/VFP are, so it cannot be combined with them. When set, every
+   instruction on that assemble_arm32_line() call is assembled as
+   classic (16-bit, pre-Thumb-2) Thumb via its own mnemonic table, and
+   ASSEMBLE_ARM32_OPT_FPA/ASSEMBLE_ARM32_OPT_VFP are ignored -- a
+   caller wanting to mix ARM and Thumb functions in one source file
+   assembles each region with a different context->opt, the same way
+   BASIC's own inline assembler already switches OPT per region. */
+#define ASSEMBLE_ARM32_OPT_FPA   (1u << 4)  /* 0x10 */
+#define ASSEMBLE_ARM32_OPT_VFP   (1u << 5)  /* 0x20 -- VFP scalar and NEON/Advanced SIMD */
+#define ASSEMBLE_ARM32_OPT_THUMB (1u << 6)  /* 0x40 -- 16-bit Thumb, mutually exclusive with FPA/VFP */
 
 /* CPU-specific detail for errors raised by this backend; see
    ASSEMBLE_ERRNUM_VARIANT(). */
@@ -68,9 +80,12 @@ typedef enum assemble_arm32_error_variant
 
                 Base ARM32 mnemonics are always recognised; FPA
                 mnemonics are additionally recognised when
-                context->opt has ASSEMBLE_ARM32_OPT_FPA set. VFP/NEON
-                mnemonics are handled by a separate backend layered on
-                top (not yet implemented).
+                context->opt has ASSEMBLE_ARM32_OPT_FPA set, and VFP
+                scalar/NEON mnemonics when ASSEMBLE_ARM32_OPT_VFP is
+                set. If context->opt has ASSEMBLE_ARM32_OPT_THUMB set
+                instead, the line is assembled as classic 16-bit Thumb
+                via a wholly separate mnemonic table -- see the comment
+                above that #define.
  Parameters:    context = the assembly context; address, buffer,
                           buffer_length and opt must be filled in
                 line = tokenised BASIC source for the line, not

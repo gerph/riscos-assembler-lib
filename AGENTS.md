@@ -744,16 +744,118 @@ without adding a tenth.
   misc" shape's existing low-level helper) rather than a new one --
   only the *dispatch and double-dt-tag parsing* around them is new.
 
+### Classic 16-bit Thumb: `ASSEMBLE_ARM32_OPT_THUMB`
+
+Ported from `armips/Archs/ARM/ThumbOpcodes.cpp` and
+`CThumbInstruction.cpp` (the `@armips` reference clone alongside this
+project -- see "Source material handling" below), read as ground truth
+for each format's bit layout, field widths and immediate scaling/range
+rules, the same discipline used for VFPLib elsewhere in this file.
+Thumb is architecturally a *replacement* instruction encoding, not an
+*addition* the way FPA/VFP are (many mnemonics -- `MOV`, `ADD`, `LDR`
+-- exist in both dialects with completely different operand shapes and
+encodings), so it is gated by its own OPT bit that is checked first,
+before the base ARM32 dispatch, and hands off to a wholly separate
+mnemonic table (`thumb_mnemonic_table`) and set of encoder functions;
+setting `ASSEMBLE_ARM32_OPT_THUMB` makes `ASSEMBLE_ARM32_OPT_FPA`/
+`ASSEMBLE_ARM32_OPT_VFP` irrelevant for that call.
+
+- Every register operand still goes through the *same* `parse_register`
+  used by base ARM32 (R0-R15, PC=15, LR=14, SP=13, or a numeric
+  expression 0-15), so Thumb accepts identical register spellings.
+  What's new is that most Thumb formats have a 3-bit register field,
+  so `parse_thumb_lowreg` wraps `parse_register` with an explicit
+  R0-R7 range check. armips itself has no equivalent check (its fields
+  are set unconditionally from whatever the mask parser handed it,
+  trusting the syntax already constrained the value) -- silently
+  truncating an out-of-range register to 3 bits would encode a
+  different, wrong instruction, so this port errors instead.
+- Several mnemonics are genuinely polymorphic across multiple Thumb
+  "formats" sharing one root -- `ADD`/`SUB` span four formats (THUMB.2
+  register/immediate, THUMB.3 8-bit immediate, THUMB.12 PC/SP address
+  generation, THUMB.13 SP adjustment), `MOV`/`CMP` span three each
+  (low-immediate, low-register-as-low-ALU-op, hi-register), `LDR`/`STR`
+  span up to four addressing shapes. Unlike the flat family-table
+  dispatch base ARM32 uses (one fixed operand grammar per mnemonic
+  root), each of these gets its own dedicated parsing function that
+  decides the sub-shape from what it actually parses -- register vs
+  `#imm`, presence of a further comma, whether a register is `PC`/`SP`
+  -- rather than trying to force a single declarative shape onto all
+  of them.
+- `ADD Rd,PC/SP,#imm` (THUMB.12) and `ADD/SUB SP,SP,#imm` (THUMB.13's
+  three-operand spelling) look ambiguous when `Rd` is `SP` and the
+  base is also `SP` -- both nominally start "ADD SP,SP,...". They
+  aren't actually ambiguous: THUMB.12's destination field is only 3
+  bits wide, so it can never hold `SP` (register 13) at all. Checking
+  `rd==13 && rn==13` for the THUMB.13 form *before* the general
+  THUMB.12 check (which would otherwise reject a valid `rd==13` with
+  "bad register" rather than falling through) resolves this cleanly by
+  construction rather than by guesswork -- this was caught by
+  re-deriving the ordering from the field widths rather than trusting
+  a first draft.
+- `MOV Rd,Rs` with both registers low has no dedicated low-register
+  encoding in real Thumb at all -- like armips, it is synthesised as
+  `ADD Rd,Rs,#0` (THUMB.2's *immediate* sub-form specifically, base
+  encoding `0x1C00`, not the register sub-form `0x1800` a "two
+  registers" reading might suggest; the second operand occupies the
+  immediate form's `Rs` field with the 3-bit immediate left at zero).
+- `LDRSB`/`LDRSH` (`LDSB`/`LDSH`) only have a register-offset
+  addressing form (THUMB.8) -- there is no immediate-offset encoding
+  for sign-extending loads anywhere in the Thumb ISA, unlike every
+  other `LDR`/`STR` variant. Writing `LDRSB Rd,[Rn,#imm]` or the bare
+  `LDRSB Rd,[Rn]` form raises a specific "only support register-offset
+  addressing" error rather than a generic one, since this is a real
+  architectural gap a user might otherwise assume is just unimplemented.
+- `BLX` is two unrelated encodings sharing one mnemonic: `BLX Rm`
+  (THUMB.5, register, interworking call) and `BLX label` (THUMB.19,
+  the 32-bit two-halfword prefix pair, switches to ARM state). These
+  are told apart by peeking whether a *named* register (`Rn`/`PC`/
+  `LR`/`SP`) follows -- deliberately not reusing `parse_register`'s
+  full numeric-expression fallback for this peek, since accepting a
+  bare number as "a register" would make `BLX 4` ambiguous between
+  "register R4" and "branch to address 4"; real Thumb assembly always
+  spells the register form with a name.
+- `BLX label`'s target must already be word-aligned (switching to ARM
+  state requires it); unlike armips, which silently rounds an
+  odd halfword-count up to the nearest word by adding `Immediate&1`,
+  this port raises "Branch target ... out of range" instead of
+  guessing what the caller meant. Deliberately simpler and more
+  predictable than the reference at the cost of that one auto-rounding
+  convenience, which in practice only matters for hand-computed
+  non-symbolic BLX targets (any real function label is word-aligned
+  already).
+- `B`/`BL`/`BLX`/`Bcc` are dispatched by special-casing the mnemonic
+  text directly in `assemble_thumb_line` (matching how base ARM32
+  special-cases `LDR`/`STR`/`LDM`/`STM`/etc rather than using the flat
+  table) rather than through `thumb_mnemonic_table`, because `Bcc`'s
+  14 real conditions are recognised via the *same* `match_condition`/
+  `cond_table` base ARM32 uses for its own condition-code suffixes
+  (rejecting `AL`/`NV`, which Thumb's format16 has no encoding for --
+  unconditional branches use the separate `B` mnemonic instead), and
+  reusing it here means the alias spellings (`BHS`/`BCS`, `BLO`/`BCC`)
+  come for free rather than needing their own table rows.
+- Two deliberate, documented scope reductions, both chosen to stay
+  *consistent* with base ARM32 rather than being Thumb-specific gaps:
+  no `LDR Rd,=const` literal-pool pseudo-op (base ARM32's own `LDR`/
+  `STR` handling has never supported literal pools, so adding one only
+  for Thumb would be a new capability, not a like-for-like port), and
+  no `ADR` pseudo-mnemonic (THUMB.12's PC/SP-relative address
+  generation is written out explicitly as `ADD Rd,PC,#imm`/
+  `ADD Rd,SP,#imm`, which is what armips' own mask strings actually
+  spell it as regardless of the internal placeholder name used for it).
+
 ## Source material handling
 
 Reference material lives alongside the project but is **not part of the
 build and not tracked in git**: `6502/`, `6809/` (the tokenised `.ffb`
-patches and their `Guide,fff` docs) and `riscos64-rtrussell-bbcbasic/` (a
-full clone of the BBC BASIC source this port is based on). Don't add these
-to git, and don't treat anything under `/riscos-built/Sources` as canonical
-(per the global project instructions) — if you need to re-examine the
-6502/6809 patches, detokenise with `riscos-basicdetokenise -i <file>`
-first (see the `using-bbcbasic` skill).
+patches and their `Guide,fff` docs), `riscos64-rtrussell-bbcbasic/` (a
+full clone of the BBC BASIC source this port is based on), and `armips/`
+(a clone of the armips cross-assembler, whose `Archs/ARM/ThumbOpcodes.cpp`/
+`CThumbInstruction.cpp` were read as ground truth for the classic Thumb
+backend). Don't add these to git, and don't treat anything under
+`/riscos-built/Sources` as canonical (per the global project instructions)
+— if you need to re-examine the 6502/6809 patches, detokenise with
+`riscos-basicdetokenise -i <file>` first (see the `using-bbcbasic` skill).
 
 ## Coding conventions
 

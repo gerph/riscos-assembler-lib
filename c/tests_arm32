@@ -755,6 +755,106 @@ static const char *const lines_neon_vmaxnm_bad_f64[] = { "VMAXNM.F64 Q0,Q1,Q2", 
 static const char *const lines_vfp_vcvtb_neither_half[] = { "VCVTB.F32.F64 S0,D1", NULL };
 static const char *const lines_neon_vrintr_no_neon_form[] = { "VRINTR.F32.F32 Q0,Q1", NULL };
 
+static const char *const lines_thumb_lsl_imm[] = { "LSL R0,R1,#5", NULL };
+static const uint8_t     bytes_thumb_lsl_imm[] = { 0x48, 0x01 };
+
+static const char *const lines_thumb_lsr_reg[] = { "LSR R2,R3", NULL };
+static const uint8_t     bytes_thumb_lsr_reg[] = { 0xDA, 0x40 };
+
+static const char *const lines_thumb_add_reg3[] = { "ADD R0,R1,R2", NULL };
+static const uint8_t     bytes_thumb_add_reg3[] = { 0x88, 0x18 };
+
+static const char *const lines_thumb_sub_imm3[] = { "SUB R0,R1,#3", NULL };
+static const uint8_t     bytes_thumb_sub_imm3[] = { 0xC8, 0x1E };
+
+static const char *const lines_thumb_mov_imm[] = { "MOV R0,#&42", NULL };
+static const uint8_t     bytes_thumb_mov_imm[] = { 0x42, 0x20 };
+
+static const char *const lines_thumb_cmp_imm[] = { "CMP R3,#&10", NULL };
+static const uint8_t     bytes_thumb_cmp_imm[] = { 0x10, 0x2B };
+
+static const char *const lines_thumb_and_reg[] = { "AND R0,R1", NULL };
+static const uint8_t     bytes_thumb_and_reg[] = { 0x08, 0x40 };
+
+static const char *const lines_thumb_mov_hi[] = { "MOV R0,R8", NULL };
+static const uint8_t     bytes_thumb_mov_hi[] = { 0x40, 0x46 };
+
+static const char *const lines_thumb_bx_lr[] = { "BX LR", NULL };
+static const uint8_t     bytes_thumb_bx_lr[] = { 0x70, 0x47 };
+
+static const char *const lines_thumb_blx_reg[] = { "BLX R3", NULL };
+static const uint8_t     bytes_thumb_blx_reg[] = { 0x98, 0x47 };
+
+static const char *const lines_thumb_ldr_imm[] = { "LDR R0,[R1,#4]", NULL };
+static const uint8_t     bytes_thumb_ldr_imm[] = { 0x48, 0x68 };
+
+static const char *const lines_thumb_strb_imm[] = { "STRB R2,[R3,#5]", NULL };
+static const uint8_t     bytes_thumb_strb_imm[] = { 0x5A, 0x71 };
+
+static const char *const lines_thumb_ldrh_imm[] = { "LDRH R0,[R1,#6]", NULL };
+static const uint8_t     bytes_thumb_ldrh_imm[] = { 0xC8, 0x88 };
+
+static const char *const lines_thumb_ldr_reg[] = { "LDR R0,[R1,R2]", NULL };
+static const uint8_t     bytes_thumb_ldr_reg[] = { 0x88, 0x58 };
+
+static const char *const lines_thumb_ldrsb_reg[] = { "LDRSB R0,[R1,R2]", NULL };
+static const uint8_t     bytes_thumb_ldrsb_reg[] = { 0x88, 0x56 };
+
+static const char *const lines_thumb_ldr_pc[] = { "LDR R0,[PC,#8]", NULL };
+static const uint8_t     bytes_thumb_ldr_pc[] = { 0x02, 0x48 };
+
+static const char *const lines_thumb_ldr_sp[] = { "LDR R0,[SP,#8]", NULL };
+static const uint8_t     bytes_thumb_ldr_sp[] = { 0x02, 0x98 };
+
+static const char *const lines_thumb_add_sp_base[] = { "ADD R0,SP,#8", NULL };
+static const uint8_t     bytes_thumb_add_sp_base[] = { 0x02, 0xA8 };
+
+static const char *const lines_thumb_add_pc_base[] = { "ADD R0,PC,#8", NULL };
+static const uint8_t     bytes_thumb_add_pc_base[] = { 0x02, 0xA0 };
+
+static const char *const lines_thumb_add_sp_imm[] = { "ADD SP,#&20", NULL };
+static const uint8_t     bytes_thumb_add_sp_imm[] = { 0x08, 0xB0 };
+
+static const char *const lines_thumb_sub_sp_sp_imm[] = { "SUB SP,SP,#&10", NULL };
+static const uint8_t     bytes_thumb_sub_sp_sp_imm[] = { 0x84, 0xB0 };
+
+static const char *const lines_thumb_push[] = { "PUSH {R0,R1,LR}", NULL };
+static const uint8_t     bytes_thumb_push[] = { 0x03, 0xB5 };
+
+static const char *const lines_thumb_pop[] = { "POP {R2,PC}", NULL };
+static const uint8_t     bytes_thumb_pop[] = { 0x04, 0xBD };
+
+static const char *const lines_thumb_stmia[] = { "STMIA R0!,{R1,R2}", NULL };
+static const uint8_t     bytes_thumb_stmia[] = { 0x06, 0xC0 };
+
+static const char *const lines_thumb_ldmia[] = { "LDMIA R3!,{R0,R1}", NULL };
+static const uint8_t     bytes_thumb_ldmia[] = { 0x03, 0xCB };
+
+static const char *const lines_thumb_swi[] = { "SWI #&12", NULL };
+static const uint8_t     bytes_thumb_swi[] = { 0x12, 0xDF };
+
+static const char *const lines_thumb_bkpt[] = { "BKPT #&34", NULL };
+static const uint8_t     bytes_thumb_bkpt[] = { 0x34, 0xBE };
+
+static const char *const lines_thumb_beq[] = { "BEQ &8010", NULL };
+static const uint8_t     bytes_thumb_beq[] = { 0x06, 0xD0 };
+
+static const char *const lines_thumb_b[] = { "B &8010", NULL };
+static const uint8_t     bytes_thumb_b[] = { 0x06, 0xE0 };
+
+static const char *const lines_thumb_bl[] = { "BL &8010", NULL };
+static const uint8_t     bytes_thumb_bl[] = { 0x00, 0xF0, 0x06, 0xF8 };
+
+static const char *const lines_thumb_blx_label[] = { "BLX &8010", NULL };
+static const uint8_t     bytes_thumb_blx_label[] = { 0x00, 0xF0, 0x06, 0xE8 };
+
+static const char *const lines_thumb_lsl_out_of_range[] = { "LSL R0,R1,#32", NULL };
+static const char *const lines_thumb_push_bad_reg[] = { "PUSH {R8}", NULL };
+static const char *const lines_thumb_ldrsb_imm_unsupported[] = { "LDRSB R0,[R1,#4]", NULL };
+static const char *const lines_thumb_mov_hi_imm[] = { "MOV R8,#5", NULL };
+static const char *const lines_thumb_beq_out_of_range[] = { "BEQ &9000", NULL };
+static const char *const lines_thumb_lsl_without_opt[] = { "LSL R0,R1,#2", NULL };
+
 static const test_case_t tests[] = {
     { "MOV Rd,#imm",                   lines_mov_imm,          0, bytes_mov_imm,          sizeof(bytes_mov_imm),          0 },
     { "MOVS Rd,Rm",                    lines_mov_reg,          0, bytes_mov_reg,          sizeof(bytes_mov_reg),          0 },
@@ -927,7 +1027,45 @@ static const test_case_t tests[] = {
     { "VSEL operands must all be the same precision", lines_vfp_vsel_mismatch, 0, NULL, 0, 1, ASSEMBLE_ARM32_OPT_VFP },
     { "VMAXNM NEON form does not accept F64",  lines_neon_vmaxnm_bad_f64, 0, NULL, 0, 1, ASSEMBLE_ARM32_OPT_VFP },
     { "VCVTB requires one of the two dt tags to be F16", lines_vfp_vcvtb_neither_half, 0, NULL, 0, 1, ASSEMBLE_ARM32_OPT_VFP },
-    { "VRINTR has no NEON form",               lines_neon_vrintr_no_neon_form, 0, NULL, 0, 1, ASSEMBLE_ARM32_OPT_VFP }
+    { "VRINTR has no NEON form",               lines_neon_vrintr_no_neon_form, 0, NULL, 0, 1, ASSEMBLE_ARM32_OPT_VFP },
+
+    { "Thumb LSL Rd,Rs,#imm5",           lines_thumb_lsl_imm,        0, bytes_thumb_lsl_imm,        sizeof(bytes_thumb_lsl_imm),        0, ASSEMBLE_ARM32_OPT_THUMB },
+    { "Thumb LSR Rd,Rs (register-controlled)", lines_thumb_lsr_reg,  0, bytes_thumb_lsr_reg,        sizeof(bytes_thumb_lsr_reg),        0, ASSEMBLE_ARM32_OPT_THUMB },
+    { "Thumb ADD Rd,Rn,Rm",              lines_thumb_add_reg3,       0, bytes_thumb_add_reg3,       sizeof(bytes_thumb_add_reg3),       0, ASSEMBLE_ARM32_OPT_THUMB },
+    { "Thumb SUB Rd,Rn,#imm3",           lines_thumb_sub_imm3,       0, bytes_thumb_sub_imm3,       sizeof(bytes_thumb_sub_imm3),       0, ASSEMBLE_ARM32_OPT_THUMB },
+    { "Thumb MOV Rd,#imm8",              lines_thumb_mov_imm,        0, bytes_thumb_mov_imm,        sizeof(bytes_thumb_mov_imm),        0, ASSEMBLE_ARM32_OPT_THUMB },
+    { "Thumb CMP Rd,#imm8",              lines_thumb_cmp_imm,        0, bytes_thumb_cmp_imm,        sizeof(bytes_thumb_cmp_imm),        0, ASSEMBLE_ARM32_OPT_THUMB },
+    { "Thumb AND Rd,Rs",                 lines_thumb_and_reg,        0, bytes_thumb_and_reg,        sizeof(bytes_thumb_and_reg),        0, ASSEMBLE_ARM32_OPT_THUMB },
+    { "Thumb MOV Rd,Rs (hi register)",   lines_thumb_mov_hi,         0, bytes_thumb_mov_hi,         sizeof(bytes_thumb_mov_hi),         0, ASSEMBLE_ARM32_OPT_THUMB },
+    { "Thumb BX LR",                     lines_thumb_bx_lr,          0, bytes_thumb_bx_lr,          sizeof(bytes_thumb_bx_lr),          0, ASSEMBLE_ARM32_OPT_THUMB },
+    { "Thumb BLX Rm (register interworking call)", lines_thumb_blx_reg, 0, bytes_thumb_blx_reg,     sizeof(bytes_thumb_blx_reg),        0, ASSEMBLE_ARM32_OPT_THUMB },
+    { "Thumb LDR Rd,[Rn,#imm5*4]",       lines_thumb_ldr_imm,        0, bytes_thumb_ldr_imm,        sizeof(bytes_thumb_ldr_imm),        0, ASSEMBLE_ARM32_OPT_THUMB },
+    { "Thumb STRB Rd,[Rn,#imm5]",        lines_thumb_strb_imm,       0, bytes_thumb_strb_imm,       sizeof(bytes_thumb_strb_imm),       0, ASSEMBLE_ARM32_OPT_THUMB },
+    { "Thumb LDRH Rd,[Rn,#imm5*2]",      lines_thumb_ldrh_imm,       0, bytes_thumb_ldrh_imm,       sizeof(bytes_thumb_ldrh_imm),       0, ASSEMBLE_ARM32_OPT_THUMB },
+    { "Thumb LDR Rd,[Rn,Rm] (register offset)", lines_thumb_ldr_reg, 0, bytes_thumb_ldr_reg,        sizeof(bytes_thumb_ldr_reg),        0, ASSEMBLE_ARM32_OPT_THUMB },
+    { "Thumb LDRSB Rd,[Rn,Rm]",          lines_thumb_ldrsb_reg,      0, bytes_thumb_ldrsb_reg,      sizeof(bytes_thumb_ldrsb_reg),      0, ASSEMBLE_ARM32_OPT_THUMB },
+    { "Thumb LDR Rd,[PC,#imm8*4]",       lines_thumb_ldr_pc,         0, bytes_thumb_ldr_pc,         sizeof(bytes_thumb_ldr_pc),         0, ASSEMBLE_ARM32_OPT_THUMB },
+    { "Thumb LDR Rd,[SP,#imm8*4]",       lines_thumb_ldr_sp,         0, bytes_thumb_ldr_sp,         sizeof(bytes_thumb_ldr_sp),         0, ASSEMBLE_ARM32_OPT_THUMB },
+    { "Thumb ADD Rd,SP,#imm8*4 (address generation)", lines_thumb_add_sp_base, 0, bytes_thumb_add_sp_base, sizeof(bytes_thumb_add_sp_base), 0, ASSEMBLE_ARM32_OPT_THUMB },
+    { "Thumb ADD Rd,PC,#imm8*4 (address generation)", lines_thumb_add_pc_base, 0, bytes_thumb_add_pc_base, sizeof(bytes_thumb_add_pc_base), 0, ASSEMBLE_ARM32_OPT_THUMB },
+    { "Thumb ADD SP,#imm7*4",            lines_thumb_add_sp_imm,     0, bytes_thumb_add_sp_imm,     sizeof(bytes_thumb_add_sp_imm),     0, ASSEMBLE_ARM32_OPT_THUMB },
+    { "Thumb SUB SP,SP,#imm7*4",         lines_thumb_sub_sp_sp_imm,  0, bytes_thumb_sub_sp_sp_imm,  sizeof(bytes_thumb_sub_sp_sp_imm),  0, ASSEMBLE_ARM32_OPT_THUMB },
+    { "Thumb PUSH {list,LR}",            lines_thumb_push,           0, bytes_thumb_push,           sizeof(bytes_thumb_push),           0, ASSEMBLE_ARM32_OPT_THUMB },
+    { "Thumb POP {list,PC}",             lines_thumb_pop,            0, bytes_thumb_pop,            sizeof(bytes_thumb_pop),            0, ASSEMBLE_ARM32_OPT_THUMB },
+    { "Thumb STMIA Rn!,{list}",          lines_thumb_stmia,          0, bytes_thumb_stmia,          sizeof(bytes_thumb_stmia),          0, ASSEMBLE_ARM32_OPT_THUMB },
+    { "Thumb LDMIA Rn!,{list}",          lines_thumb_ldmia,          0, bytes_thumb_ldmia,          sizeof(bytes_thumb_ldmia),          0, ASSEMBLE_ARM32_OPT_THUMB },
+    { "Thumb SWI #imm8",                 lines_thumb_swi,            0, bytes_thumb_swi,            sizeof(bytes_thumb_swi),            0, ASSEMBLE_ARM32_OPT_THUMB },
+    { "Thumb BKPT #imm8",                lines_thumb_bkpt,           0, bytes_thumb_bkpt,           sizeof(bytes_thumb_bkpt),           0, ASSEMBLE_ARM32_OPT_THUMB },
+    { "Thumb BEQ label (conditional branch)", lines_thumb_beq,       0, bytes_thumb_beq,            sizeof(bytes_thumb_beq),            0, ASSEMBLE_ARM32_OPT_THUMB },
+    { "Thumb B label (unconditional branch)", lines_thumb_b,         0, bytes_thumb_b,              sizeof(bytes_thumb_b),              0, ASSEMBLE_ARM32_OPT_THUMB },
+    { "Thumb BL label (long branch with link)", lines_thumb_bl,      0, bytes_thumb_bl,             sizeof(bytes_thumb_bl),             0, ASSEMBLE_ARM32_OPT_THUMB },
+    { "Thumb BLX label (long branch, switches to ARM state)", lines_thumb_blx_label, 0, bytes_thumb_blx_label, sizeof(bytes_thumb_blx_label), 0, ASSEMBLE_ARM32_OPT_THUMB },
+    { "Thumb LSL shift amount out of range", lines_thumb_lsl_out_of_range, 0, NULL, 0, 1, ASSEMBLE_ARM32_OPT_THUMB },
+    { "Thumb PUSH register list may only contain R0-R7 and LR", lines_thumb_push_bad_reg, 0, NULL, 0, 1, ASSEMBLE_ARM32_OPT_THUMB },
+    { "Thumb LDRSB has no immediate-offset form", lines_thumb_ldrsb_imm_unsupported, 0, NULL, 0, 1, ASSEMBLE_ARM32_OPT_THUMB },
+    { "Thumb MOV Rd,#imm8 requires Rd to be R0-R7", lines_thumb_mov_hi_imm, 0, NULL, 0, 1, ASSEMBLE_ARM32_OPT_THUMB },
+    { "Thumb BEQ branch target out of range", lines_thumb_beq_out_of_range, 0, NULL, 0, 1, ASSEMBLE_ARM32_OPT_THUMB },
+    { "Thumb mnemonic rejected without ASSEMBLE_ARM32_OPT_THUMB", lines_thumb_lsl_without_opt, 0, NULL, 0, 1, 0 }
 };
 
 int run_tests_arm32(void)

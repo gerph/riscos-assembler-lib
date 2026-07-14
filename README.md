@@ -267,6 +267,40 @@ addressing-mode or precision suffix **after** the condition code —
 separate the condition from a `.F32`/`.F64` datatype suffix with a dot,
 following normal UAL syntax — `VADDEQ.F64`, not `VADD.F64EQ`.
 
+### Thumb dialect: `ASSEMBLE_ARM32_OPT_THUMB`
+
+Classic (pre-Thumb-2) 16-bit Thumb — the 19 instruction "formats" of
+ARMv4T through ARMv6, ported from armips' `Archs/ARM/ThumbOpcodes.cpp`
+— is implemented, gated by `ASSEMBLE_ARM32_OPT_THUMB`. Unlike FPA/VFP,
+which add mnemonics on top of 32-bit ARM, Thumb is a wholly separate
+16-bit encoding: setting this bit makes every instruction on that
+`assemble_arm32_line()` call assemble as Thumb through its own
+mnemonic table, and `ASSEMBLE_ARM32_OPT_FPA`/`ASSEMBLE_ARM32_OPT_VFP`
+are ignored. A caller wanting to mix ARM and Thumb functions in one
+source file assembles each region with a different `context->opt`.
+
+Covered: the shift family (`LSL`/`ASL`/`LSR`/`ASR`, both the
+shift-immediate and register-controlled-shift forms); `ADD`/`SUB`
+(register, 3-bit and 8-bit immediate, PC/SP-relative address
+generation, and SP adjustment forms); `MOV`/`CMP` (low-register
+immediate and register forms, plus the hi-register forms of both);
+the plain two-low-register ALU family (`AND`, `EOR`/`XOR`, `ADC`,
+`SBC`, `ROR`, `TST`, `NEG`, `CMN`, `ORR`, `MUL`, `BIC`, `MVN`); `NOP`;
+`BX`/`BLX` (register, interworking); `LDR`/`STR`/`LDRB`/`STRB`/`LDRH`/
+`STRH`/`LDRSB`(`LDSB`)/`LDRSH`(`LDSH`) across all their addressing
+forms (register offset, immediate offset, PC-relative and
+SP-relative — `LDRSB`/`LDRSH` register-offset only, matching real
+Thumb, which has no immediate-offset encoding for them); `PUSH`/`POP`;
+`STMIA`/`LDMIA`; `SWI`/`BKPT`; the conditional branches (`BEQ`
+through `BLE`); `B`; and `BL`/`BLX` (the two-halfword long
+branch-with-link form).
+
+Two deliberate scope reductions, both consistent with base ARM32
+rather than being Thumb-specific gaps: no `LDR Rd,=const` literal-pool
+pseudo-op (base ARM32 has never supported literal pools), and no
+`ADR` pseudo-mnemonic (the PC/SP-relative address-generation
+instruction is written out explicitly, eg `ADD Rd,PC,#imm`).
+
 ### FPA dialect: `ASSEMBLE_ARM32_OPT_FPA`
 
 FPA mnemonics (`ADF`, `MUF`, `SUF`, ..., `LDF`, `STF` — the legacy
