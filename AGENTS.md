@@ -968,6 +968,61 @@ from the start rather than after a wrong first pass.
   looked up via the same `find_opcode()` used for real mnemonics —
   avoids duplicating each real branch's opcode/funct3 a second time.
 
+## The Assembler module (`module/`)
+
+A separate RISC OS **module** component, `Assembler`, lives in its own
+`module/` subtree with its own `Makefile,fe1`, `VersionNum`, `cmhg/modhead`,
+PRM-in-XML docs (`module/prminxml/Assembler.xml`) and smoke test
+(`module/tests/test-assembler,fd1`) — it is versioned independently of the
+top-level `Assemble` library (currently 0.02 vs the library's 0.05) and gets
+its own `riscos-vmanage inc` when it changes. It wraps the Assemble library's
+line-at-a-time backends in a **stateful** SWI interface (`Assembler_Create`,
+`Destroy`, `BeginPass`, `AssembleLine`, `Value`, `Evaluate`, `Capabilities`,
+`LastError`) — a context owns a symbol table and pass/address state across
+many `Assembler_AssembleLine` calls, which the library's own `assemble_context_t`
+has no notion of (that's just one call's inputs/outputs).
+
+Build order matters: `module/Makefile,fe1` has `INCLUDES = C:Assemble.` and
+`LIBS = C:Assemble.o.libAssemble`, so the top-level `MakefileLib,fe1` must be
+built *and exported* (`riscos-amu -f MakefileLib export_hdr export_libs`)
+before the module will build against current headers/objects — building the
+module against a stale export after a library change fails or silently uses
+old behaviour, it doesn't re-export automatically. Build with
+`riscos-amu -f Makefile,fe1` from `module/`; run the smoke test with
+`riscos-amu -f Makefile,fe1 test` (its `.PHONY: test` target does the
+`riscos-build-run rm32/Assembler,ffa tests/test-assembler,fd1 --command
+"RMLoad Assembler" --command "Run test-assembler"` dance for you).
+
+`module/c/module` used to hand-maintain its own `cpu_assembler()`
+switch-per-backend and its own `Assembler_Capabilities` CPU/OPT bitmasks,
+duplicating the backend registry (`h/assemble_registry` — see "Backend
+registry" above) that now exists for exactly this purpose. It has been
+converted to use the registry instead:
+
+- `cpu_assembler()` is one call to `assemble_find_by_class()`. This relies on
+  the module's own public `assembler_cpu_t` enum (`module/h/assembler`) being
+  numbered **identically** to the library's `assemble_cpu_class_t` — the SWI's
+  CPU ID is cast straight across with no translation table. If you add a
+  backend to the registry and want the module to expose it, add the matching
+  value to `assembler_cpu_t` with the *same number*, not just any unused one.
+  This is exactly how RISC-V (`ASSEMBLE_CPU_RISCV = 6`) was wired up as
+  `ASSEMBLER_CPU_RISCV = 6` — a two-line change, not a new switch case.
+- `Assembler_Capabilities` (SWI `C0006`) builds its CPU bitmask (query 0) and
+  per-CPU OPT-bit mask (query 1) by walking `assemble_get_interfaces()` and
+  each entry's `opt_flags`, rather than hard-coding them. This isn't just
+  smaller code: the hard-coded version had actually drifted out of date
+  before this change (it reported ARM32's OPT mask as `&30`, FPA+VFP only,
+  missing the `&40` Thumb bit added when classic Thumb support was ported) —
+  the sort of thing that's easy to miss by hand and impossible to miss once
+  it's derived from the same table the backends themselves are dispatched
+  through. Converting a hard-coded mirror of shared state into a live query
+  against the real source of truth is worth doing on sight, not just when
+  asked, if you notice one drifting like this elsewhere.
+- The registry's `assemble_line_fn` function-pointer typedef replaced a
+  private, identically-shaped `assembler_fn` typedef the module used to
+  declare for itself — another small duplication the registry made
+  unnecessary.
+
 ## Source material handling
 
 Reference material lives alongside the project but is **not part of the
