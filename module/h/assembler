@@ -1,0 +1,50 @@
+/*******************************************************************
+ * File:        assembler
+ * Purpose:     Public interface definitions for the Assembler module.
+ * Author:      Charles Ferguson (Gerph)
+ ******************************************************************/
+
+#ifndef ASSEMBLER_H
+#define ASSEMBLER_H
+
+#include <stdint.h>
+
+#define ASSEMBLER_API_VERSION 1u
+#define ASSEMBLER_VALUE_MAGIC  0x41535631u /* ASV1 */
+
+typedef enum assembler_cpu
+{
+    ASSEMBLER_CPU_6502 = 1,
+    ASSEMBLER_CPU_6809 = 2,
+    ASSEMBLER_CPU_X86_64 = 3,
+    ASSEMBLER_CPU_Z80 = 4,
+    ASSEMBLER_CPU_ARM32 = 5
+} assembler_cpu_t;
+
+typedef enum assembler_pass
+{
+    ASSEMBLER_PASS_FIRST = 1,
+    ASSEMBLER_PASS_SECOND = 2
+} assembler_pass_t;
+
+typedef enum assembler_value_operation
+{
+    ASSEMBLER_VALUE_READ = 0,
+    ASSEMBLER_VALUE_WRITE = 1,
+    ASSEMBLER_VALUE_DELETE = 2
+} assembler_value_operation_t;
+
+typedef enum assembler_value_type
+{
+    ASSEMBLER_VALUE_INTEGER = 1
+} assembler_value_type_t;
+
+typedef struct assembler_value
+{
+    uint32_t magic;
+    uint32_t type;
+    int32_t integer;
+    uint32_t reserved;
+} assembler_module_value_t;
+
+#endif

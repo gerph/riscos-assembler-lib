@@ -1,0 +1,22 @@
+SchemaVersion: 1
+FormatVersion: 1.00
+Developer:
+  Name: Charles Ferguson
+  Company: null
+  DeveloperNumber: null
+  Address1: null
+  Address2: null
+  Address3: null
+  Address4: null
+  Phone: null
+  Fax: null
+  Email: gerph@gerph.org
+Registrations:
+  - Reservation:
+      Type: ModName
+      Text: Assembler
+  - SWIChunk:
+      Prefix: Assembler
+      Description: Context-based instruction assembly SWIs
+  - ErrorBlock:
+      Description: Error numbers for the Assembler module

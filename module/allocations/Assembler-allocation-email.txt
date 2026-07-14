@@ -1,0 +1,19 @@
+To: allocate@riscosopen.org
+From: Charles Ferguson <gerph@gerph.org>
+Subject: Module registration: Assembler
+
+I would like to register the following allocations for a new RISC OS module:
+
+Module name: Assembler
+SWI chunk (64 SWIs) and name prefix: Assembler
+Error block (256 errors): required
+
+Assembler provides a context-based interface for assembling one instruction
+source line at a time for several CPU instruction sets. It provides no
+*Commands, service calls, filetypes or system variables.
+
+The attached Assembler-allocation,fb0 request file contains the same
+registrations in Allocate format.
+
+--
+Charles Ferguson
