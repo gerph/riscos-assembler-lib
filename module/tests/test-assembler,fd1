@@ -26,4 +26,23 @@ IF bytes% <> 2 OR ?output% <> &A9 OR output%?1 <> 5 THEN ERROR 0, "6502 output i
 SYS "Assembler_BeginPass", handle%, 2, output%, 64, &8000 TO references%
 IF references% <> 0 THEN ERROR 0, "Unexpected forward reference"
 SYS "Assembler_Destroy", handle%
+
+REM Capabilities are now derived from the Assemble library's own backend
+REM registry, so this checks the CPU/OPT masks stay in step with it.
+SYS "Assembler_Capabilities", 0 TO api%, cpumask%, valmask%
+IF api% <> 1 THEN ERROR 0, "Unexpected API version"
+IF (cpumask% AND &40) = 0 THEN ERROR 0, "Capabilities did not report RISC-V support"
+
+SYS "Assembler_Capabilities", 1, 5 TO ,,optmask%
+IF optmask% <> &70 THEN ERROR 0, "ARM32 OPT mask should be &70 (FPA/VFP/Thumb)"
+
+REM RISC-V (CPU 6) is only reachable through the registry, so this exercises
+REM the module picking it up automatically.
+SYS "Assembler_Create", 6 TO riscv_handle%
+SYS "Assembler_BeginPass", riscv_handle%, 1, output%, 64, 0
+line$ = " NOP"
+SYS "Assembler_AssembleLine", riscv_handle%, line$, LEN(line$), 0 TO bytes%
+IF bytes% <> 4 OR ?output% <> &13 OR output%?1 <> 0 OR output%?2 <> 0 OR output%?3 <> 0 THEN ERROR 0, "RISC-V NOP output is wrong"
+SYS "Assembler_Destroy", riscv_handle%
+
 PRINT "Assembler module smoke test passed"

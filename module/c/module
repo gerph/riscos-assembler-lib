@@ -13,17 +13,11 @@
 #include "modhead.h"
 #include "assembler.h"
 #include "assemble_common.h"
-#include "assemble_6502.h"
-#include "assemble_6809.h"
-#include "assemble_x86_64.h"
-#include "assemble_z80.h"
-#include "assemble_arm32.h"
+#include "assemble_registry.h"
 
 #define ASSEMBLER_ERROR_TEXT_SIZE 252
 #define ASSEMBLER_OWNER_CALLER 1
 #define ASSEMBLER_OWNER_ASSEMBLER 2
-
-typedef _kernel_oserror *(*assembler_fn)(assemble_context_t *, const uint8_t *, size_t);
 
 typedef struct symbol
 {
@@ -37,7 +31,7 @@ typedef struct assembler_context
 {
     struct assembler_context *next;
     uint32_t handle;
-    assembler_fn assemble;
+    assemble_line_fn assemble;
     int pass;
     int line_started;
     uint8_t *buffer;
@@ -417,17 +411,13 @@ static assemble_result_t assign_variable(void *user_data, const char *name, size
     return ASSEMBLE_RESULT_ERROR;
 }
 
-static assembler_fn cpu_assembler(uint32_t cpu)
+/* assembler_cpu_t (h/assembler) is deliberately numbered the same as
+   assemble_cpu_class_t (Assemble's h/assemble_common), so the SWI's
+   CPU ID can be passed straight through to the registry. */
+static assemble_line_fn cpu_assembler(uint32_t cpu)
 {
-    switch (cpu)
-    {
-        case ASSEMBLER_CPU_6502: return assemble_6502_line;
-        case ASSEMBLER_CPU_6809: return assemble_6809_line;
-        case ASSEMBLER_CPU_X86_64: return assemble_x86_64_line;
-        case ASSEMBLER_CPU_Z80: return assemble_z80_line;
-        case ASSEMBLER_CPU_ARM32: return assemble_arm32_line;
-        default: return NULL;
-    }
+    const assemble_interface_t *iface = assemble_find_by_class((assemble_cpu_class_t) cpu);
+    return iface != NULL ? iface->assemble_line : NULL;
 }
 
 static _kernel_oserror *assemble_line(assembler_context_t *context, const uint8_t *line,
@@ -670,14 +660,26 @@ _kernel_oserror *SWI_Capabilities(int number, _kernel_swi_regs *r, void *pw)
     (void) number; (void) pw;
     if (r->r[0] == 0)
     {
+        size_t count, i;
+        const assemble_interface_t *interfaces = assemble_get_interfaces(&count);
+        uint32_t cpu_mask = 0;
+
+        for (i = 0; i < count; i++) cpu_mask |= (1u << interfaces[i].cpu_class);
         r->r[0] = ASSEMBLER_API_VERSION;
-        r->r[1] = (1 << ASSEMBLER_CPU_6502) | (1 << ASSEMBLER_CPU_6809) | (1 << ASSEMBLER_CPU_X86_64) | (1 << ASSEMBLER_CPU_Z80) | (1 << ASSEMBLER_CPU_ARM32);
+        r->r[1] = (int) cpu_mask;
         r->r[2] = 1 << ASSEMBLER_VALUE_INTEGER;
     }
-    else if (r->r[0] == 1 && cpu_assembler((uint32_t) r->r[1]) != NULL)
+    else if (r->r[0] == 1)
     {
+        const assemble_interface_t *iface = assemble_find_by_class((assemble_cpu_class_t) r->r[1]);
+        uint32_t opt_mask;
+        size_t j;
+
+        if (iface == NULL) return Err_BadParameter;
+        opt_mask = 0;
+        for (j = 0; j < iface->opt_flag_count; j++) opt_mask |= iface->opt_flags[j].bit;
         r->r[0] = r->r[1];
-        r->r[2] = r->r[1] == ASSEMBLER_CPU_6502 || r->r[1] == ASSEMBLER_CPU_ARM32 ? 0x30 : 0;
+        r->r[2] = (int) opt_mask;
     }
     else return Err_BadParameter;
     return NULL;
