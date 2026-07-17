@@ -2,3 +2,6 @@
 VersionNum gitlab-language=c linguist-language=c
 c/* gitlab-language=c linguist-language=c
 h/* gitlab-language=c linguist-language=c
+**/c/* gitlab-language=c linguist-language=c
+**/h/* gitlab-language=c linguist-language=c
+*,fd1 gitlab-language=bbcbasic linguist-language=basic

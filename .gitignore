@@ -12,3 +12,12 @@ oz32/*
 oz32d/*
 oz64/*
 ozd/*
+**/aof/*
+**/aof32/*
+**/oz/*
+**/oz32/*
+**/oz64/*
+**/rm/*
+**/rm32/*
+**/rm64/*
+module/h/modhead

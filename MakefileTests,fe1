@@ -5,7 +5,7 @@
 #
 # Program specific options:
 #
-COMPONENT  = Assemble
+COMPONENT  = AssembleTests
 
 # Specifies additional targets for startup
 #INITTARGET = inittarget

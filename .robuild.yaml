@@ -26,16 +26,50 @@ jobs:
     # The build will terminate if any command returns a non-0 return code or an error.
     script:
 
-      # Build component
+      # Build library
       - echo
-      - echo *** Build the component ***
-      - amu -f Makefile install INSTDIR=Install
+      - echo *** Build the libary ***
+      - amu -f MakefileLib export
 
-      # Test the command
+      # Build tests
       - echo
-      - echo *** Run command ***
-      - aif32.Assemble
+      - echo *** Build the tests ***
+      - amu -f MakefileTests
 
+      # Run the tests
+      - echo
+      - echo *** Run tests ***
+      - aif32.AssembleTests
+
+      # Build CLI tool
+      - echo
+      - echo *** Build the CLI tool ***
+      - amu -f Makefile
+
+      # Build the module
+      - echo
+      - echo *** Build the module ***
+      - dir Module
+      - amu -f Makefile
+
+      # Run the tests for the module
+      - echo
+      - echo *** Check the module ***
+      - RMLoad rm32.Assembler
+      - Tests.test-assembler
+
+      - Dir ^
+
+      # Copy things for return
+      - echo
+      - echo *** Copying results ***
+      - cdir Install
+      - cdir Install.PRMinXML
+      - Copy aif32 Install.aif32 ~CFVR
+      - Copy module.rm32 Install.rm32 ~CFVR
+      - Copy module.prminxml.Assembler/xml Install.prminxml.Assembler/xml ~CFVR
+      - cdir Install.Lib
+      - copy <Exports$Dir>.Lib.Assemble Install.Lib.Assemble ~CVRF
 
       # Done!
       - echo
