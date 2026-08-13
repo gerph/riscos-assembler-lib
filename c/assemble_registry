@@ -14,6 +14,7 @@
 #include "assemble_z80.h"
 #include "assemble_arm32.h"
 #include "assemble_riscv.h"
+#include "assemble_m68k.h"
 
 #define OPT_FLAG_COUNT(array) (sizeof(array) / sizeof((array)[0]))
 
@@ -26,6 +27,11 @@ static const assemble_opt_flag_t opt_flags_arm32[] = {
     { ASSEMBLE_ARM32_OPT_FPA,   "fpa",   "Enable legacy FPA floating-point coprocessor instructions" },
     { ASSEMBLE_ARM32_OPT_VFP,   "vfp",   "Enable classic VFP scalar and NEON/Advanced SIMD instructions" },
     { ASSEMBLE_ARM32_OPT_THUMB, "thumb", "Assemble as classic 16-bit Thumb instead of 32-bit ARM" }
+};
+
+static const assemble_opt_flag_t opt_flags_m68k[] = {
+    { ASSEMBLE_M68K_OPT_NATIVE_DIRECTIVES, "native-directives",
+      "Use DC.B/DC.W/DC.L/DS.B/DS.W/DS.L instead of DCB/DCW/DCD" }
 };
 
 /* max_instruction_length is the worst case for a genuine fixed-shape
@@ -42,7 +48,16 @@ static const assemble_opt_flag_t opt_flags_arm32[] = {
                  two-halfword pair (also 4 bytes, from one call)
      riscv  8 -- the LI/CALL pseudo-instructions, which always expand
                  to a fixed two-instruction LUI+ADDI/AUIPC+JALR pair
-                 regardless of the value */
+                 regardless of the value
+     m68k   10 -- an immediate-family instruction (ANDI/ORI/EORI/ADDI/
+                 SUBI/CMPI, or MOVE.L #imm,<ea>) combining a .L
+                 immediate (2-word extension) with an absolute-long
+                 (xxxxxxxx).L destination (2-word extension): opword(2)
+                 + immediate.L(4) + destination ea(4) = 10. No base
+                 MC68000 instruction has a third independent
+                 extension-word group (MOVEM's second word is a fixed
+                 register mask, not another EA; MOVEP/Bcc/DBcc have at
+                 most one displacement word) */
 static const assemble_interface_t interfaces[] = {
     {
         ASSEMBLE_CPU_6502, "6502",
@@ -79,6 +94,12 @@ static const assemble_interface_t interfaces[] = {
         "RV32I base integer ISA + Zicsr",
         assemble_riscv_line, 8,
         NULL, 0
+    },
+    {
+        ASSEMBLE_CPU_M68K, "m68k",
+        "Motorola MC68000 (base instruction set only)",
+        assemble_m68k_line, 10,
+        opt_flags_m68k, OPT_FLAG_COUNT(opt_flags_m68k)
     }
 };
 

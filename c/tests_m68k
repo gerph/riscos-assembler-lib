@@ -1,0 +1,481 @@
+/*******************************************************************
+ * File:        tests_m68k
+ * Purpose:     Self-tests for the assemble_m68k library. Provides a
+ *              minimal stand-in for BASIC's expression evaluator and
+ *              variable table so lines can be assembled and checked
+ *              against expected byte sequences.
+ * Author:      Charles Ferguson (Gerph)
+ ******************************************************************/
+
+#include <stdio.h>
+#include <string.h>
+#include <ctype.h>
+
+#include "tests.h"
+#include "assemble_m68k.h"
+
+#define MAX_SYMBOLS 32
+#define MAX_OUTPUT  64
+
+typedef struct symbol
+{
+    char             name[32];
+    assemble_value_t value;
+} symbol_t;
+
+typedef struct test_state
+{
+    symbol_t symbols[MAX_SYMBOLS];
+    size_t   symbol_count;
+} test_state_t;
+
+static _kernel_oserror test_error_block;
+
+static _kernel_oserror *test_error(const char *message)
+{
+    test_error_block.errnum = 0;
+    strncpy(test_error_block.errmess, message, sizeof(test_error_block.errmess) - 1);
+    test_error_block.errmess[sizeof(test_error_block.errmess) - 1] = '\0';
+    return &test_error_block;
+}
+
+static int hex_digit_value(uint8_t ch)
+{
+    if (ch >= '0' && ch <= '9')
+    {
+        return ch - '0';
+    }
+    return toupper((int) ch) - 'A' + 10;
+}
+
+/* As well as '&' (BASIC's own hex prefix, matching the other backends'
+   test harnesses), this understands '$' -- the 68000's native hex
+   prefix -- purely as a convenience for writing readable m68k test
+   source; the production assemble_m68k_line() never parses numeric
+   literals itself, it always delegates to context->resolve_expr, same
+   as every other backend. */
+static assemble_result_t test_parse_primary(test_state_t *state, const uint8_t *text, size_t length,
+                                             size_t *pos_inout, int32_t *out_value, _kernel_oserror **error)
+{
+    size_t pos = *pos_inout;
+
+    while (pos < length && text[pos] == ' ')
+    {
+        pos += 1;
+    }
+
+    if (pos < length && (text[pos] == '&' || text[pos] == '$'))
+    {
+        int32_t v = 0;
+
+        pos += 1;
+        while (pos < length && isxdigit((int) text[pos]))
+        {
+            v = v * 16 + hex_digit_value(text[pos]);
+            pos += 1;
+        }
+        *out_value = v;
+        *pos_inout = pos;
+        return ASSEMBLE_RESULT_OK;
+    }
+
+    if (pos < length && text[pos] >= '0' && text[pos] <= '9')
+    {
+        int32_t v = 0;
+
+        while (pos < length && text[pos] >= '0' && text[pos] <= '9')
+        {
+            v = v * 10 + (text[pos] - '0');
+            pos += 1;
+        }
+        *out_value = v;
+        *pos_inout = pos;
+        return ASSEMBLE_RESULT_OK;
+    }
+
+    if (pos < length && (isalpha((int) text[pos]) || text[pos] == '_' || text[pos] == '`'))
+    {
+        size_t start = pos;
+        size_t namelen;
+        char name[32];
+        size_t i;
+
+        while (pos < length &&
+               (isalnum((int) text[pos]) || text[pos] == '_' || text[pos] == '`' || text[pos] == '%'))
+        {
+            pos += 1;
+        }
+        namelen = pos - start;
+        if (namelen >= sizeof(name))
+        {
+            namelen = sizeof(name) - 1;
+        }
+        memcpy(name, text + start, namelen);
+        name[namelen] = '\0';
+
+        for (i = 0; i < state->symbol_count; i++)
+        {
+            if (strcmp(state->symbols[i].name, name) == 0)
+            {
+                *out_value = state->symbols[i].value.value.as_integer;
+                *pos_inout = pos;
+                return ASSEMBLE_RESULT_OK;
+            }
+        }
+        *error = test_error("Undefined test symbol");
+        return ASSEMBLE_RESULT_ERROR;
+    }
+
+    *error = test_error("Expected a value");
+    return ASSEMBLE_RESULT_ERROR;
+}
+
+static assemble_result_t test_resolve_expr(void *user_data, const uint8_t *text, size_t length,
+                                            assemble_value_t *value, size_t *consumed, _kernel_oserror **error)
+{
+    test_state_t *state = (test_state_t *) user_data;
+    size_t pos = 0;
+    int32_t result;
+    int negate = 0;
+
+    while (pos < length && text[pos] == ' ')
+    {
+        pos += 1;
+    }
+    if (pos < length && text[pos] == '-')
+    {
+        negate = 1;
+        pos += 1;
+    }
+
+    if (test_parse_primary(state, text, length, &pos, &result, error) != ASSEMBLE_RESULT_OK)
+    {
+        return ASSEMBLE_RESULT_ERROR;
+    }
+    if (negate)
+    {
+        result = -result;
+    }
+
+    for (;;)
+    {
+        size_t save = pos;
+        int op;
+        int32_t rhs;
+
+        while (pos < length && text[pos] == ' ')
+        {
+            pos += 1;
+        }
+        if (!(pos < length && (text[pos] == '+' || text[pos] == '-')))
+        {
+            pos = save;
+            break;
+        }
+        op = text[pos];
+        pos += 1;
+        while (pos < length && text[pos] == ' ')
+        {
+            pos += 1;
+        }
+        if (test_parse_primary(state, text, length, &pos, &rhs, error) != ASSEMBLE_RESULT_OK)
+        {
+            return ASSEMBLE_RESULT_ERROR;
+        }
+        result = (op == '+') ? (result + rhs) : (result - rhs);
+    }
+
+    value->type = ASSEMBLE_VALUE_INTEGER;
+    value->value.as_integer = result;
+    *consumed = pos;
+    return ASSEMBLE_RESULT_OK;
+}
+
+static assemble_result_t test_assign_var(void *user_data, const char *name, size_t name_length,
+                                          const assemble_value_t *value, _kernel_oserror **error)
+{
+    test_state_t *state = (test_state_t *) user_data;
+    char namebuf[32];
+    size_t len = name_length;
+    size_t i;
+
+    if (len >= sizeof(namebuf))
+    {
+        len = sizeof(namebuf) - 1;
+    }
+    memcpy(namebuf, name, len);
+    namebuf[len] = '\0';
+
+    for (i = 0; i < state->symbol_count; i++)
+    {
+        if (strcmp(state->symbols[i].name, namebuf) == 0)
+        {
+            state->symbols[i].value = *value;
+            return ASSEMBLE_RESULT_OK;
+        }
+    }
+    if (state->symbol_count >= MAX_SYMBOLS)
+    {
+        *error = test_error("Test symbol table is full");
+        return ASSEMBLE_RESULT_ERROR;
+    }
+    strcpy(state->symbols[state->symbol_count].name, namebuf);
+    state->symbols[state->symbol_count].value = *value;
+    state->symbol_count += 1;
+    return ASSEMBLE_RESULT_OK;
+}
+
+typedef struct test_case
+{
+    const char        *description;
+    const char *const *lines;      /* NULL-terminated */
+    const uint8_t      *expected;  /* concatenated bytes across all lines */
+    size_t              expected_length;
+    int                 expect_error;
+} test_case_t;
+
+static int run_case(const test_case_t *test)
+{
+    test_state_t state;
+    assemble_context_t context;
+    uint8_t output[MAX_OUTPUT];
+    uint32_t offset = 0;
+    size_t i;
+    _kernel_oserror *error = NULL;
+    int saw_error = 0;
+
+    state.symbol_count = 0;
+
+    context.buffer = output;
+    context.buffer_length = (int32_t) sizeof(output);
+    context.address = 0x8000;
+    context.opt = 0;
+    context.resolve_expr = test_resolve_expr;
+    context.assign_var = test_assign_var;
+    context.user_data = &state;
+    context.bytes_used = 0;
+
+    for (i = 0; test->lines[i] != NULL; i++)
+    {
+        const uint8_t *line = (const uint8_t *) test->lines[i];
+        size_t line_length = strlen(test->lines[i]);
+
+        error = assemble_m68k_line(&context, line, line_length);
+        if (error != NULL)
+        {
+            saw_error = 1;
+            break;
+        }
+
+        if (offset + context.bytes_used > sizeof(output))
+        {
+            printf("FAIL: %s (test output buffer too small)\n", test->description);
+            return 0;
+        }
+        offset += context.bytes_used;
+        context.address += context.bytes_used;
+        context.buffer = output + offset;
+        context.buffer_length = (int32_t) (sizeof(output) - offset);
+    }
+
+    if (test->expect_error)
+    {
+        if (!saw_error)
+        {
+            printf("FAIL: %s (expected an error, none was raised)\n", test->description);
+            return 0;
+        }
+        return 1;
+    }
+
+    if (saw_error)
+    {
+        printf("FAIL: %s (unexpected error: %s)\n", test->description, error->errmess);
+        return 0;
+    }
+
+    if (offset != test->expected_length || memcmp(output, test->expected, offset) != 0)
+    {
+        size_t j;
+
+        printf("FAIL: %s (byte mismatch, got:", test->description);
+        for (j = 0; j < offset; j++)
+        {
+            printf(" %02X", output[j]);
+        }
+        printf(" expected:");
+        for (j = 0; j < test->expected_length; j++)
+        {
+            printf(" %02X", test->expected[j]);
+        }
+        printf(")\n");
+        return 0;
+    }
+
+    return 1;
+}
+
+/* ---- Test case data ----------------------------------------------
+   Independently verifiable canonical cases (NOP/RTS/MOVEQ) and the
+   MOVE.W addressing-mode tour below are cross-checked against
+   m68k/tests/asm_test.go's TestBasicEncodings and
+   TestAddressingModes_Encodings (an untracked third-party reference
+   implementation kept alongside this project -- see AGENTS.md's
+   "Source material handling"), with two adaptations: PC-relative
+   cases use a backward label reference rather than a forward one
+   (this library's line-at-a-time interface has no forward-reference
+   support of its own -- that's the caller's job -- and this test
+   harness's expression evaluator, like every other backend's, only
+   ever sees already-defined symbols), and hex literals are written
+   with BASIC's own '&' prefix to match every other backend's test
+   convention ('$' is also accepted here, see test_parse_primary). */
+
+static const char *const lines_nop[] = { "NOP", NULL };
+static const uint8_t     bytes_nop[] = { 0x4E, 0x71 };
+
+static const char *const lines_rts[] = { "RTS", NULL };
+static const uint8_t     bytes_rts[] = { 0x4E, 0x75 };
+
+static const char *const lines_moveq[] = { "MOVEQ #1,D7", NULL };
+static const uint8_t     bytes_moveq[] = { 0x7E, 0x01 };
+
+static const char *const lines_moveq_neg[] = { "MOVEQ #-1,D0", NULL };
+static const uint8_t     bytes_moveq_neg[] = { 0x70, 0xFF };
+
+/* MOVE.W <ea>,Dn addressing-mode tour, one per mode -- see
+   m68k/tests/asm_test.go's TestAddressingModes_Encodings. */
+
+static const char *const lines_ea_an_ind[]     = { "MOVE.W (A0),D0", NULL };
+static const uint8_t     bytes_ea_an_ind[]     = { 0x30, 0x10 };
+
+static const char *const lines_ea_postinc[]    = { "MOVE.W (A0)+,D1", NULL };
+static const uint8_t     bytes_ea_postinc[]    = { 0x32, 0x18 };
+
+static const char *const lines_ea_predec[]     = { "MOVE.W -(A0),D2", NULL };
+static const uint8_t     bytes_ea_predec[]     = { 0x34, 0x20 };
+
+static const char *const lines_ea_disp[]       = { "MOVE.W 4(A0),D3", NULL };
+static const uint8_t     bytes_ea_disp[]       = { 0x36, 0x28, 0x00, 0x04 };
+
+static const char *const lines_ea_index_w[]    = { "MOVE.W 8(A0,D1.W),D4", NULL };
+static const uint8_t     bytes_ea_index_w[]    = { 0x38, 0x30, 0x10, 0x08 };
+
+static const char *const lines_ea_index_l[]    = { "MOVE.B 2(A2,A3.L),D0", NULL };
+static const uint8_t     bytes_ea_index_l[]    = { 0x10, 0x32, 0xB8, 0x02 };
+
+static const char *const lines_ea_immediate[]  = { "MOVE.W #&ABCD,D6", NULL };
+static const uint8_t     bytes_ea_immediate[]  = { 0x3C, 0x3C, 0xAB, 0xCD };
+
+static const char *const lines_ea_abs_short[]  = { "MOVE.W (&1234).W,D7", NULL };
+static const uint8_t     bytes_ea_abs_short[]  = { 0x3E, 0x38, 0x12, 0x34 };
+
+static const char *const lines_ea_abs_long[]   = { "MOVE.L (&123456).L,D0", NULL };
+static const uint8_t     bytes_ea_abs_long[]   = { 0x20, 0x39, 0x00, 0x12, 0x34, 0x56 };
+
+/* PC-relative displacement: label defined 2 bytes before the MOVE
+   instruction, so the displacement is negative -- see the note above
+   on backward-vs-forward references. */
+static const char *const lines_ea_pc_disp[]    = { ".table", "DCW &1234", "MOVE.W table(PC),D5", NULL };
+static const uint8_t     bytes_ea_pc_disp[]    = { 0x12, 0x34, 0x3A, 0x3A, 0xFF, 0xFC };
+
+/* PC-relative indexed: same idea, with an index register too. */
+static const char *const lines_ea_pc_index[]   = { ".table2", "DCW &1234", "MOVE.W table2(PC,D0.W),D1", NULL };
+static const uint8_t     bytes_ea_pc_index[]   = { 0x12, 0x34, 0x32, 0x3B, 0x00, 0xFC };
+
+/* Parenthesised (d,PC) spelling of the same addressing mode. */
+static const char *const lines_ea_pc_disp_paren[] = { ".table3", "DCW &1234", "MOVE.W (table3,PC),D2", NULL };
+static const uint8_t     bytes_ea_pc_disp_paren[] = { 0x12, 0x34, 0x34, 0x3A, 0xFF, 0xFC };
+
+static const char *const lines_movea[] = { "MOVEA.L A1,A0", NULL };
+static const uint8_t     bytes_movea[] = { 0x20, 0x49 };
+
+static const char *const lines_label[] = { ".here", "MOVE.L here,D0", NULL };
+static const uint8_t     bytes_label[] = { 0x20, 0x39, 0x00, 0x00, 0x80, 0x00 };
+
+static const char *const lines_equ[] = { ".const EQU &2A", "MOVEQ #const,D0", NULL };
+static const uint8_t     bytes_equ[] = { 0x70, 0x2A };
+
+static const char *const lines_dcb[] = { "DCB 1,2,3", NULL };
+static const uint8_t     bytes_dcb[] = { 0x01, 0x02, 0x03 };
+
+static const char *const lines_dcw[] = { "DCW &1234,&5678", NULL };
+static const uint8_t     bytes_dcw[] = { 0x12, 0x34, 0x56, 0x78 };
+
+static const char *const lines_dcd[] = { "DCD &12345678", NULL };
+static const uint8_t     bytes_dcd[] = { 0x12, 0x34, 0x56, 0x78 };
+
+static const char *const lines_opt[] = { "OPT 3", "NOP", NULL };
+static const uint8_t     bytes_opt[] = { 0x4E, 0x71 };
+
+/* ---- Error cases --------------------------------------------------- */
+
+static const char *const lines_err_bad_mnemonic[]  = { "FOOBAR", NULL };
+static const char *const lines_err_move_no_size[]  = { "MOVE D0,D1", NULL };
+static const char *const lines_err_move_bad_size[] = { "MOVE.X D0,D1", NULL };
+static const char *const lines_err_movea_byte[]    = { "MOVEA.B D0,A0", NULL };
+static const char *const lines_err_moveq_range[]   = { "MOVEQ #200,D0", NULL };
+static const char *const lines_err_moveq_dst[]     = { "MOVEQ #1,A0", NULL };
+static const char *const lines_err_move_dst_imm[]  = { "MOVE.L D0,#5", NULL };
+static const char *const lines_err_move_missing[]  = { "MOVE.W D0", NULL };
+static const char *const lines_err_equ_no_label[]  = { "EQU &10", NULL };
+static const char *const lines_err_bad_ea[]        = { "MOVE.W (D0),D1", NULL };
+
+static const test_case_t tests[] = {
+    { "NOP",                                lines_nop,               bytes_nop,               sizeof(bytes_nop),               0 },
+    { "RTS",                                lines_rts,               bytes_rts,               sizeof(bytes_rts),               0 },
+    { "MOVEQ #1,D7",                        lines_moveq,             bytes_moveq,             sizeof(bytes_moveq),             0 },
+    { "MOVEQ #-1,D0",                       lines_moveq_neg,         bytes_moveq_neg,         sizeof(bytes_moveq_neg),         0 },
+    { "EA: address register indirect",      lines_ea_an_ind,         bytes_ea_an_ind,         sizeof(bytes_ea_an_ind),         0 },
+    { "EA: postincrement",                  lines_ea_postinc,        bytes_ea_postinc,        sizeof(bytes_ea_postinc),        0 },
+    { "EA: predecrement",                   lines_ea_predec,         bytes_ea_predec,         sizeof(bytes_ea_predec),         0 },
+    { "EA: 16-bit displacement",            lines_ea_disp,           bytes_ea_disp,           sizeof(bytes_ea_disp),           0 },
+    { "EA: indexed, .W index",              lines_ea_index_w,        bytes_ea_index_w,        sizeof(bytes_ea_index_w),        0 },
+    { "EA: indexed, .L index",              lines_ea_index_l,        bytes_ea_index_l,        sizeof(bytes_ea_index_l),        0 },
+    { "EA: immediate",                      lines_ea_immediate,      bytes_ea_immediate,      sizeof(bytes_ea_immediate),      0 },
+    { "EA: absolute short",                 lines_ea_abs_short,      bytes_ea_abs_short,      sizeof(bytes_ea_abs_short),      0 },
+    { "EA: absolute long",                  lines_ea_abs_long,       bytes_ea_abs_long,       sizeof(bytes_ea_abs_long),       0 },
+    { "EA: PC-relative displacement",       lines_ea_pc_disp,        bytes_ea_pc_disp,        sizeof(bytes_ea_pc_disp),        0 },
+    { "EA: PC-relative indexed",            lines_ea_pc_index,       bytes_ea_pc_index,       sizeof(bytes_ea_pc_index),       0 },
+    { "EA: PC-relative, (d,PC) spelling",   lines_ea_pc_disp_paren,  bytes_ea_pc_disp_paren,  sizeof(bytes_ea_pc_disp_paren),  0 },
+    { "MOVEA.L A1,A0",                      lines_movea,             bytes_movea,             sizeof(bytes_movea),             0 },
+    { "label address reference",            lines_label,             bytes_label,             sizeof(bytes_label),             0 },
+    { "EQU pseudo-op",                      lines_equ,               bytes_equ,               sizeof(bytes_equ),               0 },
+    { "DCB pseudo-op",                      lines_dcb,               bytes_dcb,               sizeof(bytes_dcb),               0 },
+    { "DCW pseudo-op (big-endian)",         lines_dcw,               bytes_dcw,               sizeof(bytes_dcw),               0 },
+    { "DCD pseudo-op (big-endian)",         lines_dcd,               bytes_dcd,               sizeof(bytes_dcd),               0 },
+    { "OPT pseudo-op is a no-op",           lines_opt,               bytes_opt,               sizeof(bytes_opt),               0 },
+
+    { "error: bad mnemonic",                lines_err_bad_mnemonic,  NULL, 0, 1 },
+    { "error: MOVE requires a size suffix", lines_err_move_no_size,  NULL, 0, 1 },
+    { "error: MOVE bad size suffix",        lines_err_move_bad_size, NULL, 0, 1 },
+    { "error: MOVEA does not support .B",   lines_err_movea_byte,    NULL, 0, 1 },
+    { "error: MOVEQ immediate out of range",lines_err_moveq_range,   NULL, 0, 1 },
+    { "error: MOVEQ destination must be Dn",lines_err_moveq_dst,     NULL, 0, 1 },
+    { "error: MOVE destination immediate",  lines_err_move_dst_imm,  NULL, 0, 1 },
+    { "error: MOVE missing destination",    lines_err_move_missing,  NULL, 0, 1 },
+    { "error: EQU without a label",         lines_err_equ_no_label,  NULL, 0, 1 },
+    { "error: bad addressing mode syntax",  lines_err_bad_ea,        NULL, 0, 1 }
+};
+
+int run_tests_m68k(void)
+{
+    size_t i;
+    int passed = 0;
+    int failed = 0;
+
+    for (i = 0; i < sizeof(tests) / sizeof(tests[0]); i++)
+    {
+        if (run_case(&tests[i]))
+        {
+            passed += 1;
+        }
+        else
+        {
+            failed += 1;
+        }
+    }
+
+    printf("assemble_m68k: %d passed, %d failed (of %d)\n", passed, failed, passed + failed);
+
+    return failed;
+}

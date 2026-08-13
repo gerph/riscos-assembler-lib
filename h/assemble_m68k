@@ -1,0 +1,104 @@
+/*******************************************************************
+ * File:        assemble_m68k
+ * Purpose:     Assembler backend for the Motorola MC68000 instruction
+ *              set.
+ * Author:      Charles Ferguson (Gerph)
+ ******************************************************************/
+
+#ifndef ASSEMBLE_M68K_H
+#define ASSEMBLE_M68K_H
+
+#include <stdint.h>
+#include <stddef.h>
+
+#include "kernel.h"
+#include "assemble_common.h"
+
+/* Known deficiencies:
+   - Base MC68000 only: no 68010/68020/68030/68040/68060 extensions (eg
+     no 32-bit branch/LINK displacements, no bit-field instructions, no
+     CAS/CAS2, no MOVES, no long multiply/divide). No 68881/68882 FPU,
+     no 68851 PMMU.
+   - MOVE from CCR (CCR,<ea>) is a 68010 addition, not genuine MC68000,
+     and is deliberately rejected (ASSEMBLE_M68K_ERR_NOT_ON_MC68000)
+     rather than silently assembled -- MOVE to CCR (<ea>,CCR), MOVE
+     to/from SR and MOVE to/from USP ARE genuine MC68000 and are
+     supported.
+   - No EVEN/ALIGN pseudo-op. DC.B/DS.B (or DCB, in the shared-dialect
+     spelling) do not auto-pad odd lengths to a word boundary -- a
+     caller mixing byte data with following word/long data or code is
+     responsible for its own padding. This matters more on m68k than
+     elsewhere: an odd-addressed word/long access raises a genuine CPU
+     Address Error exception on real MC68000 hardware.
+   - Bcc/BSR/BRA require an explicit .S (8-bit) or .W (16-bit)
+     displacement size suffix; there is no displacement-size relaxation
+     (see ASSEMBLE_M68K_ERR_BRANCH_SIZE_REQUIRED) -- consistent with
+     every other backend in this library never growing/shrinking an
+     instruction's size between passes (see assemble_riscv's LI/CALL
+     for the same reasoning).
+   - MOVE.L #imm,Dn is never automatically shortened to MOVEQ; the
+     caller must write MOVEQ explicitly if that encoding is wanted.
+     This keeps every instruction's size a direct, predictable function
+     of what was written, matching the Bcc .S/.W policy above, rather
+     than adding a second, silent size-choice mechanism.
+   - No MOVEM/MOVEP/Bcc/DBcc PC-relative-versus-absolute addressing-mode
+     auto-selection; the caller writes whichever addressing-mode syntax
+     it wants explicitly. */
+
+/* Dialect selection lives in the top bits of assemble_context_t's 'opt'
+   field, following the convention used elsewhere in this library. The
+   MC68000 instruction set itself has only one dialect; the single bit
+   here selects between this library's shared DCB/DCW/DCD data-directive
+   convention (bit clear, the default, matching 6502/6809/RISC-V) and
+   idiomatic 68k-style size-suffixed directives (bit set): DC.B/DC.W/
+   DC.L and DS.B/DS.W/DS.L. This is unrelated to the mandatory .S/.W
+   branch-size suffix (always required, in both directive dialects) and
+   to ordinary instruction .B/.W/.L size suffixes (always written the
+   normal 68k way, in both directive dialects) -- only the *data
+   pseudo-op spelling* changes. EQU behaves identically in both
+   dialects. */
+#define ASSEMBLE_M68K_OPT_NATIVE_DIRECTIVES (1u << 4)  /* 0x10 */
+
+/* CPU-specific detail for errors raised by this backend; see
+   ASSEMBLE_ERRNUM_VARIANT(). */
+typedef enum assemble_m68k_error_variant
+{
+    ASSEMBLE_M68K_ERR_NONE = 0,
+    ASSEMBLE_M68K_ERR_BAD_REGISTER,           /* Dn/An expected, or out of range 0-7 */
+    ASSEMBLE_M68K_ERR_BAD_EA,                 /* operand doesn't match any addressing mode syntax */
+    ASSEMBLE_M68K_ERR_EA_NOT_ALLOWED,         /* a syntactically valid EA isn't legal for this operand slot */
+    ASSEMBLE_M68K_ERR_BAD_SIZE,               /* .B/.W/.L suffix missing/invalid/not supported by this mnemonic */
+    ASSEMBLE_M68K_ERR_BRANCH_SIZE_REQUIRED,   /* Bcc/BSR/BRA used without a mandatory .S/.W suffix */
+    ASSEMBLE_M68K_ERR_BRANCH_RANGE,           /* branch displacement out of range for its suffix, or odd */
+    ASSEMBLE_M68K_ERR_IMMEDIATE_RANGE,        /* #imm doesn't fit the field (eg MOVEQ -128..127) */
+    ASSEMBLE_M68K_ERR_DISPLACEMENT_RANGE,     /* d16 out of -32768..32767, or d8 index displacement out of -128..127 */
+    ASSEMBLE_M68K_ERR_BAD_REGISTER_LIST,      /* MOVEM register-list syntax error */
+    ASSEMBLE_M68K_ERR_NEED_LABEL_FOR_EQU,     /* EQU used without a preceding '.label' */
+    ASSEMBLE_M68K_ERR_NOT_ON_MC68000          /* valid 68010+ mnemonic/form, not on base MC68000 (eg MOVE CCR,<ea>) */
+} assemble_m68k_error_variant_t;
+
+/*******************************************************************
+ Function:      assemble_m68k_line
+ Description:   Assembles one line of tokenised BASIC source as an
+                MC68000 instruction, label definition or data
+                pseudo-op (EQU, DCB/DCW/DCD or, when
+                ASSEMBLE_M68K_OPT_NATIVE_DIRECTIVES is set,
+                DC.B/DC.W/DC.L/DS.B/DS.W/DS.L, OPT), writing the
+                result to context->buffer (or just measuring it, if
+                context->buffer_length is -1). context->bytes_used is
+                set to the number of bytes written or that would have
+                been written. All values are big-endian, matching the
+                68000's native byte order.
+ Parameters:    context = the assembly context; address, buffer,
+                          buffer_length and opt must be filled in
+                line = tokenised BASIC source for the line, not
+                       including the terminating CR/LF
+                line_length = number of bytes at 'line'
+ Returns:       NULL if successful, otherwise a pointer to a static
+                error block (see assemble_common.h)
+ ******************************************************************/
+_kernel_oserror *assemble_m68k_line(assemble_context_t *context,
+                                     const uint8_t *line,
+                                     size_t line_length);
+
+#endif

@@ -22,6 +22,7 @@ EXPORTS    = ${EXP_LIB}.${COMPONENT}.h.assemble_6502 \
 		     ${EXP_LIB}.${COMPONENT}.h.assemble_x86_64 \
 		     ${EXP_LIB}.${COMPONENT}.h.assemble_z80 \
 		     ${EXP_LIB}.${COMPONENT}.h.assemble_riscv \
+		     ${EXP_LIB}.${COMPONENT}.h.assemble_m68k \
 		     ${EXP_LIB}.${COMPONENT}.h.assemble_registry \
 		     ${EXP_LIB}.${COMPONENT}.h.assemble_common \
 
@@ -41,6 +42,7 @@ OBJS       = \
              o.assemble_z80 \
              o.assemble_arm32 \
              o.assemble_riscv \
+             o.assemble_m68k \
              o.assemble_registry \
 
 
@@ -55,6 +57,7 @@ ${EXP_LIB}.${COMPONENT}.h.assemble_arm32:  h.assemble_arm32;      ${CP} $?  $@  
 ${EXP_LIB}.${COMPONENT}.h.assemble_x86_64: h.assemble_x86_64;     ${CP} $?  $@  ${CPFLAGS}
 ${EXP_LIB}.${COMPONENT}.h.assemble_z80:    h.assemble_z80;        ${CP} $?  $@  ${CPFLAGS}
 ${EXP_LIB}.${COMPONENT}.h.assemble_riscv:  h.assemble_riscv;      ${CP} $?  $@  ${CPFLAGS}
+${EXP_LIB}.${COMPONENT}.h.assemble_m68k:   h.assemble_m68k;       ${CP} $?  $@  ${CPFLAGS}
 ${EXP_LIB}.${COMPONENT}.h.assemble_registry: h.assemble_registry; ${CP} $?  $@  ${CPFLAGS}
 ${EXP_LIB}.${COMPONENT}.h.assemble_common: h.assemble_common;     ${CP} $?  $@  ${CPFLAGS}
 

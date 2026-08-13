@@ -1,0 +1,1383 @@
+/*******************************************************************
+ * File:        assemble_m68k
+ * Purpose:     Assembler backend for the Motorola MC68000 instruction
+ *              set. Parses one tokenised BASIC source line at a time
+ *              into machine code, using the callbacks in the assembly
+ *              context to evaluate expressions and to assign labels.
+ *              All multi-byte values are big-endian, matching the
+ *              68000 itself.
+ * Author:      Charles Ferguson (Gerph)
+ ******************************************************************/
+
+#include <string.h>
+#include <ctype.h>
+
+#include "assemble_m68k.h"
+
+/* ---- Addressing mode model ----------------------------------------
+   A parsed operand is kept as a small struct (mode/register/index
+   fields/value); extension words are computed later by
+   m68k_encode_ea(), once the instruction's operation size and the
+   legal addressing-mode set for this specific operand slot are both
+   known. This mirrors how assemble_arm32/assemble_riscv structure
+   their own operand parsing (parse first, encode once context is
+   known), rather than the reference implementation this backend's
+   instruction-set knowledge was drawn from, which computes extension
+   words during parsing itself. */
+
+typedef enum m68k_size
+{
+    M68K_SIZE_NONE = 0,  /* no suffix given, or suffix not applicable */
+    M68K_SIZE_B,
+    M68K_SIZE_W,
+    M68K_SIZE_L
+} m68k_size_t;
+
+/* The eight EA "mode" field values, matching the real 3-bit mode field
+   exactly; mode 7's five submodes are distinguished by 'reg' below
+   (M68K_SUB_*), matching the real register-field encoding for mode
+   111. */
+typedef enum m68k_ea_kind
+{
+    M68K_EA_DN          = 0, /* Dn */
+    M68K_EA_AN          = 1, /* An */
+    M68K_EA_AN_IND      = 2, /* (An) */
+    M68K_EA_AN_POSTINC  = 3, /* (An)+ */
+    M68K_EA_AN_PREDEC   = 4, /* -(An) */
+    M68K_EA_AN_DISP     = 5, /* d16(An) */
+    M68K_EA_AN_INDEX    = 6, /* d8(An,Xn.w/l) */
+    M68K_EA_OTHER       = 7  /* subtype in 'reg': see M68K_SUB_* below */
+} m68k_ea_kind_t;
+
+#define M68K_SUB_ABS_SHORT  0  /* (xxxx).W */
+#define M68K_SUB_ABS_LONG   1  /* (xxxx).L */
+#define M68K_SUB_PC_DISP    2  /* d16(PC) or (d16,PC) */
+#define M68K_SUB_PC_INDEX   3  /* d8(PC,Xn.w/l) or (d8,PC,Xn.w/l) */
+#define M68K_SUB_IMMEDIATE  4  /* #<data> */
+
+typedef struct m68k_operand
+{
+    m68k_ea_kind_t mode;
+    uint16_t       reg;           /* 0-7 for Dn/An/(An)-family, or an M68K_SUB_* value when mode==M68K_EA_OTHER */
+
+    /* For AN_INDEX/PC_INDEX: the index register/size, needed to build
+       the brief extension word at encode time. */
+    unsigned char  index_is_addr; /* 0 = Dn index, 1 = An index */
+    unsigned char  index_reg;     /* 0-7 */
+    unsigned char  index_long;    /* 0 = .W (sign-extended), 1 = .L */
+
+    /* The operand's own numeric payload -- a displacement, an absolute
+       address or an immediate value, resolved via context->resolve_expr
+       at parse time. */
+    int32_t        value;
+
+    int            is_pc_relative; /* 1 for d16(PC)/d8(PC,Xn) syntax specifically */
+} m68k_operand_t;
+
+/* Motorola's own named EA legality classes, built from the individual
+   mode bits below -- every instruction's legal operand set is one of
+   these, occasionally with a bit added/removed per the PRM's own
+   per-instruction tables (eg CHK/MULx/DIVx exclude An but otherwise
+   use DATA). */
+#define M68K_EAM_DN         (1u << 0)
+#define M68K_EAM_AN         (1u << 1)
+#define M68K_EAM_AN_IND     (1u << 2)
+#define M68K_EAM_AN_POSTINC (1u << 3)
+#define M68K_EAM_AN_PREDEC  (1u << 4)
+#define M68K_EAM_AN_DISP    (1u << 5)
+#define M68K_EAM_AN_INDEX   (1u << 6)
+#define M68K_EAM_ABS_SHORT  (1u << 7)
+#define M68K_EAM_ABS_LONG   (1u << 8)
+#define M68K_EAM_PC_DISP    (1u << 9)
+#define M68K_EAM_PC_INDEX   (1u << 10)
+#define M68K_EAM_IMMEDIATE  (1u << 11)
+
+#define M68K_EAM_MEMORY           (M68K_EAM_AN_IND | M68K_EAM_AN_POSTINC | M68K_EAM_AN_PREDEC | \
+                                    M68K_EAM_AN_DISP | M68K_EAM_AN_INDEX | M68K_EAM_ABS_SHORT | \
+                                    M68K_EAM_ABS_LONG | M68K_EAM_PC_DISP | M68K_EAM_PC_INDEX | M68K_EAM_IMMEDIATE)
+#define M68K_EAM_ALTERABLE        (M68K_EAM_DN | M68K_EAM_AN | M68K_EAM_AN_IND | M68K_EAM_AN_POSTINC | \
+                                    M68K_EAM_AN_PREDEC | M68K_EAM_AN_DISP | M68K_EAM_AN_INDEX | \
+                                    M68K_EAM_ABS_SHORT | M68K_EAM_ABS_LONG)
+#define M68K_EAM_DATA_ALTERABLE   (M68K_EAM_ALTERABLE & ~M68K_EAM_AN)
+#define M68K_EAM_MEMORY_ALTERABLE (M68K_EAM_DATA_ALTERABLE & ~M68K_EAM_DN)
+#define M68K_EAM_DATA             (M68K_EAM_DATA_ALTERABLE | M68K_EAM_PC_DISP | M68K_EAM_PC_INDEX | M68K_EAM_IMMEDIATE)
+#define M68K_EAM_ALL              (M68K_EAM_DATA | M68K_EAM_AN)
+
+/* ---- Expression evaluation (via the caller-supplied callbacks) ---- */
+
+static int32_t value_to_integer(const assemble_value_t *value)
+{
+    switch (value->type)
+    {
+        case ASSEMBLE_VALUE_FLOAT:
+            return (int32_t) value->value.as_float;
+        case ASSEMBLE_VALUE_INTEGER:
+        default:
+            return value->value.as_integer;
+    }
+}
+
+static _kernel_oserror *eval_expr(assemble_context_t *context,
+                                   const uint8_t *text, size_t length,
+                                   assemble_value_t *value, size_t *consumed)
+{
+    _kernel_oserror *error = NULL;
+
+    if (context->resolve_expr(context->user_data, text, length, value, consumed, &error) != ASSEMBLE_RESULT_OK)
+    {
+        if (error != NULL)
+        {
+            return error;
+        }
+        return assemble_set_error(ASSEMBLE_CPU_M68K, ASSEMBLE_ERROR_TYPE_EXPRESSION, ASSEMBLE_M68K_ERR_NONE,
+                                   "Expression could not be evaluated");
+    }
+    if (value->type == ASSEMBLE_VALUE_STRING)
+    {
+        return assemble_set_error(ASSEMBLE_CPU_M68K, ASSEMBLE_ERROR_TYPE_EXPRESSION, ASSEMBLE_M68K_ERR_NONE,
+                                   "Expected a numeric value");
+    }
+    return NULL;
+}
+
+static _kernel_oserror *eval_numeric(assemble_context_t *context,
+                                      const uint8_t *text, size_t length,
+                                      size_t *pos_inout, int32_t *out_value)
+{
+    assemble_value_t value;
+    size_t consumed;
+    _kernel_oserror *error;
+
+    error = eval_expr(context, text + *pos_inout, length - *pos_inout, &value, &consumed);
+    if (error != NULL)
+    {
+        return error;
+    }
+    *pos_inout += consumed;
+    *out_value = value_to_integer(&value);
+    return NULL;
+}
+
+static _kernel_oserror *check_trailing(const uint8_t *text, size_t length, size_t pos)
+{
+    pos += assemble_skip_spaces(text + pos, length - pos);
+    if (pos != length)
+    {
+        return assemble_set_error(ASSEMBLE_CPU_M68K, ASSEMBLE_ERROR_TYPE_SYNTAX, ASSEMBLE_M68K_ERR_NONE,
+                                   "Unexpected text after operand");
+    }
+    return NULL;
+}
+
+/* ---- Register/keyword parsing --------------------------------------
+   These return 0/1 (rather than an error) so callers can backtrack and
+   try a different operand shape when a register/keyword doesn't match,
+   the same convention parse_indexed_register() uses in assemble_6809. */
+
+static int parse_data_register(const uint8_t *text, size_t length, size_t *pos_inout, uint16_t *out_reg)
+{
+    size_t pos = *pos_inout;
+
+    if (pos + 1 < length && (text[pos] == 'D' || text[pos] == 'd') && text[pos + 1] >= '0' && text[pos + 1] <= '7')
+    {
+        if (pos + 2 < length && assemble_is_ident_char(text[pos + 2]))
+        {
+            return 0;
+        }
+        *out_reg = (uint16_t) (text[pos + 1] - '0');
+        *pos_inout = pos + 2;
+        return 1;
+    }
+    return 0;
+}
+
+static int parse_addr_register(const uint8_t *text, size_t length, size_t *pos_inout, uint16_t *out_reg)
+{
+    size_t pos = *pos_inout;
+
+    if (pos + 1 < length && (text[pos] == 'A' || text[pos] == 'a') && text[pos + 1] >= '0' && text[pos + 1] <= '7')
+    {
+        if (pos + 2 < length && assemble_is_ident_char(text[pos + 2]))
+        {
+            return 0;
+        }
+        *out_reg = (uint16_t) (text[pos + 1] - '0');
+        *pos_inout = pos + 2;
+        return 1;
+    }
+    if (pos + 1 < length && (text[pos] == 'S' || text[pos] == 's') && (text[pos + 1] == 'P' || text[pos + 1] == 'p'))
+    {
+        if (pos + 2 < length && assemble_is_ident_char(text[pos + 2]))
+        {
+            return 0;
+        }
+        *out_reg = 7;  /* SP is an alias for A7 */
+        *pos_inout = pos + 2;
+        return 1;
+    }
+    return 0;
+}
+
+static int parse_pc_keyword(const uint8_t *text, size_t length, size_t *pos_inout)
+{
+    size_t pos = *pos_inout;
+
+    if (pos + 1 < length && (text[pos] == 'P' || text[pos] == 'p') && (text[pos + 1] == 'C' || text[pos + 1] == 'c'))
+    {
+        if (pos + 2 < length && assemble_is_ident_char(text[pos + 2]))
+        {
+            return 0;
+        }
+        *pos_inout = pos + 2;
+        return 1;
+    }
+    return 0;
+}
+
+/*******************************************************************
+ Function:      parse_index_register
+ Description:   Parses the 'Dn.w'/'Dn.l'/'An.w'/'An.l' index-register
+                operand used inside indexed addressing modes. The
+                size suffix is mandatory, matching real 68000 syntax.
+ Parameters:    text/length = the operand text
+                pos_inout = current position, at the register
+                out_is_addr = [[out]] 0 = Dn index, 1 = An index
+                out_reg = [[out]] register number 0-7
+                out_long = [[out]] 0 = .w (sign-extended), 1 = .l
+ Returns:       NULL if successful, otherwise a static error block
+ ******************************************************************/
+static _kernel_oserror *parse_index_register(const uint8_t *text, size_t length, size_t *pos_inout,
+                                              unsigned char *out_is_addr, unsigned char *out_reg,
+                                              unsigned char *out_long)
+{
+    size_t pos = *pos_inout;
+    uint16_t reg;
+    int is_addr;
+    int ch;
+
+    if (parse_data_register(text, length, &pos, &reg))
+    {
+        is_addr = 0;
+    }
+    else if (parse_addr_register(text, length, &pos, &reg))
+    {
+        is_addr = 1;
+    }
+    else
+    {
+        return assemble_set_error(ASSEMBLE_CPU_M68K, ASSEMBLE_ERROR_TYPE_BAD_OPERAND, ASSEMBLE_M68K_ERR_BAD_REGISTER,
+                                   "Expected a data or address register as the index register");
+    }
+
+    if (!(pos + 1 < length && text[pos] == '.'))
+    {
+        return assemble_set_error(ASSEMBLE_CPU_M68K, ASSEMBLE_ERROR_TYPE_SYNTAX, ASSEMBLE_M68K_ERR_BAD_SIZE,
+                                   "Index register requires a .w or .l size suffix");
+    }
+    ch = toupper((int) text[pos + 1]);
+    if (ch != 'W' && ch != 'L')
+    {
+        return assemble_set_error(ASSEMBLE_CPU_M68K, ASSEMBLE_ERROR_TYPE_SYNTAX, ASSEMBLE_M68K_ERR_BAD_SIZE,
+                                   "Index register size suffix must be .w or .l");
+    }
+
+    *out_is_addr = (unsigned char) is_addr;
+    *out_reg = (unsigned char) reg;
+    *out_long = (unsigned char) (ch == 'L' ? 1 : 0);
+    *pos_inout = pos + 2;
+    return NULL;
+}
+
+/*******************************************************************
+ Function:      parse_m68k_operand
+ Description:   Parses one addressing-mode operand. Legality for the
+                specific operand slot (source/destination) is checked
+                separately by m68k_encode_ea(), not here -- this
+                function accepts any of the 12 addressing-mode
+                syntaxes.
+ Parameters:    context = the assembly context
+                text/length = the operand text
+                pos_inout = current position, advanced past the operand
+                out = [[out]] the parsed operand
+ Returns:       NULL if successful, otherwise a static error block
+ ******************************************************************/
+static _kernel_oserror *parse_m68k_operand(assemble_context_t *context,
+                                            const uint8_t *text, size_t length, size_t *pos_inout,
+                                            m68k_operand_t *out)
+{
+    size_t pos = *pos_inout;
+    uint16_t reg;
+    _kernel_oserror *error;
+
+    memset(out, 0, sizeof(*out));
+    pos += assemble_skip_spaces(text + pos, length - pos);
+
+    /* Immediate: #expr */
+    if (pos < length && text[pos] == '#')
+    {
+        int32_t value;
+
+        pos += 1;
+        error = eval_numeric(context, text, length, &pos, &value);
+        if (error != NULL)
+        {
+            return error;
+        }
+        out->mode = M68K_EA_OTHER;
+        out->reg = M68K_SUB_IMMEDIATE;
+        out->value = value;
+        *pos_inout = pos;
+        return NULL;
+    }
+
+    /* Predecrement: -(An) */
+    if (pos + 1 < length && text[pos] == '-' && text[pos + 1] == '(')
+    {
+        pos += 2;
+        pos += assemble_skip_spaces(text + pos, length - pos);
+        if (!parse_addr_register(text, length, &pos, &reg))
+        {
+            return assemble_set_error(ASSEMBLE_CPU_M68K, ASSEMBLE_ERROR_TYPE_BAD_OPERAND,
+                                       ASSEMBLE_M68K_ERR_BAD_REGISTER, "Expected an address register after '-('");
+        }
+        pos += assemble_skip_spaces(text + pos, length - pos);
+        if (!(pos < length && text[pos] == ')'))
+        {
+            return assemble_set_error(ASSEMBLE_CPU_M68K, ASSEMBLE_ERROR_TYPE_SYNTAX, ASSEMBLE_M68K_ERR_NONE,
+                                       "Expected ')'");
+        }
+        out->mode = M68K_EA_AN_PREDEC;
+        out->reg = reg;
+        *pos_inout = pos + 1;
+        return NULL;
+    }
+
+    /* Parenthesised forms: (An), (An)+, (d,PC)[,Xn.sz], (expr).W/.L */
+    if (pos < length && text[pos] == '(')
+    {
+        size_t p2 = pos + 1;
+        int32_t val;
+
+        p2 += assemble_skip_spaces(text + p2, length - p2);
+
+        {
+            size_t p3 = p2;
+
+            if (parse_addr_register(text, length, &p3, &reg))
+            {
+                p3 += assemble_skip_spaces(text + p3, length - p3);
+                if (p3 < length && text[p3] == ')')
+                {
+                    p3 += 1;
+                    if (p3 < length && text[p3] == '+')
+                    {
+                        out->mode = M68K_EA_AN_POSTINC;
+                        out->reg = reg;
+                        *pos_inout = p3 + 1;
+                        return NULL;
+                    }
+                    out->mode = M68K_EA_AN_IND;
+                    out->reg = reg;
+                    *pos_inout = p3;
+                    return NULL;
+                }
+            }
+        }
+
+        error = eval_numeric(context, text, length, &p2, &val);
+        if (error != NULL)
+        {
+            return error;
+        }
+        p2 += assemble_skip_spaces(text + p2, length - p2);
+
+        if (p2 < length && text[p2] == ',')
+        {
+            p2 += 1;
+            p2 += assemble_skip_spaces(text + p2, length - p2);
+            if (!parse_pc_keyword(text, length, &p2))
+            {
+                return assemble_set_error(ASSEMBLE_CPU_M68K, ASSEMBLE_ERROR_TYPE_BAD_OPERAND,
+                                           ASSEMBLE_M68K_ERR_BAD_EA, "Expected PC after ',' in this addressing mode");
+            }
+            p2 += assemble_skip_spaces(text + p2, length - p2);
+            if (p2 < length && text[p2] == ',')
+            {
+                unsigned char is_addr, idxreg, is_long;
+
+                p2 += 1;
+                p2 += assemble_skip_spaces(text + p2, length - p2);
+                error = parse_index_register(text, length, &p2, &is_addr, &idxreg, &is_long);
+                if (error != NULL)
+                {
+                    return error;
+                }
+                p2 += assemble_skip_spaces(text + p2, length - p2);
+                if (!(p2 < length && text[p2] == ')'))
+                {
+                    return assemble_set_error(ASSEMBLE_CPU_M68K, ASSEMBLE_ERROR_TYPE_SYNTAX, ASSEMBLE_M68K_ERR_NONE,
+                                               "Expected ')'");
+                }
+                out->mode = M68K_EA_OTHER;
+                out->reg = M68K_SUB_PC_INDEX;
+                out->index_is_addr = is_addr;
+                out->index_reg = idxreg;
+                out->index_long = is_long;
+                out->value = val;
+                out->is_pc_relative = 1;
+                *pos_inout = p2 + 1;
+                return NULL;
+            }
+            if (!(p2 < length && text[p2] == ')'))
+            {
+                return assemble_set_error(ASSEMBLE_CPU_M68K, ASSEMBLE_ERROR_TYPE_SYNTAX, ASSEMBLE_M68K_ERR_NONE,
+                                           "Expected ')'");
+            }
+            out->mode = M68K_EA_OTHER;
+            out->reg = M68K_SUB_PC_DISP;
+            out->value = val;
+            out->is_pc_relative = 1;
+            *pos_inout = p2 + 1;
+            return NULL;
+        }
+
+        if (p2 < length && text[p2] == ')')
+        {
+            int ch;
+
+            p2 += 1;
+            if (!(p2 + 1 < length && text[p2] == '.'))
+            {
+                return assemble_set_error(ASSEMBLE_CPU_M68K, ASSEMBLE_ERROR_TYPE_SYNTAX, ASSEMBLE_M68K_ERR_BAD_SIZE,
+                                           "Absolute address in parentheses requires a .w or .l suffix");
+            }
+            ch = toupper((int) text[p2 + 1]);
+            out->mode = M68K_EA_OTHER;
+            if (ch == 'W')
+            {
+                out->reg = M68K_SUB_ABS_SHORT;
+            }
+            else if (ch == 'L')
+            {
+                out->reg = M68K_SUB_ABS_LONG;
+            }
+            else
+            {
+                return assemble_set_error(ASSEMBLE_CPU_M68K, ASSEMBLE_ERROR_TYPE_SYNTAX, ASSEMBLE_M68K_ERR_BAD_SIZE,
+                                           "Absolute address size suffix must be .w or .l");
+            }
+            out->value = val;
+            *pos_inout = p2 + 2;
+            return NULL;
+        }
+
+        return assemble_set_error(ASSEMBLE_CPU_M68K, ASSEMBLE_ERROR_TYPE_BAD_OPERAND, ASSEMBLE_M68K_ERR_BAD_EA,
+                                   "Operand does not match any addressing mode");
+    }
+
+    /* Register direct: Dn, or An/SP */
+    {
+        size_t p3 = pos;
+
+        if (parse_data_register(text, length, &p3, &reg))
+        {
+            out->mode = M68K_EA_DN;
+            out->reg = reg;
+            *pos_inout = p3;
+            return NULL;
+        }
+    }
+    {
+        size_t p3 = pos;
+
+        if (parse_addr_register(text, length, &p3, &reg))
+        {
+            out->mode = M68K_EA_AN;
+            out->reg = reg;
+            *pos_inout = p3;
+            return NULL;
+        }
+    }
+
+    /* d(An) / d(An,Xn.sz) / d(PC) / d(PC,Xn.sz) / absolute expr[.W|.L] */
+    {
+        int32_t val;
+
+        error = eval_numeric(context, text, length, &pos, &val);
+        if (error != NULL)
+        {
+            return error;
+        }
+
+        if (pos < length && text[pos] == '(')
+        {
+            pos += 1;
+            pos += assemble_skip_spaces(text + pos, length - pos);
+
+            if (parse_pc_keyword(text, length, &pos))
+            {
+                pos += assemble_skip_spaces(text + pos, length - pos);
+                if (pos < length && text[pos] == ',')
+                {
+                    unsigned char is_addr, idxreg, is_long;
+
+                    pos += 1;
+                    pos += assemble_skip_spaces(text + pos, length - pos);
+                    error = parse_index_register(text, length, &pos, &is_addr, &idxreg, &is_long);
+                    if (error != NULL)
+                    {
+                        return error;
+                    }
+                    pos += assemble_skip_spaces(text + pos, length - pos);
+                    if (!(pos < length && text[pos] == ')'))
+                    {
+                        return assemble_set_error(ASSEMBLE_CPU_M68K, ASSEMBLE_ERROR_TYPE_SYNTAX, ASSEMBLE_M68K_ERR_NONE,
+                                                   "Expected ')'");
+                    }
+                    out->mode = M68K_EA_OTHER;
+                    out->reg = M68K_SUB_PC_INDEX;
+                    out->index_is_addr = is_addr;
+                    out->index_reg = idxreg;
+                    out->index_long = is_long;
+                    out->value = val;
+                    out->is_pc_relative = 1;
+                    *pos_inout = pos + 1;
+                    return NULL;
+                }
+                if (!(pos < length && text[pos] == ')'))
+                {
+                    return assemble_set_error(ASSEMBLE_CPU_M68K, ASSEMBLE_ERROR_TYPE_SYNTAX, ASSEMBLE_M68K_ERR_NONE,
+                                               "Expected ')'");
+                }
+                out->mode = M68K_EA_OTHER;
+                out->reg = M68K_SUB_PC_DISP;
+                out->value = val;
+                out->is_pc_relative = 1;
+                *pos_inout = pos + 1;
+                return NULL;
+            }
+
+            if (parse_addr_register(text, length, &pos, &reg))
+            {
+                pos += assemble_skip_spaces(text + pos, length - pos);
+                if (pos < length && text[pos] == ',')
+                {
+                    unsigned char is_addr, idxreg, is_long;
+
+                    pos += 1;
+                    pos += assemble_skip_spaces(text + pos, length - pos);
+                    error = parse_index_register(text, length, &pos, &is_addr, &idxreg, &is_long);
+                    if (error != NULL)
+                    {
+                        return error;
+                    }
+                    pos += assemble_skip_spaces(text + pos, length - pos);
+                    if (!(pos < length && text[pos] == ')'))
+                    {
+                        return assemble_set_error(ASSEMBLE_CPU_M68K, ASSEMBLE_ERROR_TYPE_SYNTAX, ASSEMBLE_M68K_ERR_NONE,
+                                                   "Expected ')'");
+                    }
+                    out->mode = M68K_EA_AN_INDEX;
+                    out->reg = reg;
+                    out->index_is_addr = is_addr;
+                    out->index_reg = idxreg;
+                    out->index_long = is_long;
+                    out->value = val;
+                    *pos_inout = pos + 1;
+                    return NULL;
+                }
+                if (!(pos < length && text[pos] == ')'))
+                {
+                    return assemble_set_error(ASSEMBLE_CPU_M68K, ASSEMBLE_ERROR_TYPE_SYNTAX, ASSEMBLE_M68K_ERR_NONE,
+                                               "Expected ')'");
+                }
+                out->mode = M68K_EA_AN_DISP;
+                out->reg = reg;
+                out->value = val;
+                *pos_inout = pos + 1;
+                return NULL;
+            }
+
+            return assemble_set_error(ASSEMBLE_CPU_M68K, ASSEMBLE_ERROR_TYPE_BAD_OPERAND, ASSEMBLE_M68K_ERR_BAD_EA,
+                                       "Expected an address register or PC after '('");
+        }
+
+        if (pos + 1 < length && text[pos] == '.')
+        {
+            int ch = toupper((int) text[pos + 1]);
+
+            out->mode = M68K_EA_OTHER;
+            if (ch == 'W')
+            {
+                out->reg = M68K_SUB_ABS_SHORT;
+            }
+            else if (ch == 'L')
+            {
+                out->reg = M68K_SUB_ABS_LONG;
+            }
+            else
+            {
+                return assemble_set_error(ASSEMBLE_CPU_M68K, ASSEMBLE_ERROR_TYPE_SYNTAX, ASSEMBLE_M68K_ERR_BAD_SIZE,
+                                           "Absolute address size suffix must be .w or .l");
+            }
+            out->value = val;
+            *pos_inout = pos + 2;
+            return NULL;
+        }
+
+        out->mode = M68K_EA_OTHER;
+        out->reg = M68K_SUB_ABS_LONG;  /* default when no size suffix is given */
+        out->value = val;
+        *pos_inout = pos;
+        return NULL;
+    }
+}
+
+/* ---- EA encoding ---------------------------------------------------- */
+
+static uint16_t m68k_brief_ext(unsigned char index_is_addr, unsigned char index_reg,
+                                unsigned char index_long, int32_t disp8)
+{
+    return (uint16_t) ((index_is_addr ? 0x8000u : 0u) | ((uint32_t) index_reg << 12) |
+                        (index_long ? 0x0800u : 0u) | ((uint32_t) disp8 & 0xFFu));
+}
+
+/*******************************************************************
+ Function:      m68k_encode_ea
+ Description:   Converts a parsed operand into its 6-bit EA field
+                (mode<<3 | reg) and 0-2 big-endian extension words,
+                checking that its addressing mode is legal for this
+                specific operand slot.
+ Parameters:    context = the assembly context (for context->address,
+                          used by PC-relative modes)
+                op = the parsed operand
+                size = the instruction's operation size (governs how
+                       many extension words an immediate needs)
+                allowed = bitmask of M68K_EAM_* legal for this slot
+                pc_bias = extra bytes already emitted for this
+                          instruction's other operand(s) before this
+                          one's own extension word, needed so a
+                          PC-relative displacement here is computed
+                          against the address of *this* extension word,
+                          not the instruction's opcode word
+                out_ea = [[out]] mode<<3 | reg
+                out_ext = [[out]] up to 2 big-endian extension words
+                out_ext_count = [[out]] how many of out_ext are used (0-2)
+ Returns:       NULL if successful, otherwise a static error block
+ ******************************************************************/
+static _kernel_oserror *m68k_encode_ea(assemble_context_t *context,
+                                        const m68k_operand_t *op,
+                                        m68k_size_t size,
+                                        uint32_t allowed,
+                                        uint32_t pc_bias,
+                                        uint16_t *out_ea,
+                                        uint16_t out_ext[2],
+                                        unsigned char *out_ext_count)
+{
+    uint32_t mode_bit;
+
+    *out_ext_count = 0;
+
+    switch (op->mode)
+    {
+        case M68K_EA_DN:         mode_bit = M68K_EAM_DN; break;
+        case M68K_EA_AN:         mode_bit = M68K_EAM_AN; break;
+        case M68K_EA_AN_IND:     mode_bit = M68K_EAM_AN_IND; break;
+        case M68K_EA_AN_POSTINC: mode_bit = M68K_EAM_AN_POSTINC; break;
+        case M68K_EA_AN_PREDEC:  mode_bit = M68K_EAM_AN_PREDEC; break;
+        case M68K_EA_AN_DISP:    mode_bit = M68K_EAM_AN_DISP; break;
+        case M68K_EA_AN_INDEX:   mode_bit = M68K_EAM_AN_INDEX; break;
+        case M68K_EA_OTHER:
+            switch (op->reg)
+            {
+                case M68K_SUB_ABS_SHORT: mode_bit = M68K_EAM_ABS_SHORT; break;
+                case M68K_SUB_ABS_LONG:  mode_bit = M68K_EAM_ABS_LONG; break;
+                case M68K_SUB_PC_DISP:   mode_bit = M68K_EAM_PC_DISP; break;
+                case M68K_SUB_PC_INDEX:  mode_bit = M68K_EAM_PC_INDEX; break;
+                case M68K_SUB_IMMEDIATE: mode_bit = M68K_EAM_IMMEDIATE; break;
+                default:                 mode_bit = 0; break;
+            }
+            break;
+        default: mode_bit = 0; break;
+    }
+
+    if ((mode_bit & allowed) == 0)
+    {
+        return assemble_set_error(ASSEMBLE_CPU_M68K, ASSEMBLE_ERROR_TYPE_BAD_OPERAND,
+                                   ASSEMBLE_M68K_ERR_EA_NOT_ALLOWED,
+                                   "Addressing mode not allowed for this operand");
+    }
+
+    switch (op->mode)
+    {
+        case M68K_EA_DN:
+        case M68K_EA_AN:
+        case M68K_EA_AN_IND:
+        case M68K_EA_AN_POSTINC:
+        case M68K_EA_AN_PREDEC:
+            *out_ea = (uint16_t) (((uint32_t) op->mode << 3) | op->reg);
+            return NULL;
+
+        case M68K_EA_AN_DISP:
+            if (op->value < -32768 || op->value > 32767)
+            {
+                return assemble_set_error(ASSEMBLE_CPU_M68K, ASSEMBLE_ERROR_TYPE_RANGE,
+                                           ASSEMBLE_M68K_ERR_DISPLACEMENT_RANGE,
+                                           "Displacement out of range for a 16-bit indexed offset");
+            }
+            *out_ea = (uint16_t) (((uint32_t) op->mode << 3) | op->reg);
+            out_ext[0] = (uint16_t) op->value;
+            *out_ext_count = 1;
+            return NULL;
+
+        case M68K_EA_AN_INDEX:
+            if (op->value < -128 || op->value > 127)
+            {
+                return assemble_set_error(ASSEMBLE_CPU_M68K, ASSEMBLE_ERROR_TYPE_RANGE,
+                                           ASSEMBLE_M68K_ERR_DISPLACEMENT_RANGE,
+                                           "Displacement out of range for an 8-bit indexed offset");
+            }
+            *out_ea = (uint16_t) (((uint32_t) op->mode << 3) | op->reg);
+            out_ext[0] = m68k_brief_ext(op->index_is_addr, op->index_reg, op->index_long, op->value);
+            *out_ext_count = 1;
+            return NULL;
+
+        case M68K_EA_OTHER:
+            switch (op->reg)
+            {
+                case M68K_SUB_ABS_SHORT:
+                    if (op->value < -32768 || op->value > 65535)
+                    {
+                        return assemble_set_error(ASSEMBLE_CPU_M68K, ASSEMBLE_ERROR_TYPE_RANGE,
+                                                   ASSEMBLE_M68K_ERR_DISPLACEMENT_RANGE,
+                                                   "Absolute short address out of range");
+                    }
+                    *out_ea = (uint16_t) ((7u << 3) | M68K_SUB_ABS_SHORT);
+                    out_ext[0] = (uint16_t) op->value;
+                    *out_ext_count = 1;
+                    return NULL;
+
+                case M68K_SUB_ABS_LONG:
+                    *out_ea = (uint16_t) ((7u << 3) | M68K_SUB_ABS_LONG);
+                    out_ext[0] = (uint16_t) (((uint32_t) op->value) >> 16);
+                    out_ext[1] = (uint16_t) (((uint32_t) op->value) & 0xFFFFu);
+                    *out_ext_count = 2;
+                    return NULL;
+
+                case M68K_SUB_PC_DISP:
+                {
+                    int32_t disp = op->value - (int32_t) (context->address + 2u + pc_bias);
+
+                    if (disp < -32768 || disp > 32767)
+                    {
+                        return assemble_set_error(ASSEMBLE_CPU_M68K, ASSEMBLE_ERROR_TYPE_RANGE,
+                                                   ASSEMBLE_M68K_ERR_DISPLACEMENT_RANGE,
+                                                   "PC-relative displacement out of range");
+                    }
+                    *out_ea = (uint16_t) ((7u << 3) | M68K_SUB_PC_DISP);
+                    out_ext[0] = (uint16_t) disp;
+                    *out_ext_count = 1;
+                    return NULL;
+                }
+
+                case M68K_SUB_PC_INDEX:
+                {
+                    int32_t disp = op->value - (int32_t) (context->address + 2u + pc_bias);
+
+                    if (disp < -128 || disp > 127)
+                    {
+                        return assemble_set_error(ASSEMBLE_CPU_M68K, ASSEMBLE_ERROR_TYPE_RANGE,
+                                                   ASSEMBLE_M68K_ERR_DISPLACEMENT_RANGE,
+                                                   "PC-relative displacement out of range");
+                    }
+                    *out_ea = (uint16_t) ((7u << 3) | M68K_SUB_PC_INDEX);
+                    out_ext[0] = m68k_brief_ext(op->index_is_addr, op->index_reg, op->index_long, disp);
+                    *out_ext_count = 1;
+                    return NULL;
+                }
+
+                case M68K_SUB_IMMEDIATE:
+                    *out_ea = (uint16_t) ((7u << 3) | M68K_SUB_IMMEDIATE);
+                    if (size == M68K_SIZE_B)
+                    {
+                        if (op->value < -128 || op->value > 255)
+                        {
+                            return assemble_set_error(ASSEMBLE_CPU_M68K, ASSEMBLE_ERROR_TYPE_RANGE,
+                                                       ASSEMBLE_M68K_ERR_IMMEDIATE_RANGE,
+                                                       "Immediate value out of range for .B");
+                        }
+                        out_ext[0] = (uint16_t) ((uint32_t) op->value & 0xFFu);
+                        *out_ext_count = 1;
+                    }
+                    else if (size == M68K_SIZE_W)
+                    {
+                        if (op->value < -32768 || op->value > 65535)
+                        {
+                            return assemble_set_error(ASSEMBLE_CPU_M68K, ASSEMBLE_ERROR_TYPE_RANGE,
+                                                       ASSEMBLE_M68K_ERR_IMMEDIATE_RANGE,
+                                                       "Immediate value out of range for .W");
+                        }
+                        out_ext[0] = (uint16_t) ((uint32_t) op->value & 0xFFFFu);
+                        *out_ext_count = 1;
+                    }
+                    else
+                    {
+                        out_ext[0] = (uint16_t) (((uint32_t) op->value) >> 16);
+                        out_ext[1] = (uint16_t) (((uint32_t) op->value) & 0xFFFFu);
+                        *out_ext_count = 2;
+                    }
+                    return NULL;
+
+                default:
+                    break;
+            }
+            break;
+
+        default:
+            break;
+    }
+
+    return assemble_set_error(ASSEMBLE_CPU_M68K, ASSEMBLE_ERROR_TYPE_INTERNAL, ASSEMBLE_M68K_ERR_NONE,
+                               "Unhandled addressing mode");
+}
+
+/* ---- Mnemonic dispatch ----------------------------------------------
+   68000 opcodes are bit-field encoded from EA/register/size, not one
+   row per mnemonic+mode as 6809/6502 use -- so this table carries a
+   'family' tag and a per-family encoder function does the real work,
+   the same shape assemble_arm32 uses. This stage only needs the MOVE
+   family and a zero-operand 'no-op-shaped' family for NOP/RTS; later
+   stages add more families and rows. */
+
+typedef enum m68k_family
+{
+    FAM_MOVE,
+    FAM_NOOP
+} m68k_family_t;
+
+typedef struct m68k_mnemonic_entry
+{
+    const char    *root;
+    m68k_family_t  family;
+    uint32_t       param1;
+    unsigned char  size_mask;   /* bit0=B bit1=W bit2=L allowed, 0 = no size suffix accepted at all */
+} m68k_mnemonic_entry_t;
+
+#define SZ_B    0x1u
+#define SZ_W    0x2u
+#define SZ_L    0x4u
+#define SZ_BWL  (SZ_B | SZ_W | SZ_L)
+#define SZ_WL   (SZ_W | SZ_L)
+#define SZ_NONE 0u
+
+static const m68k_mnemonic_entry_t m68k_mnemonics[] = {
+    { "MOVE",  FAM_MOVE, 0, SZ_BWL },
+    { "MOVEA", FAM_MOVE, 0, SZ_WL },
+    { "MOVEQ", FAM_MOVE, 0, SZ_NONE },
+
+    { "NOP", FAM_NOOP, 0x4E71, SZ_NONE },
+    { "RTS", FAM_NOOP, 0x4E75, SZ_NONE }
+};
+
+#define NUM_MNEMONICS (sizeof(m68k_mnemonics) / sizeof(m68k_mnemonics[0]))
+
+static const m68k_mnemonic_entry_t *find_mnemonic(const char *root)
+{
+    size_t i;
+
+    for (i = 0; i < NUM_MNEMONICS; i++)
+    {
+        if (strcmp(m68k_mnemonics[i].root, root) == 0)
+        {
+            return &m68k_mnemonics[i];
+        }
+    }
+    return NULL;
+}
+
+static size_t read_mnemonic(const uint8_t *text, size_t length, char *out)
+{
+    size_t pos = 0;
+    size_t count = 0;
+
+    if (length == 0)
+    {
+        out[0] = '\0';
+        return 0;
+    }
+
+    while (pos < length && count < 7 &&
+           ((text[pos] >= 'A' && text[pos] <= 'Z') || (text[pos] >= 'a' && text[pos] <= 'z')))
+    {
+        out[count] = (char) toupper((int) text[pos]);
+        count += 1;
+        pos += 1;
+    }
+
+    out[count] = '\0';
+    return pos;
+}
+
+/*******************************************************************
+ Function:      parse_size_suffix
+ Description:   Parses an optional '.B'/'.W'/'.L' size suffix
+                immediately following a mnemonic root (no space
+                allowed between the root and the '.', matching real
+                68000 syntax, eg 'MOVE.L').
+ Parameters:    text/length = the source line
+                pos_inout = current position, just after the mnemonic
+                            root; advanced past the suffix if one was
+                            present
+                out_size = [[out]] the parsed size, or M68K_SIZE_NONE
+ Returns:       NULL if successful, otherwise a static error block
+ ******************************************************************/
+static _kernel_oserror *parse_size_suffix(const uint8_t *text, size_t length, size_t *pos_inout,
+                                           m68k_size_t *out_size)
+{
+    size_t pos = *pos_inout;
+
+    if (pos + 1 < length && text[pos] == '.')
+    {
+        int ch = toupper((int) text[pos + 1]);
+
+        if (ch == 'B') { *out_size = M68K_SIZE_B; *pos_inout = pos + 2; return NULL; }
+        if (ch == 'W') { *out_size = M68K_SIZE_W; *pos_inout = pos + 2; return NULL; }
+        if (ch == 'L') { *out_size = M68K_SIZE_L; *pos_inout = pos + 2; return NULL; }
+
+        return assemble_set_error(ASSEMBLE_CPU_M68K, ASSEMBLE_ERROR_TYPE_SYNTAX, ASSEMBLE_M68K_ERR_BAD_SIZE,
+                                   "Invalid size suffix (expected .B, .W or .L)");
+    }
+    *out_size = M68K_SIZE_NONE;
+    return NULL;
+}
+
+/*******************************************************************
+ Function:      encode_move
+ Description:   Encodes MOVE and MOVEA. MOVEA's destination is
+                restricted to An by the allowed-mode mask passed to
+                m68k_encode_ea() for the destination operand; both
+                mnemonics otherwise share the same opcode field
+                layout (MOVEA is not a distinct opcode format -- it is
+                the ordinary MOVE format with the destination EA
+                forced to address-register-direct).
+ Parameters:    context = the assembly context
+                is_movea = 0 for MOVE, 1 for MOVEA
+                size = the parsed .B/.W/.L size suffix
+                text/length = the operand text following the mnemonic
+ Returns:       NULL if successful, otherwise a static error block
+ ******************************************************************/
+static _kernel_oserror *encode_move(assemble_context_t *context, int is_movea,
+                                     m68k_size_t size, const uint8_t *text, size_t length)
+{
+    size_t pos = 0;
+    m68k_operand_t src, dst;
+    uint16_t src_ea, dst_ea;
+    uint16_t src_ext[2], dst_ext[2];
+    unsigned char src_ext_count, dst_ext_count;
+    uint16_t opword;
+    uint16_t size_bits;
+    _kernel_oserror *error;
+
+    if (size == M68K_SIZE_NONE)
+    {
+        return assemble_set_error(ASSEMBLE_CPU_M68K, ASSEMBLE_ERROR_TYPE_SYNTAX, ASSEMBLE_M68K_ERR_BAD_SIZE,
+                                   "MOVE/MOVEA requires a .B/.W/.L size suffix");
+    }
+    if (is_movea && size == M68K_SIZE_B)
+    {
+        return assemble_set_error(ASSEMBLE_CPU_M68K, ASSEMBLE_ERROR_TYPE_SYNTAX, ASSEMBLE_M68K_ERR_BAD_SIZE,
+                                   "MOVEA does not support .B");
+    }
+
+    pos += assemble_skip_spaces(text + pos, length - pos);
+    error = parse_m68k_operand(context, text, length, &pos, &src);
+    if (error != NULL)
+    {
+        return error;
+    }
+    pos += assemble_skip_spaces(text + pos, length - pos);
+    if (!(pos < length && text[pos] == ','))
+    {
+        return assemble_set_error(ASSEMBLE_CPU_M68K, ASSEMBLE_ERROR_TYPE_SYNTAX, ASSEMBLE_M68K_ERR_NONE,
+                                   "Expected ','");
+    }
+    pos += 1;
+    pos += assemble_skip_spaces(text + pos, length - pos);
+    error = parse_m68k_operand(context, text, length, &pos, &dst);
+    if (error != NULL)
+    {
+        return error;
+    }
+    error = check_trailing(text, length, pos);
+    if (error != NULL)
+    {
+        return error;
+    }
+
+    error = m68k_encode_ea(context, &src, size, M68K_EAM_ALL, 0, &src_ea, src_ext, &src_ext_count);
+    if (error != NULL)
+    {
+        return error;
+    }
+    error = m68k_encode_ea(context, &dst, size, is_movea ? M68K_EAM_AN : M68K_EAM_ALTERABLE,
+                            (uint32_t) src_ext_count * 2u, &dst_ea, dst_ext, &dst_ext_count);
+    if (error != NULL)
+    {
+        return error;
+    }
+
+    size_bits = (size == M68K_SIZE_B) ? 1u : (size == M68K_SIZE_W) ? 3u : 2u;  /* MOVE's odd B/W/L encoding */
+
+    opword = (uint16_t) ((size_bits << 12) |
+                          (((uint32_t) dst_ea & 0x7u) << 9) |
+                          ((((uint32_t) dst_ea >> 3) & 0x7u) << 6) |
+                          (((uint32_t) src_ea & 0x38u)) |
+                          ((uint32_t) src_ea & 0x7u));
+
+    error = assemble_emit_word_be(context, ASSEMBLE_CPU_M68K, opword);
+    if (error != NULL)
+    {
+        return error;
+    }
+    if (src_ext_count >= 1) { error = assemble_emit_word_be(context, ASSEMBLE_CPU_M68K, src_ext[0]); }
+    if (error == NULL && src_ext_count >= 2) { error = assemble_emit_word_be(context, ASSEMBLE_CPU_M68K, src_ext[1]); }
+    if (error == NULL && dst_ext_count >= 1) { error = assemble_emit_word_be(context, ASSEMBLE_CPU_M68K, dst_ext[0]); }
+    if (error == NULL && dst_ext_count >= 2) { error = assemble_emit_word_be(context, ASSEMBLE_CPU_M68K, dst_ext[1]); }
+    return error;
+}
+
+/*******************************************************************
+ Function:      encode_moveq
+ Description:   Encodes MOVEQ #imm,Dn. Unlike some 68000 assemblers,
+                'MOVE.L #imm,Dn' is never automatically shortened to
+                this encoding -- see h/assemble_m68k's deficiencies
+                comment.
+ Parameters:    context = the assembly context
+                text/length = the operand text following 'MOVEQ'
+ Returns:       NULL if successful, otherwise a static error block
+ ******************************************************************/
+static _kernel_oserror *encode_moveq(assemble_context_t *context, m68k_size_t size,
+                                      const uint8_t *text, size_t length)
+{
+    size_t pos = 0;
+    int32_t imm;
+    uint16_t reg;
+    _kernel_oserror *error;
+
+    if (size != M68K_SIZE_NONE)
+    {
+        return assemble_set_error(ASSEMBLE_CPU_M68K, ASSEMBLE_ERROR_TYPE_SYNTAX, ASSEMBLE_M68K_ERR_BAD_SIZE,
+                                   "MOVEQ does not take a size suffix (its size is always .L)");
+    }
+
+    pos += assemble_skip_spaces(text + pos, length - pos);
+    if (!(pos < length && text[pos] == '#'))
+    {
+        return assemble_set_error(ASSEMBLE_CPU_M68K, ASSEMBLE_ERROR_TYPE_BAD_OPERAND, ASSEMBLE_M68K_ERR_BAD_EA,
+                                   "MOVEQ requires an immediate source");
+    }
+    pos += 1;
+    error = eval_numeric(context, text, length, &pos, &imm);
+    if (error != NULL)
+    {
+        return error;
+    }
+    if (imm < -128 || imm > 127)
+    {
+        return assemble_set_error(ASSEMBLE_CPU_M68K, ASSEMBLE_ERROR_TYPE_RANGE, ASSEMBLE_M68K_ERR_IMMEDIATE_RANGE,
+                                   "MOVEQ immediate out of range -128..127");
+    }
+    pos += assemble_skip_spaces(text + pos, length - pos);
+    if (!(pos < length && text[pos] == ','))
+    {
+        return assemble_set_error(ASSEMBLE_CPU_M68K, ASSEMBLE_ERROR_TYPE_SYNTAX, ASSEMBLE_M68K_ERR_NONE,
+                                   "Expected ','");
+    }
+    pos += 1;
+    pos += assemble_skip_spaces(text + pos, length - pos);
+    if (!parse_data_register(text, length, &pos, &reg))
+    {
+        return assemble_set_error(ASSEMBLE_CPU_M68K, ASSEMBLE_ERROR_TYPE_BAD_OPERAND,
+                                   ASSEMBLE_M68K_ERR_EA_NOT_ALLOWED, "MOVEQ destination must be a data register");
+    }
+    error = check_trailing(text, length, pos);
+    if (error != NULL)
+    {
+        return error;
+    }
+
+    return assemble_emit_word_be(context, ASSEMBLE_CPU_M68K,
+                                  (uint16_t) (0x7000u | ((uint32_t) reg << 9) | ((uint32_t) imm & 0xFFu)));
+}
+
+static _kernel_oserror *encode_noop(assemble_context_t *context, uint16_t opcode,
+                                     const uint8_t *text, size_t length)
+{
+    _kernel_oserror *error = check_trailing(text, length, 0);
+
+    if (error != NULL)
+    {
+        return error;
+    }
+    return assemble_emit_word_be(context, ASSEMBLE_CPU_M68K, opcode);
+}
+
+static _kernel_oserror *dispatch_family(assemble_context_t *context, const m68k_mnemonic_entry_t *entry,
+                                         m68k_size_t size, const uint8_t *text, size_t length)
+{
+    switch (entry->family)
+    {
+        case FAM_MOVE:
+            if (strcmp(entry->root, "MOVEQ") == 0)
+            {
+                return encode_moveq(context, size, text, length);
+            }
+            return encode_move(context, strcmp(entry->root, "MOVEA") == 0, size, text, length);
+
+        case FAM_NOOP:
+            return encode_noop(context, (uint16_t) entry->param1, text, length);
+
+        default:
+            break;
+    }
+    return assemble_set_error(ASSEMBLE_CPU_M68K, ASSEMBLE_ERROR_TYPE_INTERNAL, ASSEMBLE_M68K_ERR_NONE,
+                               "Unhandled instruction family");
+}
+
+/*******************************************************************
+ Function:      assemble_dc
+ Description:   Assembles a DCB/DCW/DCD pseudo-op: a comma-separated
+                list of expressions, each emitted as a byte, 16-bit
+                word or 32-bit doubleword respectively, big-endian.
+                No padding is added for an odd byte count -- see
+                h/assemble_m68k's deficiencies comment.
+ Parameters:    context = the assembly context
+                mnemonic = "DCB", "DCW" or "DCD"
+                text/length = the operand text following the mnemonic
+ Returns:       NULL if successful, otherwise a static error block
+ ******************************************************************/
+static _kernel_oserror *assemble_dc(assemble_context_t *context, const char *mnemonic,
+                                     const uint8_t *text, size_t length)
+{
+    size_t pos = 0;
+    _kernel_oserror *error;
+
+    for (;;)
+    {
+        int32_t number;
+
+        pos += assemble_skip_spaces(text + pos, length - pos);
+        error = eval_numeric(context, text, length, &pos, &number);
+        if (error != NULL)
+        {
+            return error;
+        }
+
+        if (strcmp(mnemonic, "DCB") == 0)
+        {
+            error = assemble_emit_byte(context, ASSEMBLE_CPU_M68K, (uint8_t) (number & 0xFF));
+        }
+        else if (strcmp(mnemonic, "DCW") == 0)
+        {
+            error = assemble_emit_word_be(context, ASSEMBLE_CPU_M68K, (uint16_t) (number & 0xFFFF));
+        }
+        else
+        {
+            error = assemble_emit_dword_be(context, ASSEMBLE_CPU_M68K, (uint32_t) number);
+        }
+        if (error != NULL)
+        {
+            return error;
+        }
+
+        pos += assemble_skip_spaces(text + pos, length - pos);
+        if (pos < length && text[pos] == ',')
+        {
+            pos += 1;
+            continue;
+        }
+        break;
+    }
+
+    return check_trailing(text, length, pos);
+}
+
+/*******************************************************************
+ Function:      assign_label
+ Description:   Assigns a value to a label via the context's
+                assign_var callback.
+ Parameters:    context = the assembly context
+                label/label_length = the label name
+                value = the value to assign
+ Returns:       NULL if successful, otherwise a static error block
+ ******************************************************************/
+static _kernel_oserror *assign_label(assemble_context_t *context,
+                                      const char *label, size_t label_length,
+                                      const assemble_value_t *value)
+{
+    _kernel_oserror *error = NULL;
+
+    if (context->assign_var(context->user_data, label, label_length, value, &error) != ASSEMBLE_RESULT_OK)
+    {
+        if (error != NULL)
+        {
+            return error;
+        }
+        return assemble_set_error(ASSEMBLE_CPU_M68K, ASSEMBLE_ERROR_TYPE_BAD_LABEL, ASSEMBLE_M68K_ERR_NONE,
+                                   "Label could not be assigned");
+    }
+    return NULL;
+}
+
+_kernel_oserror *assemble_m68k_line(assemble_context_t *context,
+                                     const uint8_t *line, size_t line_length)
+{
+    size_t pos;
+    char label[64];
+    size_t label_length = 0;
+    int have_label = 0;
+    char mnemonic[8];
+    size_t consumed;
+    m68k_size_t size;
+    const m68k_mnemonic_entry_t *entry;
+    _kernel_oserror *error;
+
+    context->bytes_used = 0;
+    pos = 0;
+
+    pos += assemble_skip_spaces(line + pos, line_length - pos);
+
+    if (pos < line_length && line[pos] == '.')
+    {
+        size_t start;
+
+        pos += 1;
+        start = pos;
+        if (!(pos < line_length && assemble_is_ident_start(line[pos])))
+        {
+            return assemble_set_error(ASSEMBLE_CPU_M68K, ASSEMBLE_ERROR_TYPE_BAD_LABEL, ASSEMBLE_M68K_ERR_NONE,
+                                       "Expected a label name after '.'");
+        }
+        while (pos < line_length && assemble_is_ident_char(line[pos]))
+        {
+            pos += 1;
+        }
+        label_length = pos - start;
+        if (label_length >= sizeof(label))
+        {
+            label_length = sizeof(label) - 1;
+        }
+        memcpy(label, line + start, label_length);
+        label[label_length] = '\0';
+        have_label = 1;
+
+        pos += assemble_skip_spaces(line + pos, line_length - pos);
+    }
+
+    if (pos >= line_length)
+    {
+        if (have_label)
+        {
+            assemble_value_t value;
+
+            value.type = ASSEMBLE_VALUE_INTEGER;
+            value.value.as_integer = (int32_t) context->address;
+            return assign_label(context, label, label_length, &value);
+        }
+        return NULL;
+    }
+
+    consumed = read_mnemonic(line + pos, line_length - pos, mnemonic);
+    if (consumed == 0 || mnemonic[0] == '\0')
+    {
+        return assemble_set_error(ASSEMBLE_CPU_M68K, ASSEMBLE_ERROR_TYPE_BAD_MNEMONIC, ASSEMBLE_M68K_ERR_NONE,
+                                   "Mnemonic not recognised");
+    }
+    pos += consumed;
+
+    if (strcmp(mnemonic, "EQU") == 0)
+    {
+        assemble_value_t value;
+
+        if (!have_label)
+        {
+            return assemble_set_error(ASSEMBLE_CPU_M68K, ASSEMBLE_ERROR_TYPE_BAD_LABEL,
+                                       ASSEMBLE_M68K_ERR_NEED_LABEL_FOR_EQU, "EQU used without a preceding label");
+        }
+        pos += assemble_skip_spaces(line + pos, line_length - pos);
+        error = eval_expr(context, line + pos, line_length - pos, &value, &consumed);
+        if (error != NULL)
+        {
+            return error;
+        }
+        pos += consumed;
+        error = check_trailing(line, line_length, pos);
+        if (error != NULL)
+        {
+            return error;
+        }
+        return assign_label(context, label, label_length, &value);
+    }
+
+    if (have_label)
+    {
+        assemble_value_t value;
+
+        value.type = ASSEMBLE_VALUE_INTEGER;
+        value.value.as_integer = (int32_t) context->address;
+        error = assign_label(context, label, label_length, &value);
+        if (error != NULL)
+        {
+            return error;
+        }
+    }
+
+    if (strcmp(mnemonic, "OPT") == 0)
+    {
+        pos += assemble_skip_spaces(line + pos, line_length - pos);
+        if (pos < line_length)
+        {
+            assemble_value_t value;
+
+            error = eval_expr(context, line + pos, line_length - pos, &value, &consumed);
+            if (error != NULL)
+            {
+                return error;
+            }
+            pos += consumed;
+        }
+        return check_trailing(line, line_length, pos);
+    }
+
+    if (strcmp(mnemonic, "DCB") == 0 || strcmp(mnemonic, "DCW") == 0 || strcmp(mnemonic, "DCD") == 0)
+    {
+        pos += assemble_skip_spaces(line + pos, line_length - pos);
+        return assemble_dc(context, mnemonic, line + pos, line_length - pos);
+    }
+
+    entry = find_mnemonic(mnemonic);
+    if (entry == NULL)
+    {
+        return assemble_set_error(ASSEMBLE_CPU_M68K, ASSEMBLE_ERROR_TYPE_BAD_MNEMONIC, ASSEMBLE_M68K_ERR_NONE,
+                                   "Mnemonic not recognised");
+    }
+
+    error = parse_size_suffix(line, line_length, &pos, &size);
+    if (error != NULL)
+    {
+        return error;
+    }
+    if (size != M68K_SIZE_NONE)
+    {
+        unsigned char bit = (size == M68K_SIZE_B) ? SZ_B : (size == M68K_SIZE_W) ? SZ_W : SZ_L;
+
+        if ((entry->size_mask & bit) == 0)
+        {
+            return assemble_set_error(ASSEMBLE_CPU_M68K, ASSEMBLE_ERROR_TYPE_SYNTAX, ASSEMBLE_M68K_ERR_BAD_SIZE,
+                                       "Size suffix not supported by this mnemonic");
+        }
+    }
+    pos += assemble_skip_spaces(line + pos, line_length - pos);
+
+    return dispatch_family(context, entry, size, line + pos, line_length - pos);
+}

@@ -23,6 +23,7 @@ int main(int argc, char *argv[])
     failed += run_tests_z80();
     failed += run_tests_arm32();
     failed += run_tests_riscv();
+    failed += run_tests_m68k();
     failed += run_tests_registry();
 
     exit(failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE);

@@ -50,7 +50,8 @@ typedef enum assemble_cpu_class
     ASSEMBLE_CPU_X86_64  = 3,
     ASSEMBLE_CPU_Z80     = 4,
     ASSEMBLE_CPU_ARM32   = 5,
-    ASSEMBLE_CPU_RISCV   = 6
+    ASSEMBLE_CPU_RISCV   = 6,
+    ASSEMBLE_CPU_M68K    = 7
 } assemble_cpu_class_t;
 
 typedef enum assemble_error_type
