@@ -45,4 +45,18 @@ SYS "Assembler_AssembleLine", riscv_handle%, line$, LEN(line$), 0 TO bytes%
 IF bytes% <> 4 OR ?output% <> &13 OR output%?1 <> 0 OR output%?2 <> 0 OR output%?3 <> 0 THEN ERROR 0, "RISC-V NOP output is wrong"
 SYS "Assembler_Destroy", riscv_handle%
 
+REM m68k (CPU 7) likewise -- confirms the module needed no code change
+REM beyond the assembler_cpu_t enum entry to pick up a new backend.
+SYS "Assembler_Capabilities", 0 TO ,cpumask%
+IF (cpumask% AND &80) = 0 THEN ERROR 0, "Capabilities did not report m68k support"
+SYS "Assembler_Capabilities", 1, 7 TO ,,optmask%
+IF optmask% <> &10 THEN ERROR 0, "m68k OPT mask should be &10 (native-directives)"
+
+SYS "Assembler_Create", 7 TO m68k_handle%
+SYS "Assembler_BeginPass", m68k_handle%, 1, output%, 64, 0
+line$ = " NOP"
+SYS "Assembler_AssembleLine", m68k_handle%, line$, LEN(line$), 0 TO bytes%
+IF bytes% <> 2 OR ?output% <> &4E OR output%?1 <> &71 THEN ERROR 0, "m68k NOP output is wrong"
+SYS "Assembler_Destroy", m68k_handle%
+
 PRINT "Assembler module smoke test passed"

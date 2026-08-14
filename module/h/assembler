@@ -19,7 +19,8 @@ typedef enum assembler_cpu
     ASSEMBLER_CPU_X86_64 = 3,
     ASSEMBLER_CPU_Z80 = 4,
     ASSEMBLER_CPU_ARM32 = 5,
-    ASSEMBLER_CPU_RISCV = 6
+    ASSEMBLER_CPU_RISCV = 6,
+    ASSEMBLER_CPU_M68K = 7
 } assembler_cpu_t;
 
 typedef enum assembler_pass
