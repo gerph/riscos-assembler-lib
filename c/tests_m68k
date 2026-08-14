@@ -562,6 +562,56 @@ static const char lines_andi_token_raw[] = { (char) 0x80, 'I', '.', 'W', ' ', '#
 static const char *const lines_andi_token[] = { lines_andi_token_raw, NULL };
 static const uint8_t     bytes_andi_token[] = { 0x02, 0x40, 0x00, 0x01 };
 
+/* Tokenised DIV/MOVE/EXT/STOP/SWAP -- found after the fact by actually
+   tokenising sample source through riscos-basictokenise rather than
+   assuming AND/EOR/OR/NOT (the tokens every other backend also has to
+   handle) were the only collisions m68k has. MOVE is the interesting
+   one: it collides with a *whole family* of mnemonics (MOVE itself,
+   MOVEA/MOVEQ/MOVEM/MOVEP, and the MOVE SR/CCR/USP special forms), all
+   via the same single token byte. SWAP is a BASIC V structured-
+   programming keyword and tokenises as a two-byte extended-page
+   sequence (C8 94), not a single byte -- confirmed directly against
+   riscos-basictokenise, not assumed from the single-byte pattern. */
+static const char lines_divu_token_raw[] = { (char) 0x81, 'U', ' ', 'D', '1', ',', 'D', '0', '\0' };
+static const char *const lines_divu_token[] = { lines_divu_token_raw, NULL };
+static const uint8_t     bytes_divu_token[] = { 0x80, 0xC1 };
+
+static const char lines_move_token_raw[] = { (char) 0xEC, ' ', 'S', 'R', ',', 'D', '0', '\0' };
+static const char *const lines_move_token[] = { lines_move_token_raw, NULL };
+static const uint8_t     bytes_move_token[] = { 0x40, 0xC0 };
+
+static const char lines_moveq_token_raw[] = { (char) 0xEC, 'Q', ' ', '#', '1', ',', 'D', '7', '\0' };
+static const char *const lines_moveq_token[] = { lines_moveq_token_raw, NULL };
+static const uint8_t     bytes_moveq_token[] = { 0x7E, 0x01 };
+
+static const char lines_movea_token_raw[] = { (char) 0xEC, 'A', '.', 'L', ' ', 'A', '1', ',', 'A', '0', '\0' };
+static const char *const lines_movea_token[] = { lines_movea_token_raw, NULL };
+static const uint8_t     bytes_movea_token[] = { 0x20, 0x49 };
+
+static const char lines_movem_token_raw[] = {
+    (char) 0xEC, 'M', '.', 'L', ' ', 'D', '0', '-', 'D', '3', '/', 'A', '0', '-', 'A', '2', ',', '-', '(', 'S', 'P', ')', '\0'
+};
+static const char *const lines_movem_token[] = { lines_movem_token_raw, NULL };
+static const uint8_t     bytes_movem_token[] = { 0x48, 0xE7, 0xF0, 0xE0 };
+
+static const char lines_movep_token_raw[] = {
+    (char) 0xEC, 'P', '.', 'W', ' ', 'D', '0', ',', '4', '(', 'A', '1', ')', '\0'
+};
+static const char *const lines_movep_token[] = { lines_movep_token_raw, NULL };
+static const uint8_t     bytes_movep_token[] = { 0x01, 0x89, 0x00, 0x04 };
+
+static const char lines_ext_token_raw[] = { (char) 0xA2, '.', 'W', ' ', 'D', '0', '\0' };
+static const char *const lines_ext_token[] = { lines_ext_token_raw, NULL };
+static const uint8_t     bytes_ext_token[] = { 0x48, 0x80 };
+
+static const char lines_stop_token_raw[] = { (char) 0xFA, ' ', '#', '&', '2', '7', '0', '0', '\0' };
+static const char *const lines_stop_token[] = { lines_stop_token_raw, NULL };
+static const uint8_t     bytes_stop_token[] = { 0x4E, 0x72, 0x27, 0x00 };
+
+static const char lines_swap_token_raw[] = { (char) 0xC8, (char) 0x94, ' ', 'D', '0', '\0' };
+static const char *const lines_swap_token[] = { lines_swap_token_raw, NULL };
+static const uint8_t     bytes_swap_token[] = { 0x48, 0x40 };
+
 /* ---- Bit ops and shifts/rotates (stage 4) --------------------------
    Hand-derived from the real MC68000 opcode map. */
 
@@ -876,6 +926,15 @@ static const test_case_t tests[] = {
     { "tokenised OR",                       lines_or_token,          bytes_or_token,          sizeof(bytes_or_token),          0 },
     { "tokenised NOT",                      lines_not_token,         bytes_not_token,         sizeof(bytes_not_token),         0 },
     { "tokenised AND, ANDI continuation",   lines_andi_token,        bytes_andi_token,        sizeof(bytes_andi_token),        0 },
+    { "tokenised DIV, DIVU continuation",   lines_divu_token,        bytes_divu_token,        sizeof(bytes_divu_token),        0 },
+    { "tokenised MOVE",                     lines_move_token,        bytes_move_token,        sizeof(bytes_move_token),        0 },
+    { "tokenised MOVE, MOVEQ continuation", lines_moveq_token,       bytes_moveq_token,       sizeof(bytes_moveq_token),       0 },
+    { "tokenised MOVE, MOVEA continuation", lines_movea_token,       bytes_movea_token,       sizeof(bytes_movea_token),       0 },
+    { "tokenised MOVE, MOVEM continuation", lines_movem_token,       bytes_movem_token,       sizeof(bytes_movem_token),       0 },
+    { "tokenised MOVE, MOVEP continuation", lines_movep_token,       bytes_movep_token,       sizeof(bytes_movep_token),       0 },
+    { "tokenised EXT",                      lines_ext_token,         bytes_ext_token,         sizeof(bytes_ext_token),         0 },
+    { "tokenised STOP",                     lines_stop_token,        bytes_stop_token,        sizeof(bytes_stop_token),        0 },
+    { "tokenised SWAP (two-byte token)",    lines_swap_token,        bytes_swap_token,        sizeof(bytes_swap_token),        0 },
 
     { "BTST dynamic (register bit number)", lines_btst_dyn,          bytes_btst_dyn,          sizeof(bytes_btst_dyn),          0 },
     { "BTST static (immediate bit number)", lines_btst_static,       bytes_btst_static,       sizeof(bytes_btst_static),       0 },

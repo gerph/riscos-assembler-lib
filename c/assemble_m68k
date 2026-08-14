@@ -22,11 +22,38 @@
    added since none of those backends have a bare NOT mnemonic
    (assemble_6809 has COM, assemble_riscv has XOR not EOR/NOT). Values
    confirmed directly against riscos-basictokenise's own token table,
-   not copied from another backend's file. */
-#define TOKEN_AND 0x80
-#define TOKEN_EOR 0x82
-#define TOKEN_OR  0x84
-#define TOKEN_NOT 0xAC
+   not copied from another backend's file.
+
+   m68k has more of these than any other backend, because several
+   more of its mnemonics happen to collide with whole BASIC keywords,
+   not just the arithmetic/logical operators every backend has to
+   worry about: DIV (hits DIVU/DIVS), MOVE (hits MOVE itself plus
+   every MOVEx mnemonic -- MOVEA/MOVEQ/MOVEM/MOVEP and the MOVE
+   SR/CCR/USP special forms), EXT (hits EXT/EXT.W/EXT.L) and STOP
+   (hits STOP, a complete-word match with no suffix). These were
+   missed in the initial implementation -- only found by actually
+   tokenising sample source through riscos-basictokenise and
+   comparing, rather than assuming the 6809/Z80/RISC-V precedent's
+   token set (AND/EOR/OR/NOT) was exhaustive for a new instruction
+   set. See AGENTS.md's "BASIC token collisions" note: check *every*
+   mnemonic a new backend defines against the tokeniser directly,
+   don't just reuse the previous backends' token list. */
+#define TOKEN_AND  0x80
+#define TOKEN_DIV  0x81
+#define TOKEN_EOR  0x82
+#define TOKEN_OR   0x84
+#define TOKEN_EXT  0xA2
+#define TOKEN_NOT  0xAC
+#define TOKEN_MOVE 0xEC
+#define TOKEN_STOP 0xFA
+
+/* SWAP is a structured-programming keyword added in BASIC V, which
+   ran out of single-byte token space; it tokenises as a two-byte
+   sequence, an extended-page prefix followed by a sub-token, rather
+   than the single bytes above. Confirmed directly against
+   riscos-basictokenise: 'SWAP' on its own line produced C8 94. */
+#define TOKEN_SWAP_PAGE 0xC8
+#define TOKEN_SWAP_SUB  0x94
 
 /* ---- Addressing mode model ----------------------------------------
    A parsed operand is kept as a small struct (mode/register/index
@@ -1043,9 +1070,17 @@ static size_t read_mnemonic(const uint8_t *text, size_t length, char *out)
     }
 
     if (text[0] == TOKEN_AND) { out[count++] = 'A'; out[count++] = 'N'; out[count++] = 'D'; pos = 1; }
+    else if (text[0] == TOKEN_DIV) { out[count++] = 'D'; out[count++] = 'I'; out[count++] = 'V'; pos = 1; }
     else if (text[0] == TOKEN_EOR) { out[count++] = 'E'; out[count++] = 'O'; out[count++] = 'R'; pos = 1; }
     else if (text[0] == TOKEN_OR)  { out[count++] = 'O'; out[count++] = 'R';                    pos = 1; }
+    else if (text[0] == TOKEN_EXT) { out[count++] = 'E'; out[count++] = 'X'; out[count++] = 'T'; pos = 1; }
     else if (text[0] == TOKEN_NOT) { out[count++] = 'N'; out[count++] = 'O'; out[count++] = 'T'; pos = 1; }
+    else if (text[0] == TOKEN_MOVE) { out[count++] = 'M'; out[count++] = 'O'; out[count++] = 'V'; out[count++] = 'E'; pos = 1; }
+    else if (text[0] == TOKEN_STOP) { out[count++] = 'S'; out[count++] = 'T'; out[count++] = 'O'; out[count++] = 'P'; pos = 1; }
+    else if (length >= 2 && text[0] == TOKEN_SWAP_PAGE && text[1] == TOKEN_SWAP_SUB)
+    {
+        out[count++] = 'S'; out[count++] = 'W'; out[count++] = 'A'; out[count++] = 'P'; pos = 2;
+    }
 
     while (pos < length && count < 7 &&
            ((text[pos] >= 'A' && text[pos] <= 'Z') || (text[pos] >= 'a' && text[pos] <= 'z')))
