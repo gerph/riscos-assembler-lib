@@ -877,7 +877,9 @@ typedef enum m68k_family
     FAM_CHK,
     FAM_BCD,         /* ABCD/SBCD, param1: 0=ABCD 1=SBCD */
     FAM_NBCD,
-    FAM_LOGIC        /* AND/OR/EOR/ANDI/ORI/EORI, param1: 0=AND 1=OR 2=EOR, param2 selects force_kind */
+    FAM_LOGIC,       /* AND/OR/EOR/ANDI/ORI/EORI, param1: 0=AND 1=OR 2=EOR, param2 selects force_kind */
+    FAM_BIT_OP,      /* BTST/BSET/BCLR/BCHG, param1: 0=BTST 1=BCHG 2=BCLR 3=BSET */
+    FAM_SHIFT        /* ASx/LSx/ROXx/ROx, param1=type (0=AS 1=LS 2=ROX 3=RO), param2=direction (0=right 1=left) */
 } m68k_family_t;
 
 /* FAM_ADD_SUB/FAM_CMP 'force_kind' values (param2): auto-detect the
@@ -958,7 +960,21 @@ static const m68k_mnemonic_entry_t m68k_mnemonics[] = {
     { "EOR",  FAM_LOGIC, 2, M68K_FORCE_AUTO, SZ_BWL },
     { "ANDI", FAM_LOGIC, 0, M68K_FORCE_I,    SZ_BWL },
     { "ORI",  FAM_LOGIC, 1, M68K_FORCE_I,    SZ_BWL },
-    { "EORI", FAM_LOGIC, 2, M68K_FORCE_I,    SZ_BWL }
+    { "EORI", FAM_LOGIC, 2, M68K_FORCE_I,    SZ_BWL },
+
+    { "BTST", FAM_BIT_OP, 0, 0, SZ_NONE },
+    { "BCHG", FAM_BIT_OP, 1, 0, SZ_NONE },
+    { "BCLR", FAM_BIT_OP, 2, 0, SZ_NONE },
+    { "BSET", FAM_BIT_OP, 3, 0, SZ_NONE },
+
+    { "ASL",  FAM_SHIFT, 0, 1, SZ_BWL },
+    { "ASR",  FAM_SHIFT, 0, 0, SZ_BWL },
+    { "LSL",  FAM_SHIFT, 1, 1, SZ_BWL },
+    { "LSR",  FAM_SHIFT, 1, 0, SZ_BWL },
+    { "ROXL", FAM_SHIFT, 2, 1, SZ_BWL },
+    { "ROXR", FAM_SHIFT, 2, 0, SZ_BWL },
+    { "ROL",  FAM_SHIFT, 3, 1, SZ_BWL },
+    { "ROR",  FAM_SHIFT, 3, 0, SZ_BWL }
 };
 
 #define NUM_MNEMONICS (sizeof(m68k_mnemonics) / sizeof(m68k_mnemonics[0]))
@@ -2125,6 +2141,207 @@ static _kernel_oserror *encode_logic(assemble_context_t *context, int kind, uint
     return emit_ext_words(context, dst_ext, dst_ext_count);
 }
 
+/*******************************************************************
+ Function:      encode_bit_op
+ Description:   Encodes BTST/BCHG/BCLR/BSET, both the dynamic (bit
+                number in a data register) and static (bit number as
+                an immediate) forms. The static form's bit-number
+                extension word always precedes the destination EA's
+                own extension words, so the destination is encoded
+                with a 2-byte PC-relative bias for that form.
+ Parameters:    context = the assembly context
+                kind = 0=BTST, 1=BCHG, 2=BCLR, 3=BSET
+                text/length = the operand text following the mnemonic
+ Returns:       NULL if successful, otherwise a static error block
+ ******************************************************************/
+static _kernel_oserror *encode_bit_op(assemble_context_t *context, int kind, const uint8_t *text, size_t length)
+{
+    static const uint16_t dyn_base[4]    = { 0x0100u, 0x0140u, 0x0180u, 0x01C0u };
+    static const uint16_t static_base[4] = { 0x0800u, 0x0840u, 0x0880u, 0x08C0u };
+
+    m68k_operand_t src, dst;
+    uint16_t dst_ea, dst_ext[2];
+    unsigned char dst_ext_count;
+    uint32_t dst_mask = (kind == 0) ? M68K_EAM_DATA : M68K_EAM_DATA_ALTERABLE;
+    _kernel_oserror *error;
+
+    error = parse_two_operands(context, text, length, &src, &dst);
+    if (error != NULL)
+    {
+        return error;
+    }
+
+    if (src.mode == M68K_EA_DN)
+    {
+        error = m68k_encode_ea(context, &dst, M68K_SIZE_B, dst_mask, 0, &dst_ea, dst_ext, &dst_ext_count);
+        if (error != NULL)
+        {
+            return error;
+        }
+        error = assemble_emit_word_be(context, ASSEMBLE_CPU_M68K,
+                                       (uint16_t) (dyn_base[kind] | (((uint32_t) src.reg) << 9) | dst_ea));
+        if (error != NULL)
+        {
+            return error;
+        }
+        return emit_ext_words(context, dst_ext, dst_ext_count);
+    }
+
+    if (src.mode == M68K_EA_OTHER && src.reg == M68K_SUB_IMMEDIATE)
+    {
+        int32_t bit = src.value;
+
+        error = m68k_encode_ea(context, &dst, M68K_SIZE_B, dst_mask, 2, &dst_ea, dst_ext, &dst_ext_count);
+        if (error != NULL)
+        {
+            return error;
+        }
+        if (dst.mode == M68K_EA_DN)
+        {
+            if (bit < 0 || bit > 31)
+            {
+                return assemble_set_error(ASSEMBLE_CPU_M68K, ASSEMBLE_ERROR_TYPE_RANGE,
+                                           ASSEMBLE_M68K_ERR_IMMEDIATE_RANGE,
+                                           "Bit number out of range 0..31 for a data-register destination");
+            }
+        }
+        else if (bit < 0 || bit > 7)
+        {
+            return assemble_set_error(ASSEMBLE_CPU_M68K, ASSEMBLE_ERROR_TYPE_RANGE, ASSEMBLE_M68K_ERR_IMMEDIATE_RANGE,
+                                       "Bit number out of range 0..7 for a memory destination");
+        }
+
+        error = assemble_emit_word_be(context, ASSEMBLE_CPU_M68K, (uint16_t) (static_base[kind] | dst_ea));
+        if (error != NULL)
+        {
+            return error;
+        }
+        error = assemble_emit_word_be(context, ASSEMBLE_CPU_M68K, (uint16_t) ((uint32_t) bit & 0xFFu));
+        if (error != NULL)
+        {
+            return error;
+        }
+        return emit_ext_words(context, dst_ext, dst_ext_count);
+    }
+
+    return assemble_set_error(ASSEMBLE_CPU_M68K, ASSEMBLE_ERROR_TYPE_BAD_OPERAND, ASSEMBLE_M68K_ERR_BAD_EA,
+                               "BTST/BCHG/BCLR/BSET source must be a data register or #immediate bit number");
+}
+
+/*******************************************************************
+ Function:      encode_shift
+ Description:   Encodes ASx/LSx/ROXx/ROx, both the register form
+                (#imm,Dn or Dy,Dx, size .B/.W/.L) and the memory form
+                (a single word-sized alterable memory operand, shift
+                count always 1 -- detected by the absence of a comma).
+ Parameters:    context = the assembly context
+                type = 0=AS, 1=LS, 2=ROX, 3=RO
+                dir = 0=right, 1=left
+                size = the parsed .B/.W/.L size suffix (register form
+                       only; the memory form is always word-sized)
+                text/length = the operand text following the mnemonic
+ Returns:       NULL if successful, otherwise a static error block
+ ******************************************************************/
+static _kernel_oserror *encode_shift(assemble_context_t *context, uint32_t type, uint32_t dir,
+                                      m68k_size_t size, const uint8_t *text, size_t length)
+{
+    size_t pos = 0;
+    m68k_operand_t first, second;
+    int has_comma;
+    _kernel_oserror *error;
+
+    pos += assemble_skip_spaces(text + pos, length - pos);
+    error = parse_m68k_operand(context, text, length, &pos, &first);
+    if (error != NULL)
+    {
+        return error;
+    }
+    pos += assemble_skip_spaces(text + pos, length - pos);
+    has_comma = (pos < length && text[pos] == ',');
+
+    if (!has_comma)
+    {
+        uint16_t dst_ea, dst_ext[2];
+        unsigned char dst_ext_count;
+
+        error = check_trailing(text, length, pos);
+        if (error != NULL)
+        {
+            return error;
+        }
+        if (size != M68K_SIZE_NONE && size != M68K_SIZE_W)
+        {
+            return assemble_set_error(ASSEMBLE_CPU_M68K, ASSEMBLE_ERROR_TYPE_SYNTAX, ASSEMBLE_M68K_ERR_BAD_SIZE,
+                                       "Memory shift/rotate is always word-sized");
+        }
+
+        error = m68k_encode_ea(context, &first, M68K_SIZE_W, M68K_EAM_MEMORY_ALTERABLE, 0,
+                                &dst_ea, dst_ext, &dst_ext_count);
+        if (error != NULL)
+        {
+            return error;
+        }
+        error = assemble_emit_word_be(context, ASSEMBLE_CPU_M68K,
+                                       (uint16_t) (0xE000u | (type << 9) | (dir << 8) | 0xC0u | dst_ea));
+        if (error != NULL)
+        {
+            return error;
+        }
+        return emit_ext_words(context, dst_ext, dst_ext_count);
+    }
+
+    if (size == M68K_SIZE_NONE)
+    {
+        return assemble_set_error(ASSEMBLE_CPU_M68K, ASSEMBLE_ERROR_TYPE_SYNTAX, ASSEMBLE_M68K_ERR_BAD_SIZE,
+                                   "Requires a .B/.W/.L size suffix");
+    }
+
+    pos += 1;
+    pos += assemble_skip_spaces(text + pos, length - pos);
+    error = parse_m68k_operand(context, text, length, &pos, &second);
+    if (error != NULL)
+    {
+        return error;
+    }
+    error = check_trailing(text, length, pos);
+    if (error != NULL)
+    {
+        return error;
+    }
+
+    if (second.mode != M68K_EA_DN)
+    {
+        return assemble_set_error(ASSEMBLE_CPU_M68K, ASSEMBLE_ERROR_TYPE_BAD_OPERAND, ASSEMBLE_M68K_ERR_EA_NOT_ALLOWED,
+                                   "Shift/rotate destination must be a data register");
+    }
+
+    if (first.mode == M68K_EA_OTHER && first.reg == M68K_SUB_IMMEDIATE)
+    {
+        int32_t count = first.value;
+        uint16_t ddd;
+
+        if (count < 1 || count > 8)
+        {
+            return assemble_set_error(ASSEMBLE_CPU_M68K, ASSEMBLE_ERROR_TYPE_RANGE, ASSEMBLE_M68K_ERR_IMMEDIATE_RANGE,
+                                       "Shift/rotate count out of range 1..8");
+        }
+        ddd = (uint16_t) ((count == 8) ? 0 : count);
+        return assemble_emit_word_be(context, ASSEMBLE_CPU_M68K,
+                                      (uint16_t) (0xE000u | (ddd << 9) | (dir << 8) | (m68k_std_size_bits(size) << 6) |
+                                                  (type << 3) | second.reg));
+    }
+
+    if (first.mode == M68K_EA_DN)
+    {
+        return assemble_emit_word_be(context, ASSEMBLE_CPU_M68K,
+                                      (uint16_t) (0xE000u | (((uint32_t) first.reg) << 9) | (dir << 8) |
+                                                  (m68k_std_size_bits(size) << 6) | 0x20u | (type << 3) | second.reg));
+    }
+
+    return assemble_set_error(ASSEMBLE_CPU_M68K, ASSEMBLE_ERROR_TYPE_BAD_OPERAND, ASSEMBLE_M68K_ERR_BAD_EA,
+                               "Shift/rotate count must be a data register or #immediate");
+}
+
 static _kernel_oserror *dispatch_family(assemble_context_t *context, const m68k_mnemonic_entry_t *entry,
                                          m68k_size_t size, const uint8_t *text, size_t length)
 {
@@ -2172,6 +2389,12 @@ static _kernel_oserror *dispatch_family(assemble_context_t *context, const m68k_
 
         case FAM_LOGIC:
             return encode_logic(context, (int) entry->param1, entry->param2, size, text, length);
+
+        case FAM_BIT_OP:
+            return encode_bit_op(context, (int) entry->param1, text, length);
+
+        case FAM_SHIFT:
+            return encode_shift(context, entry->param1, entry->param2, size, text, length);
 
         default:
             break;

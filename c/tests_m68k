@@ -561,6 +561,45 @@ static const char lines_andi_token_raw[] = { (char) 0x80, 'I', '.', 'W', ' ', '#
 static const char *const lines_andi_token[] = { lines_andi_token_raw, NULL };
 static const uint8_t     bytes_andi_token[] = { 0x02, 0x40, 0x00, 0x01 };
 
+/* ---- Bit ops and shifts/rotates (stage 4) --------------------------
+   Hand-derived from the real MC68000 opcode map. */
+
+static const char *const lines_btst_dyn[]  = { "BTST D1,D0", NULL };
+static const uint8_t     bytes_btst_dyn[]  = { 0x03, 0x00 };
+
+static const char *const lines_btst_static[] = { "BTST #3,D0", NULL };
+static const uint8_t     bytes_btst_static[] = { 0x08, 0x00, 0x00, 0x03 };
+
+static const char *const lines_bset_static[] = { "BSET #7,(A0)", NULL };
+static const uint8_t     bytes_bset_static[] = { 0x08, 0xD0, 0x00, 0x07 };
+
+static const char *const lines_bclr_dyn[]  = { "BCLR D2,D3", NULL };
+static const uint8_t     bytes_bclr_dyn[]  = { 0x05, 0x83 };
+
+static const char *const lines_bchg_static[] = { "BCHG #1,D0", NULL };
+static const uint8_t     bytes_bchg_static[] = { 0x08, 0x40, 0x00, 0x01 };
+
+static const char *const lines_asl_imm[]   = { "ASL.W #1,D0", NULL };
+static const uint8_t     bytes_asl_imm[]   = { 0xE3, 0x40 };
+
+static const char *const lines_asr_reg[]   = { "ASR.L D1,D0", NULL };
+static const uint8_t     bytes_asr_reg[]   = { 0xE2, 0xA0 };
+
+static const char *const lines_lsl_eight[] = { "LSL.B #8,D0", NULL };
+static const uint8_t     bytes_lsl_eight[] = { 0xE1, 0x08 };
+
+static const char *const lines_lsr_mem[]   = { "LSR.W (A0)", NULL };
+static const uint8_t     bytes_lsr_mem[]   = { 0xE2, 0xD0 };
+
+static const char *const lines_roxl_reg[]  = { "ROXL.W D0,D1", NULL };
+static const uint8_t     bytes_roxl_reg[]  = { 0xE1, 0x71 };
+
+static const char *const lines_ror_imm[]   = { "ROR.W #4,D0", NULL };
+static const uint8_t     bytes_ror_imm[]   = { 0xE8, 0x58 };
+
+static const char *const lines_roxr_mem[]  = { "ROXR (A0)", NULL };
+static const uint8_t     bytes_roxr_mem[]  = { 0xE4, 0xD0 };
+
 /* ---- Error cases --------------------------------------------------- */
 
 static const char *const lines_err_bad_mnemonic[]  = { "FOOBAR", NULL };
@@ -583,6 +622,12 @@ static const char *const lines_err_chk_size[]      = { "CHK.L D0,D1", NULL };
 static const char *const lines_err_eor_mem_src[]   = { "EOR.W (A0),D0", NULL };
 static const char *const lines_err_ori_sr_size[]   = { "ORI.B #1,SR", NULL };
 static const char *const lines_err_and_an_dst[]    = { "AND.L D0,A0", NULL };
+static const char *const lines_err_btst_range_dn[] = { "BTST #40,D0", NULL };
+static const char *const lines_err_bset_range_mem[]= { "BSET #8,(A0)", NULL };
+static const char *const lines_err_shift_range[]   = { "ASL.W #9,D0", NULL };
+static const char *const lines_err_shift_dn_alone[]= { "ASL D0", NULL };
+static const char *const lines_err_shift_mem_size[]= { "LSR.B (A0)", NULL };
+static const char *const lines_err_btst_src[]      = { "BTST (A0),D0", NULL };
 
 static const test_case_t tests[] = {
     { "NOP",                                lines_nop,               bytes_nop,               sizeof(bytes_nop),               0 },
@@ -655,6 +700,19 @@ static const test_case_t tests[] = {
     { "tokenised NOT",                      lines_not_token,         bytes_not_token,         sizeof(bytes_not_token),         0 },
     { "tokenised AND, ANDI continuation",   lines_andi_token,        bytes_andi_token,        sizeof(bytes_andi_token),        0 },
 
+    { "BTST dynamic (register bit number)", lines_btst_dyn,          bytes_btst_dyn,          sizeof(bytes_btst_dyn),          0 },
+    { "BTST static (immediate bit number)", lines_btst_static,       bytes_btst_static,       sizeof(bytes_btst_static),       0 },
+    { "BSET static, memory destination",    lines_bset_static,       bytes_bset_static,       sizeof(bytes_bset_static),       0 },
+    { "BCLR dynamic",                       lines_bclr_dyn,          bytes_bclr_dyn,          sizeof(bytes_bclr_dyn),          0 },
+    { "BCHG static",                        lines_bchg_static,       bytes_bchg_static,       sizeof(bytes_bchg_static),       0 },
+    { "ASL immediate count",                lines_asl_imm,           bytes_asl_imm,           sizeof(bytes_asl_imm),           0 },
+    { "ASR register count",                 lines_asr_reg,           bytes_asr_reg,           sizeof(bytes_asr_reg),           0 },
+    { "LSL count 8 (ddd field wraps to 0)", lines_lsl_eight,         bytes_lsl_eight,         sizeof(bytes_lsl_eight),         0 },
+    { "LSR memory form",                    lines_lsr_mem,           bytes_lsr_mem,           sizeof(bytes_lsr_mem),           0 },
+    { "ROXL register count",                lines_roxl_reg,          bytes_roxl_reg,          sizeof(bytes_roxl_reg),          0 },
+    { "ROR immediate count",                lines_ror_imm,           bytes_ror_imm,           sizeof(bytes_ror_imm),           0 },
+    { "ROXR memory form",                   lines_roxr_mem,          bytes_roxr_mem,          sizeof(bytes_roxr_mem),          0 },
+
     { "error: bad mnemonic",                lines_err_bad_mnemonic,  NULL, 0, 1 },
     { "error: MOVE requires a size suffix", lines_err_move_no_size,  NULL, 0, 1 },
     { "error: MOVE bad size suffix",        lines_err_move_bad_size, NULL, 0, 1 },
@@ -674,7 +732,13 @@ static const test_case_t tests[] = {
     { "error: CHK does not support .L",     lines_err_chk_size,      NULL, 0, 1 },
     { "error: EOR memory source",           lines_err_eor_mem_src,   NULL, 0, 1 },
     { "error: ORI to SR must be .W",        lines_err_ori_sr_size,   NULL, 0, 1 },
-    { "error: AND with An destination",     lines_err_and_an_dst,    NULL, 0, 1 }
+    { "error: AND with An destination",     lines_err_and_an_dst,    NULL, 0, 1 },
+    { "error: BTST bit number out of range (Dn)", lines_err_btst_range_dn,  NULL, 0, 1 },
+    { "error: BSET bit number out of range (mem)",lines_err_bset_range_mem, NULL, 0, 1 },
+    { "error: shift count out of range",    lines_err_shift_range,    NULL, 0, 1 },
+    { "error: shift with bare Dn operand",  lines_err_shift_dn_alone, NULL, 0, 1 },
+    { "error: memory shift with .B suffix", lines_err_shift_mem_size, NULL, 0, 1 },
+    { "error: BTST memory source",          lines_err_btst_src,       NULL, 0, 1 }
 };
 
 int run_tests_m68k(void)
