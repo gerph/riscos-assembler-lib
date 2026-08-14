@@ -35,6 +35,30 @@
 
 #include "assemble_x86_64.h"
 
+/* BASIC tokenises whole keywords as single bytes (two bytes, for a
+   handful of BASIC V structured-programming keywords that ran out of
+   single-byte token space), including as prefixes of longer
+   identifiers -- not just the AND/EOR/OR every other backend in this
+   library has to handle. Tokenising every mnemonic this backend
+   defines through riscos-basictokenise (the same audit that found
+   assemble_m68k's DIV/MOVE/EXT/STOP/SWAP gaps) turned up a different,
+   larger set here, because x86-64 has real ANDx/DIVx/ORx/SQRTxx
+   mnemonic families of its own, plus whole-word collisions (CALL,
+   NOT, WAIT) and prefix collisions with BASIC's FN and PI keywords
+   that happen to lead several FPU/SSE mnemonics (FNCLEX/FNINIT/
+   FNOP/FNSAVE/FNSTCW/FNSTENV/FNSTSW; PINSRW). Values confirmed
+   directly against riscos-basictokenise's own token table. */
+#define TOKEN_AND       0x80
+#define TOKEN_DIV       0x81
+#define TOKEN_OR        0x84
+#define TOKEN_FN        0xA4
+#define TOKEN_NOT       0xAC
+#define TOKEN_PI        0xAF
+#define TOKEN_SQR       0xB6
+#define TOKEN_CALL      0xD6
+#define TOKEN_WAIT_PAGE 0xC7
+#define TOKEN_WAIT_SUB  0x96
+
 // Mnemonic-index constants used by find_instruction()/encode() below,
 // unchanged from the original:
 #define CMPPD 0x3C
@@ -1351,6 +1375,79 @@ static int schop_mnemonic(const uint8_t *text, size_t length, size_t *pos_inout)
     }
     *pos_inout = pos + n;
     return b;
+}
+
+/* Wraps schop_mnemonic() to additionally recognise a leading BASIC
+   token byte (see the TOKEN_* constants above). schop_mnemonic()
+   itself can't see these: it scans identifier characters directly
+   from the source via x86_mnem_char(), which rejects any byte >=
+   0x80 outright, so a token byte would otherwise abort the scan at
+   zero length before the binary search ever runs -- unlike the other
+   backends in this library, which build a plain uppercase mnemonic
+   string first and can substitute the token's expansion into that
+   buffer directly.
+
+   When 'text[pos]' is a recognised token, its ASCII expansion is
+   copied into a small local buffer together with however many
+   further raw identifier bytes immediately follow it in the real
+   source (exactly the bytes schop_mnemonic() would itself have
+   scanned as the identifier's continuation, eg the "I" in a
+   tokenised ANDI); the lookup runs against that local buffer. Only
+   on a successful match is '*pos_inout' advanced -- by the number of
+   *source* bytes consumed (the token plus its continuation), not the
+   expanded buffer's length -- so the caller carries on parsing
+   operands from the real line. A failed lookup leaves '*pos_inout'
+   untouched and falls through to try schop_mnemonic() on the
+   unmodified source, matching normal "not a token" behaviour. */
+static int schop_mnemonic_tokenised(const uint8_t *text, size_t length, size_t *pos_inout)
+{
+    static const struct { uint8_t byte1, byte2; const char *expansion; } tokens[] = {
+        { TOKEN_AND,       0,              "AND"  },
+        { TOKEN_DIV,       0,              "DIV"  },
+        { TOKEN_OR,        0,              "OR"   },
+        { TOKEN_FN,        0,              "FN"   },
+        { TOKEN_NOT,       0,              "NOT"  },
+        { TOKEN_PI,        0,              "PI"   },
+        { TOKEN_SQR,       0,              "SQR"  },
+        { TOKEN_CALL,      0,              "CALL" },
+        { TOKEN_WAIT_PAGE, TOKEN_WAIT_SUB, "WAIT" }
+    };
+    size_t pos = *pos_inout;
+    size_t i;
+
+    if (pos < length)
+    {
+        for (i = 0; i < sizeof(tokens) / sizeof(tokens[0]); i++)
+        {
+            size_t token_len = tokens[i].byte2 ? 2 : 1;
+
+            if (text[pos] == tokens[i].byte1 &&
+                (token_len == 1 || (pos + 1 < length && text[pos + 1] == tokens[i].byte2)))
+            {
+                char expanded[16];
+                size_t explen = strlen(tokens[i].expansion);
+                size_t extra = 0;
+                size_t local_pos = 0;
+                int result;
+
+                memcpy(expanded, tokens[i].expansion, explen);
+                while (pos + token_len + extra < length &&
+                       x86_mnem_char(text[pos + token_len + extra]) &&
+                       explen + extra < sizeof(expanded) - 1)
+                {
+                    expanded[explen + extra] = (char) text[pos + token_len + extra];
+                    extra += 1;
+                }
+                result = schop_mnemonic((const uint8_t *) expanded, explen + extra, &local_pos);
+                if (result != -1)
+                {
+                    *pos_inout = pos + token_len + extra;
+                }
+                return result;
+            }
+        }
+    }
+    return schop_mnemonic(text, length, pos_inout);
 }
 
 /* Binary search of the (sorted) instructions[] table for the packed
@@ -2772,7 +2869,7 @@ _kernel_oserror *assemble_x86_64_line(assemble_context_t *context,
         return NULL; /* label-only, or blank, line */
     }
 
-    mnemonic = schop_mnemonic(line, line_length, &pos);
+    mnemonic = schop_mnemonic_tokenised(line, line_length, &pos);
 
     if (mnemonic == OPT)
     {

@@ -420,6 +420,70 @@ static const uint8_t     bytes_rel[] = { 0x48, 0x8B, 0x05, 0xF9, 0xFF, 0xFF, 0xF
 static const char *const lines_addsd[] = { "ADDSD XMM0,XMM1", NULL };
 static const uint8_t     bytes_addsd[] = { 0xF2, 0x0F, 0x58, 0xC1 };
 
+/* BASIC tokenises whole keywords as single (or, for a handful of
+   BASIC V structured-programming keywords that ran out of single-byte
+   token space, two) bytes, including as prefixes of longer
+   identifiers -- not just the AND/EOR/OR every other backend in this
+   library has to handle. Tokenising every mnemonic this backend
+   defines through riscos-basictokenise (the same audit that found
+   assemble_m68k's DIV/MOVE/EXT/STOP/SWAP gaps) found a larger set
+   here: real ANDx/DIVx/ORx/SQRTxx mnemonic families of its own, plus
+   whole-word collisions (AND, DIV, NOT, OR, CALL, WAIT) and prefix
+   collisions with BASIC's FN and PI keywords that happen to lead
+   several FPU/SSE mnemonics (FNINIT etc; PINSRW). Unlike every other
+   backend, x86-64 has no separate "read mnemonic into an uppercase
+   buffer" step to hook token substitution into -- schop_mnemonic()
+   binary-searches directly against the raw source bytes -- so
+   schop_mnemonic_tokenised() (assemble_x86_64.c) instead recognises a
+   leading token byte, expands it into a small local buffer alongside
+   whatever raw identifier bytes follow it in the real source, and
+   looks the result up there, advancing the real source position by
+   however many source bytes (not expanded-buffer bytes) the token and
+   its continuation occupied. */
+static const char *const lines_and[]    = { "AND RAX,RBX", NULL };
+static const uint8_t     bytes_and[]    = { 0x48, 0x21, 0xD8 };
+static const char lines_and_token_raw[] = { (char) 0x80, ' ', 'R', 'A', 'X', ',', 'R', 'B', 'X', '\0' };
+static const char *const lines_and_token[] = { lines_and_token_raw, NULL };
+
+static const char *const lines_or[]    = { "OR RAX,RBX", NULL };
+static const uint8_t     bytes_or[]    = { 0x48, 0x09, 0xD8 };
+static const char lines_or_token_raw[] = { (char) 0x84, ' ', 'R', 'A', 'X', ',', 'R', 'B', 'X', '\0' };
+static const char *const lines_or_token[] = { lines_or_token_raw, NULL };
+
+static const char *const lines_div[]    = { "DIV RBX", NULL };
+static const uint8_t     bytes_div[]    = { 0x48, 0xF7, 0xF3 };
+static const char lines_div_token_raw[] = { (char) 0x81, ' ', 'R', 'B', 'X', '\0' };
+static const char *const lines_div_token[] = { lines_div_token_raw, NULL };
+
+static const char *const lines_not[]    = { "NOT RAX", NULL };
+static const uint8_t     bytes_not[]    = { 0x48, 0xF7, 0xD0 };
+static const char lines_not_token_raw[] = { (char) 0xAC, ' ', 'R', 'A', 'X', '\0' };
+static const char *const lines_not_token[] = { lines_not_token_raw, NULL };
+
+static const char *const lines_wait[]    = { "WAIT", NULL };
+static const uint8_t     bytes_wait[]    = { 0x9B };
+static const char lines_wait_token_raw[] = { (char) 0xC7, (char) 0x96, '\0' };
+static const char *const lines_wait_token[] = { lines_wait_token_raw, NULL };
+
+static const char *const lines_fninit[]    = { "FNINIT", NULL };
+static const uint8_t     bytes_fninit[]    = { 0xDB, 0xE3 };
+static const char lines_fninit_token_raw[] = { (char) 0xA4, 'I', 'N', 'I', 'T', '\0' };
+static const char *const lines_fninit_token[] = { lines_fninit_token_raw, NULL };
+
+static const char *const lines_call[]    = { ".here", "NOP", "CALL here", NULL };
+static const uint8_t     bytes_call[]    = { 0x90, 0xE8, 0xFA, 0xFF, 0xFF, 0xFF };
+static const char lines_call_token_raw[] = { (char) 0xD6, ' ', 'h', 'e', 'r', 'e', '\0' };
+static const char *const lines_call_token[] = { ".here", "NOP", lines_call_token_raw, NULL };
+
+/* SQR/PI prefix collisions: SQRTPD/SQRTPS/SQRTSD/SQRTSS and PINSRW
+   also tokenise (SQR -> B6, PI -> AF), but exercising the encoder
+   itself for either isn't needed to prove the tokeniser hook works --
+   the AND/OR/DIV/NOT/WAIT/FNINIT/CALL cases above already cover a
+   whole-word token, a prefix token with ASCII continuation, and the
+   two-byte WAIT token; schop_mnemonic_tokenised() treats every table
+   entry identically regardless of which mnemonic family it expands
+   into. */
+
 static const char *const lines_err_bad_mnemonic[] = { "FROB RAX,RBX", NULL };
 static const char *const lines_err_size_mismatch[] = { "MOV RAX,EBX", NULL };
 static const char *const lines_err_size_needed[]   = { "INC [RBX]", NULL };
@@ -454,6 +518,21 @@ static const test_case_t tests[] = {
     { "MOV RAX,[RBX+RCX*4] (SIB)",          lines_sib,          bytes_sib,          sizeof(bytes_sib),          0 },
     { "MOV RAX,[REL here] (RIP-relative)",  lines_rel,          bytes_rel,          sizeof(bytes_rel),          0 },
     { "ADDSD XMM0,XMM1 (SSE)",              lines_addsd,        bytes_addsd,        sizeof(bytes_addsd),        0 },
+
+    { "AND RAX,RBX",                        lines_and,          bytes_and,          sizeof(bytes_and),          0 },
+    { "tokenised AND",                      lines_and_token,    bytes_and,          sizeof(bytes_and),          0 },
+    { "OR RAX,RBX",                         lines_or,           bytes_or,           sizeof(bytes_or),           0 },
+    { "tokenised OR",                       lines_or_token,     bytes_or,           sizeof(bytes_or),           0 },
+    { "DIV RBX",                            lines_div,          bytes_div,          sizeof(bytes_div),          0 },
+    { "tokenised DIV",                      lines_div_token,    bytes_div,          sizeof(bytes_div),          0 },
+    { "NOT RAX",                            lines_not,          bytes_not,          sizeof(bytes_not),          0 },
+    { "tokenised NOT",                      lines_not_token,    bytes_not,          sizeof(bytes_not),          0 },
+    { "WAIT",                               lines_wait,         bytes_wait,         sizeof(bytes_wait),         0 },
+    { "tokenised WAIT (two-byte token)",    lines_wait_token,   bytes_wait,         sizeof(bytes_wait),         0 },
+    { "FNINIT",                             lines_fninit,       bytes_fninit,       sizeof(bytes_fninit),       0 },
+    { "tokenised FN, FNINIT continuation",  lines_fninit_token, bytes_fninit,       sizeof(bytes_fninit),       0 },
+    { "CALL label (near, E8 form)",         lines_call,         bytes_call,         sizeof(bytes_call),         0 },
+    { "tokenised CALL",                     lines_call_token,   bytes_call,         sizeof(bytes_call),         0 },
 
     { "error: bad mnemonic",                lines_err_bad_mnemonic,  NULL, 0, 1 },
     { "error: size mismatch",               lines_err_size_mismatch, NULL, 0, 1 },
