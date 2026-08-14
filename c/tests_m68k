@@ -667,6 +667,66 @@ static const uint8_t     bytes_illegal[] = { 0x4A, 0xFC };
 static const char *const lines_trapv[]   = { "TRAPV", NULL };
 static const uint8_t     bytes_trapv[]   = { 0x4E, 0x76 };
 
+/* ---- Remaining data movement (stage 6) ------------------------------
+   Hand-derived from the real MC68000 opcode map. */
+
+static const char *const lines_move_to_sr[]   = { "MOVE.W (A0),SR", NULL };
+static const uint8_t     bytes_move_to_sr[]   = { 0x46, 0xD0 };
+
+static const char *const lines_move_from_sr[] = { "MOVE SR,D0", NULL };
+static const uint8_t     bytes_move_from_sr[] = { 0x40, 0xC0 };
+
+static const char *const lines_move_to_ccr[]  = { "MOVE.B (A0),CCR", NULL };
+static const uint8_t     bytes_move_to_ccr[]  = { 0x44, 0xD0 };
+
+static const char *const lines_move_an_usp[]  = { "MOVE A0,USP", NULL };
+static const uint8_t     bytes_move_an_usp[]  = { 0x4E, 0x60 };
+
+static const char *const lines_move_usp_an[]  = { "MOVE USP,A1", NULL };
+static const uint8_t     bytes_move_usp_an[]  = { 0x4E, 0x69 };
+
+static const char *const lines_lea_pc[] = { ".table", "DCW &1234", "LEA table(PC),A0", NULL };
+static const uint8_t     bytes_lea_pc[] = { 0x12, 0x34, 0x41, 0xFA, 0xFF, 0xFC };
+
+static const char *const lines_lea_ind[] = { "LEA (A0),A1", NULL };
+static const uint8_t     bytes_lea_ind[] = { 0x43, 0xD0 };
+
+static const char *const lines_pea[]    = { "PEA (A0)", NULL };
+static const uint8_t     bytes_pea[]    = { 0x48, 0x50 };
+
+static const char *const lines_exg_dd[] = { "EXG D0,D1", NULL };
+static const uint8_t     bytes_exg_dd[] = { 0xC1, 0x41 };
+
+static const char *const lines_exg_aa[] = { "EXG A0,A1", NULL };
+static const uint8_t     bytes_exg_aa[] = { 0xC1, 0x49 };
+
+static const char *const lines_exg_da[] = { "EXG D0,A1", NULL };
+static const uint8_t     bytes_exg_da[] = { 0xC1, 0x89 };
+
+static const char *const lines_swap[]   = { "SWAP D0", NULL };
+static const uint8_t     bytes_swap[]   = { 0x48, 0x40 };
+
+static const char *const lines_ext_w[]  = { "EXT.W D0", NULL };
+static const uint8_t     bytes_ext_w[]  = { 0x48, 0x80 };
+
+static const char *const lines_ext_l[]  = { "EXT.L D1", NULL };
+static const uint8_t     bytes_ext_l[]  = { 0x48, 0xC1 };
+
+static const char *const lines_tas[]    = { "TAS D0", NULL };
+static const uint8_t     bytes_tas[]    = { 0x4A, 0xC0 };
+
+static const char *const lines_movem_store[] = { "MOVEM.L D0-D3/A0-A2,-(SP)", NULL };
+static const uint8_t     bytes_movem_store[] = { 0x48, 0xE7, 0xF0, 0xE0 };
+
+static const char *const lines_movem_load[]  = { "MOVEM.W (A0),D0-D1", NULL };
+static const uint8_t     bytes_movem_load[]  = { 0x4C, 0x90, 0x00, 0x03 };
+
+static const char *const lines_movep_store[] = { "MOVEP.W D0,4(A1)", NULL };
+static const uint8_t     bytes_movep_store[] = { 0x01, 0x89, 0x00, 0x04 };
+
+static const char *const lines_movep_load[]  = { "MOVEP.L 8(A2),D3", NULL };
+static const uint8_t     bytes_movep_load[]  = { 0x07, 0x4A, 0x00, 0x08 };
+
 /* ---- Error cases --------------------------------------------------- */
 
 static const char *const lines_err_bad_mnemonic[]  = { "FOOBAR", NULL };
@@ -702,6 +762,17 @@ static const char *const lines_err_trap_range[]    = { "TRAP #16", NULL };
 static const char *const lines_err_scc_size[]       = { "SEQ.B D0", NULL };
 static const char *const lines_err_jmp_dn[]        = { "JMP D0", NULL };
 static const char *const lines_err_link_dn[]       = { "LINK D0,#0", NULL };
+static const char *const lines_err_move_from_ccr[] = { "MOVE CCR,D0", NULL };
+static const char *const lines_err_movem_size[]    = { "MOVEM.B D0,-(SP)", NULL };
+static const char *const lines_err_movem_range[]   = { "MOVEM.L D0-A2,-(SP)", NULL };
+static const char *const lines_err_movep_dst[]     = { "MOVEP.W D0,D1", NULL };
+static const char *const lines_err_lea_dn[]        = { "LEA D0,A0", NULL };
+static const char *const lines_err_pea_dn[]        = { "PEA D0", NULL };
+static const char *const lines_err_exg_imm[]       = { "EXG D0,#5", NULL };
+static const char *const lines_err_swap_an[]       = { "SWAP A0", NULL };
+static const char *const lines_err_ext_no_size[]   = { "EXT D0", NULL };
+static const char *const lines_err_tas_an[]        = { "TAS A0", NULL };
+static const char *const lines_err_move_usp_src[]  = { "MOVE D0,USP", NULL };
 
 static const test_case_t tests[] = {
     { "NOP",                                lines_nop,               bytes_nop,               sizeof(bytes_nop),               0 },
@@ -807,6 +878,26 @@ static const test_case_t tests[] = {
     { "ILLEGAL",                            lines_illegal,           bytes_illegal,           sizeof(bytes_illegal),           0 },
     { "TRAPV",                              lines_trapv,             bytes_trapv,             sizeof(bytes_trapv),             0 },
 
+    { "MOVE <ea>,SR",                       lines_move_to_sr,        bytes_move_to_sr,        sizeof(bytes_move_to_sr),        0 },
+    { "MOVE SR,<ea>",                       lines_move_from_sr,      bytes_move_from_sr,      sizeof(bytes_move_from_sr),      0 },
+    { "MOVE <ea>,CCR",                      lines_move_to_ccr,       bytes_move_to_ccr,       sizeof(bytes_move_to_ccr),       0 },
+    { "MOVE An,USP",                        lines_move_an_usp,       bytes_move_an_usp,       sizeof(bytes_move_an_usp),       0 },
+    { "MOVE USP,An",                        lines_move_usp_an,       bytes_move_usp_an,       sizeof(bytes_move_usp_an),       0 },
+    { "LEA PC-relative",                    lines_lea_pc,            bytes_lea_pc,            sizeof(bytes_lea_pc),            0 },
+    { "LEA (An),Am",                        lines_lea_ind,           bytes_lea_ind,           sizeof(bytes_lea_ind),           0 },
+    { "PEA",                                lines_pea,               bytes_pea,               sizeof(bytes_pea),               0 },
+    { "EXG Dn,Dn",                          lines_exg_dd,            bytes_exg_dd,            sizeof(bytes_exg_dd),            0 },
+    { "EXG An,An",                          lines_exg_aa,            bytes_exg_aa,            sizeof(bytes_exg_aa),            0 },
+    { "EXG Dn,An",                          lines_exg_da,            bytes_exg_da,            sizeof(bytes_exg_da),            0 },
+    { "SWAP",                               lines_swap,              bytes_swap,              sizeof(bytes_swap),              0 },
+    { "EXT.W",                              lines_ext_w,             bytes_ext_w,             sizeof(bytes_ext_w),             0 },
+    { "EXT.L",                              lines_ext_l,             bytes_ext_l,             sizeof(bytes_ext_l),             0 },
+    { "TAS",                                lines_tas,               bytes_tas,               sizeof(bytes_tas),               0 },
+    { "MOVEM store, predecrement (reversed mask)", lines_movem_store, bytes_movem_store, sizeof(bytes_movem_store), 0 },
+    { "MOVEM load",                         lines_movem_load,        bytes_movem_load,        sizeof(bytes_movem_load),        0 },
+    { "MOVEP store",                        lines_movep_store,       bytes_movep_store,       sizeof(bytes_movep_store),       0 },
+    { "MOVEP load",                         lines_movep_load,        bytes_movep_load,        sizeof(bytes_movep_load),        0 },
+
     { "error: bad mnemonic",                lines_err_bad_mnemonic,  NULL, 0, 1 },
     { "error: MOVE requires a size suffix", lines_err_move_no_size,  NULL, 0, 1 },
     { "error: MOVE bad size suffix",        lines_err_move_bad_size, NULL, 0, 1 },
@@ -839,7 +930,18 @@ static const test_case_t tests[] = {
     { "error: TRAP vector out of range",    lines_err_trap_range,     NULL, 0, 1 },
     { "error: Scc does not support .B",     lines_err_scc_size,       NULL, 0, 1 },
     { "error: JMP to a data register",      lines_err_jmp_dn,         NULL, 0, 1 },
-    { "error: LINK with a data register",   lines_err_link_dn,        NULL, 0, 1 }
+    { "error: LINK with a data register",   lines_err_link_dn,        NULL, 0, 1 },
+    { "error: MOVE from CCR rejected (68010+ only)", lines_err_move_from_ccr, NULL, 0, 1 },
+    { "error: MOVEM does not support .B",   lines_err_movem_size,     NULL, 0, 1 },
+    { "error: MOVEM cross-group range",     lines_err_movem_range,    NULL, 0, 1 },
+    { "error: MOVEP destination not d(An)", lines_err_movep_dst,      NULL, 0, 1 },
+    { "error: LEA with a data register",    lines_err_lea_dn,         NULL, 0, 1 },
+    { "error: PEA with a data register",    lines_err_pea_dn,         NULL, 0, 1 },
+    { "error: EXG with an immediate",       lines_err_exg_imm,        NULL, 0, 1 },
+    { "error: SWAP with an address register", lines_err_swap_an,      NULL, 0, 1 },
+    { "error: EXT requires a size suffix",  lines_err_ext_no_size,    NULL, 0, 1 },
+    { "error: TAS with an address register",lines_err_tas_an,         NULL, 0, 1 },
+    { "error: MOVE An,USP source not An",   lines_err_move_usp_src,   NULL, 0, 1 }
 };
 
 int run_tests_m68k(void)
