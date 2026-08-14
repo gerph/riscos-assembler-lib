@@ -20,9 +20,20 @@
    back to their mnemonic spelling before normal mnemonic lookup
    (the same technique assemble_6809 and assemble_6502 use). RISC-V
    has no EOR mnemonic (it uses XOR), so there is no third token to
-   handle here. */
-#define TOKEN_AND 0x80
-#define TOKEN_OR  0x84
+   handle here.
+
+   CALL is a whole-word BASIC keyword (tokenises to a single byte,
+   D6, confirmed against riscos-basictokenise) and RISC-V's CALL
+   pseudo-instruction collides with it exactly -- found by tokenising
+   every mnemonic in this backend's tables and checking which ones
+   came back non-ASCII, after the same gap was found and fixed in
+   assemble_m68k. Without this, genuine BASIC-tokenised source
+   containing CALL would fail to assemble: the token byte doesn't
+   match A-Z/a-z, so read_mnemonic() would read it as an empty
+   mnemonic. */
+#define TOKEN_AND  0x80
+#define TOKEN_OR   0x84
+#define TOKEN_CALL 0xD6
 
 #define OPC_LOAD     0x03u
 #define OPC_OP_IMM   0x13u
@@ -1100,6 +1111,14 @@ static size_t read_mnemonic(const uint8_t *text, size_t length, char *out)
     {
         out[count++] = 'O';
         out[count++] = 'R';
+        pos = 1;
+    }
+    else if (text[0] == TOKEN_CALL)
+    {
+        out[count++] = 'C';
+        out[count++] = 'A';
+        out[count++] = 'L';
+        out[count++] = 'L';
         pos = 1;
     }
 

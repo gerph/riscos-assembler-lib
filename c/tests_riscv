@@ -360,6 +360,15 @@ static const char lines_andi_token_raw[] = { (char) 0x80, 'I', ' ', 'x', '1', ',
 static const char *const lines_andi_token[] = { lines_andi_token_raw, NULL };
 static const uint8_t     bytes_andi_token[] = { 0x93, 0x70, 0x31, 0x00 };
 
+/* Tokenised CALL: a whole-word BASIC keyword collision found by
+   tokenising every mnemonic in this backend's tables through
+   riscos-basictokenise and checking which came back non-ASCII (the
+   same audit that found assemble_m68k's DIV/MOVE/EXT/STOP/SWAP
+   collisions). Confirmed CALL -> D6, a single byte covering the
+   whole word. */
+static const char lines_call_token_raw[] = { (char) 0xD6, ' ', 'l', 'o', 'o', 'p', '\0' };
+static const char *const lines_call_token[] = { ".loop", "NOP", lines_call_token_raw, NULL };
+
 static const char *const lines_addi[]  = { "ADDI x1,x0,5", NULL };
 static const uint8_t     bytes_addi[]  = { 0x93, 0x00, 0x50, 0x00 };
 
@@ -574,6 +583,7 @@ static const test_case_t tests[] = {
     { "tokenised AND -> AND",           lines_and_token,    bytes_and,          sizeof(bytes_and),          0 },
     { "tokenised OR -> OR",             lines_or_token,     bytes_or,           sizeof(bytes_or),           0 },
     { "tokenised AND + I -> ANDI",      lines_andi_token,   bytes_andi_token,   sizeof(bytes_andi_token),   0 },
+    { "tokenised CALL",                 lines_call_token,   bytes_call,         sizeof(bytes_call),         0 },
     { "I-type ADDI",                    lines_addi,         bytes_addi,         sizeof(bytes_addi),         0 },
     { "I-type ADDI negative",           lines_addi_neg,     bytes_addi_neg,     sizeof(bytes_addi_neg),     0 },
     { "I-type SLTI",                    lines_slti,         bytes_slti,         sizeof(bytes_slti),         0 },
