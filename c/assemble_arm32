@@ -14,6 +14,43 @@
 
 #include "assemble_arm32.h"
 
+/* BASIC tokenises whole keywords as single bytes, including as
+   prefixes of longer identifiers -- read_token() must recognise and
+   expand these back to their ASCII spelling before mnemonic lookup,
+   same technique as assemble_6809/assemble_z80/assemble_riscv/
+   assemble_m68k. This backend had no such handling at all until
+   tokenising every mnemonic in mnemonic_table/fpa_mnemonic_table/
+   thumb_mnemonic_table through riscos-basictokenise (the same audit
+   that found assemble_m68k's DIV/MOVE/EXT/STOP/SWAP gaps) turned up
+   the largest set found in any backend so far: the ordinary AND/EOR/
+   OR (ORR's own initial "OR" collides just like the other backends'
+   ORxxx forms), and -- because the FPA mnemonic table borrows short
+   maths-function names -- a further ten collisions with BASIC's own
+   built-in numeric functions: ABS, ACS (arccos), ASN (arcsin), ATN,
+   COS, EXP, LOG, RND, SIN, TAN. VDUP (NEON "duplicate to every lane")
+   collides with the VDU statement keyword the same way. Every one of
+   these can carry a condition-code (and, where the mnemonic allows
+   it, 'S') suffix after the token, eg a tokenised "ABSEQ" -- the
+   token is still just the ABS/AND/etc portion; match_mnemonic()'s
+   own condition-code parsing handles the rest exactly as if it had
+   been typed out in full, once read_token() has expanded the leading
+   token byte. Values confirmed directly against riscos-basictokenise's
+   own token table. */
+#define TOKEN_AND 0x80
+#define TOKEN_EOR 0x82
+#define TOKEN_OR  0x84
+#define TOKEN_ABS 0x94
+#define TOKEN_ACS 0x95
+#define TOKEN_ASN 0x98
+#define TOKEN_ATN 0x99
+#define TOKEN_COS 0x9B
+#define TOKEN_EXP 0xA1
+#define TOKEN_LOG 0xAB
+#define TOKEN_RND 0xB3
+#define TOKEN_SIN 0xB5
+#define TOKEN_TAN 0xB7
+#define TOKEN_VDU 0xEF
+
 #define COND_AL 0xEu
 #define COND_NV 0xFu
 
@@ -1533,18 +1570,67 @@ static const mnemonic_entry_t mnemonic_table[] = {
 #define NUM_MNEMONICS (sizeof(mnemonic_table) / sizeof(mnemonic_table[0]))
 
 /*******************************************************************
- Function:      read_token
+ Function:      read_token_root3
  Description:   Reads a raw mnemonic token (letters and digits) from
                 'text', upper-cased, into 'out' (which must be at
-                least 16 bytes).
+                least 16 bytes). A leading BASIC token byte (see the
+                TOKEN_* constants above) is expanded to its ASCII
+                spelling first.
+
+                Some callers (the FPA dispatch) locate a mnemonic
+                purely by its first three characters, then reopen
+                'text' at a hardcoded '+3' to parse a suffix that
+                follows the root -- correct only when three logical
+                characters always cost three real source bytes, which
+                token expansion breaks (eg the ABS token is a single
+                real byte producing three logical characters). When
+                'out_root3' is non-NULL, it is set to the number of
+                real source bytes spanned by the first three
+                characters written to 'out', so such a caller can seek
+                to 'pos + *out_root3' instead of assuming 'pos + 3'.
+                Left at 0 if the token has fewer than three
+                characters.
  Parameters:    text/length = source text
                 out = [[out]] the upper-cased token, NUL terminated
+                out_root3 = [[out]] real source bytes spanned by the
+                            first three characters of 'out', or NULL
+                            if the caller doesn't need it
  Returns:       number of source bytes consumed
  ******************************************************************/
-static size_t read_token(const uint8_t *text, size_t length, char *out)
+static size_t read_token_root3(const uint8_t *text, size_t length, char *out, size_t *out_root3)
 {
     size_t pos = 0;
     size_t count = 0;
+    size_t root3 = 0;
+
+    if (length > 0)
+    {
+        static const struct { uint8_t byte; const char *expansion; } tokens[] = {
+            { TOKEN_AND, "AND" }, { TOKEN_EOR, "EOR" }, { TOKEN_OR,  "OR"  },
+            { TOKEN_ABS, "ABS" }, { TOKEN_ACS, "ACS" }, { TOKEN_ASN, "ASN" },
+            { TOKEN_ATN, "ATN" }, { TOKEN_COS, "COS" }, { TOKEN_EXP, "EXP" },
+            { TOKEN_LOG, "LOG" }, { TOKEN_RND, "RND" }, { TOKEN_SIN, "SIN" },
+            { TOKEN_TAN, "TAN" }, { TOKEN_VDU, "VDU" }
+        };
+        size_t i;
+
+        for (i = 0; i < sizeof(tokens) / sizeof(tokens[0]); i++)
+        {
+            if (text[0] == tokens[i].byte)
+            {
+                size_t explen = strlen(tokens[i].expansion);
+
+                memcpy(out, tokens[i].expansion, explen);
+                count = explen;
+                pos = 1;
+                break;
+            }
+        }
+    }
+    if (count >= 3)
+    {
+        root3 = pos;
+    }
 
     while (pos < length && count < 15 &&
            ((text[pos] >= 'A' && text[pos] <= 'Z') || (text[pos] >= 'a' && text[pos] <= 'z') ||
@@ -1553,9 +1639,24 @@ static size_t read_token(const uint8_t *text, size_t length, char *out)
         out[count] = (char) toupper((int) text[pos]);
         count += 1;
         pos += 1;
+        if (root3 == 0 && count >= 3)
+        {
+            root3 = pos;
+        }
     }
     out[count] = '\0';
+    if (out_root3 != NULL)
+    {
+        *out_root3 = root3;
+    }
     return pos;
+}
+
+/* Most callers don't need the root3 byte-offset (see
+   read_token_root3()); this is the plain wrapper for them. */
+static size_t read_token(const uint8_t *text, size_t length, char *out)
+{
+    return read_token_root3(text, length, out, NULL);
 }
 
 /*******************************************************************
@@ -4565,6 +4666,7 @@ _kernel_oserror *assemble_arm32_line(assemble_context_t *context,
     int have_label = 0;
     char mnemonic[16];
     size_t consumed;
+    size_t mnemonic_root3;
     _kernel_oserror *error;
 
     context->bytes_used = 0;
@@ -4610,7 +4712,7 @@ _kernel_oserror *assemble_arm32_line(assemble_context_t *context,
         return NULL;
     }
 
-    consumed = read_token(line + pos, line_length - pos, mnemonic);
+    consumed = read_token_root3(line + pos, line_length - pos, mnemonic, &mnemonic_root3);
     if (consumed == 0 || mnemonic[0] == '\0')
     {
         return error_bad_mnemonic();
@@ -4723,7 +4825,7 @@ _kernel_oserror *assemble_arm32_line(assemble_context_t *context,
         if (fpa_entry != NULL)
         {
             uint32_t instr;
-            size_t opstart = pos + 3;
+            size_t opstart = pos + mnemonic_root3;
 
             if (!(context->opt & ASSEMBLE_ARM32_OPT_FPA))
             {
