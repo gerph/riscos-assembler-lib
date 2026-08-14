@@ -197,6 +197,88 @@ Keep it that way round — a backend header must never include
 
 ## Backend-specific notes
 
+### BASIC token collisions
+
+BASIC tokenises whole keywords as single bytes (rarely two, for a handful of
+BASIC V structured-programming keywords that ran out of single-byte token
+space) — including as *prefixes* of longer identifiers, not just when the
+keyword appears as a complete standalone word. `ANDI`, typed into a BASIC
+program, is stored as the `AND` token byte followed by literal `I`, because
+the tokeniser matches the longest keyword at that position regardless of
+what follows. Every backend's mnemonic reader (`read_mnemonic`/`read_token`,
+whatever it's called per-backend) must recognise these token bytes and
+expand them back to ASCII before mnemonic lookup runs, or genuine
+BASIC-tokenised source containing an affected mnemonic fails to assemble
+outright (the token byte doesn't fall in `A-Z`/`a-z`, so the identifier scan
+reads zero characters and lookup fails).
+
+For years this project only handled `AND`/`EOR`/`OR` (and, once m68k needed
+it, `NOT`) — the obvious arithmetic/logical-operator overlaps. An audit in
+2026-08 tokenised **every** mnemonic each backend actually defines through
+`riscos-basictokenise` and diffed the result against plain ASCII, rather
+than assuming that four-token set was exhaustive. It wasn't: six of the
+seven backends had at least one further collision, and two backends
+(x86-64, ARM32) had *no* token handling at all. If you add a new backend or
+a new mnemonic to an existing one, **run this audit rather than reusing the
+previous backend's token list** — a new instruction set's mnemonics can
+collide with completely different BASIC keywords (FPA borrowed BASIC's own
+maths-function names; x86-64's `CALL`/`WAIT` are whole-word BASIC statement
+keywords no other backend happens to define a mnemonic for).
+
+Practical recipe: write one BASIC line per mnemonic root (`10 <MNEMONIC>`,
+one per line number), `riscos-basictokenise` it, and check whether the first
+non-space byte of each tokenised line is still plain ASCII. Any that come
+back `>= 0x80` are collisions; the token's expansion is whatever prefix
+match the tokeniser found (not necessarily the whole mnemonic — figure out
+which real BASIC keyword it is, eg by testing the keyword alone). Confirmed
+findings, per backend:
+
+- **6502/6809/Z80/RISC-V**: already fully handled (`AND`/`EOR`/`OR`, plus
+  Z80's own `CALL`/`DEFB`/`DEFM`/`DEFW` via `TOKEN_CALL`/`TOKEN_DEF`) —
+  except RISC-V was missing `TOKEN_CALL` for its `CALL` pseudo-instruction,
+  fixed alongside this audit.
+- **m68k**: `AND`/`EOR`/`OR`/`NOT` were handled from the start; `DIV`
+  (hits `DIVU`/`DIVS`), `MOVE` (hits `MOVE` itself plus every `MOVEx`
+  mnemonic — `MOVEA`/`MOVEQ`/`MOVEM`/`MOVEP` and the `MOVE SR/CCR/USP`
+  special forms, all via one token byte), `EXT`, `STOP` and `SWAP` were
+  missing. `SWAP` is the only token anywhere in this library that tokenises
+  as **two** bytes, not one (`C8 94`, an extended-page prefix) — it's a
+  BASIC V structured-programming keyword that ran out of single-byte token
+  space.
+- **x86-64**: had no token handling at all. Found: whole-word `AND`/`DIV`/
+  `OR`/`NOT`/`CALL`, the two-byte `WAIT`, and prefix collisions with
+  BASIC's `FN` and `PI` keywords that lead several real mnemonics
+  (`FNINIT` etc; `PINSRW`) — plus this backend's own `ANDx`/`DIVx`/`ORx`/
+  `SQRTxx` families via the same `AND`/`DIV`/`OR`/`SQR` tokens. This
+  backend's mnemonic reader (`schop_mnemonic`) has no separate
+  "materialise an uppercase buffer first" step the way every other backend
+  does — it binary-searches directly against the raw source bytes for
+  speed, and its character-class test rejects any byte `>= 0x80` outright.
+  Fixed with a wrapper, `schop_mnemonic_tokenised()`, that recognises a
+  leading token byte, expands it plus whatever raw identifier bytes follow
+  it into a small local buffer, looks the result up there, and — only on a
+  match — advances the *real* source position by the number of source
+  bytes consumed (not the expanded buffer's length).
+- **ARM32**: also had no token handling at all, and turned up the largest
+  collision set of any backend: `AND`/`EOR`/`OR` (`ORR`'s own leading `OR`
+  collides just like the other backends' `ORxxx` forms), ten FPA
+  maths-mnemonic collisions with BASIC's own built-in numeric functions
+  (`ABS`/`ACS`/`ASN`/`ATN`/`COS`/`EXP`/`LOG`/`RND`/`SIN`/`TAN`), and NEON
+  `VDUP` colliding with the `VDU` statement keyword. One further wrinkle
+  here: the FPA dispatch locates a mnemonic by its first three characters
+  and then reopens the source at a hardcoded `pos + 3` to parse the
+  mandatory `S`/`D`/`E` precision suffix that follows the root — correct
+  only when three logical characters always cost three real source bytes,
+  which token expansion breaks (the `ABS` token is a single real byte
+  producing three logical characters, so `pos + 3` skipped straight past
+  the precision letter into the operands). Fixed by having the mnemonic
+  reader (`read_token_root3()`) additionally report how many real source
+  bytes the first three logical characters actually spanned, and using
+  that instead of the hardcoded `3` at that one call site. If you add a
+  mnemonic-dispatch path elsewhere that recomputes a source position from
+  a fixed character-count assumption like this, it has the same latent bug
+  for any mnemonic whose root happens to collide with a token.
+
 ### 6502 (`assemble_6502`)
 
 Reverse-engineered from `Basic6502,ffb` (a tokenised BASIC program by John
@@ -942,6 +1024,9 @@ from the start rather than after a wrong first pass.
   `assemble_z80` handle `AND`/`OR`/`EOR`: the token byte is expanded
   back to its ASCII spelling before the normal mnemonic reader runs.
   There's no RV32I `EOR` (it uses `XOR`), so only two tokens need this.
+  `CALL` (the pseudo-instruction) collides too — a whole-word BASIC
+  keyword, found later by the audit described in "BASIC token
+  collisions" above, not caught by the original three-token pass.
 - Loads, stores and `JALR` all share one `rd`/`rs2`, `imm(rs1)` operand
   parser (`FMT_I_MEM`/`FMT_S`), since the "paren offset" syntax and
   12-bit signed range are identical across all of them; only the
@@ -1049,6 +1134,13 @@ addressing-mode/registry/directive conventions above:
   colliding keywords — `NOT` is a new fourth case none of those
   backends needed, since none of them has a bare `NOT` mnemonic
   (`assemble_6809` has `COM`, `assemble_riscv` has `XOR` not `EOR`/`NOT`).
+  A later audit (see "BASIC token collisions" above) found this backend
+  has five *more* collisions the initial pass missed: `DIV` (hits
+  `DIVU`/`DIVS`), `MOVE` (hits `MOVE` itself plus every `MOVEx`
+  mnemonic — `MOVEA`/`MOVEQ`/`MOVEM`/`MOVEP` and the `MOVE SR/CCR/USP`
+  special forms, all via one token byte), `EXT`, `STOP`, and `SWAP`
+  (the only token in this library that's two bytes, not one — a BASIC V
+  structured-programming keyword, `C8 94`).
 - Directive syntax is selectable via `ASSEMBLE_M68K_OPT_NATIVE_DIRECTIVES`
   (bit 4): clear (default) gives the shared `DCB`/`DCW`/`DCD`
   convention (matching 6502/6809/RISC-V); set gives idiomatic 68k
