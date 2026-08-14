@@ -14,6 +14,20 @@
 
 #include "assemble_m68k.h"
 
+/* BASIC tokenises AND/EOR/OR/NOT as single bytes; since ANDI/ANDA,
+   ORI/ORA, EORI/EORA and the bare NOT mnemonic all start with (or
+   are) one of these words, the tokens must be recognised and expanded
+   back to their ASCII spelling before normal mnemonic lookup -- same
+   technique as assemble_6809/assemble_z80/assemble_riscv, with NOT
+   added since none of those backends have a bare NOT mnemonic
+   (assemble_6809 has COM, assemble_riscv has XOR not EOR/NOT). Values
+   confirmed directly against riscos-basictokenise's own token table,
+   not copied from another backend's file. */
+#define TOKEN_AND 0x80
+#define TOKEN_EOR 0x82
+#define TOKEN_OR  0x84
+#define TOKEN_NOT 0xAC
+
 /* ---- Addressing mode model ----------------------------------------
    A parsed operand is kept as a small struct (mode/register/index
    fields/value); extension words are computed later by
@@ -862,7 +876,8 @@ typedef enum m68k_family
     FAM_CMPM,
     FAM_CHK,
     FAM_BCD,         /* ABCD/SBCD, param1: 0=ABCD 1=SBCD */
-    FAM_NBCD
+    FAM_NBCD,
+    FAM_LOGIC        /* AND/OR/EOR/ANDI/ORI/EORI, param1: 0=AND 1=OR 2=EOR, param2 selects force_kind */
 } m68k_family_t;
 
 /* FAM_ADD_SUB/FAM_CMP 'force_kind' values (param2): auto-detect the
@@ -936,7 +951,14 @@ static const m68k_mnemonic_entry_t m68k_mnemonics[] = {
 
     { "ABCD", FAM_BCD, 0, 0, SZ_NONE },
     { "SBCD", FAM_BCD, 1, 0, SZ_NONE },
-    { "NBCD", FAM_NBCD, 0, 0, SZ_NONE }
+    { "NBCD", FAM_NBCD, 0, 0, SZ_NONE },
+
+    { "AND",  FAM_LOGIC, 0, M68K_FORCE_AUTO, SZ_BWL },
+    { "OR",   FAM_LOGIC, 1, M68K_FORCE_AUTO, SZ_BWL },
+    { "EOR",  FAM_LOGIC, 2, M68K_FORCE_AUTO, SZ_BWL },
+    { "ANDI", FAM_LOGIC, 0, M68K_FORCE_I,    SZ_BWL },
+    { "ORI",  FAM_LOGIC, 1, M68K_FORCE_I,    SZ_BWL },
+    { "EORI", FAM_LOGIC, 2, M68K_FORCE_I,    SZ_BWL }
 };
 
 #define NUM_MNEMONICS (sizeof(m68k_mnemonics) / sizeof(m68k_mnemonics[0]))
@@ -965,6 +987,11 @@ static size_t read_mnemonic(const uint8_t *text, size_t length, char *out)
         out[0] = '\0';
         return 0;
     }
+
+    if (text[0] == TOKEN_AND) { out[count++] = 'A'; out[count++] = 'N'; out[count++] = 'D'; pos = 1; }
+    else if (text[0] == TOKEN_EOR) { out[count++] = 'E'; out[count++] = 'O'; out[count++] = 'R'; pos = 1; }
+    else if (text[0] == TOKEN_OR)  { out[count++] = 'O'; out[count++] = 'R';                    pos = 1; }
+    else if (text[0] == TOKEN_NOT) { out[count++] = 'N'; out[count++] = 'O'; out[count++] = 'T'; pos = 1; }
 
     while (pos < length && count < 7 &&
            ((text[pos] >= 'A' && text[pos] <= 'Z') || (text[pos] >= 'a' && text[pos] <= 'z')))
@@ -1867,6 +1894,237 @@ static _kernel_oserror *encode_nbcd(assemble_context_t *context, m68k_size_t siz
     return emit_ext_words(context, dst_ext, dst_ext_count);
 }
 
+/*******************************************************************
+ Function:      peek_keyword
+ Description:   Tests whether 'keyword' (an upper-case ASCII literal)
+                appears at 'pos', case-insensitively, not followed by
+                a further identifier character. Used to recognise the
+                'CCR'/'SR' destination keywords of ANDI/ORI/EORI, which
+                aren't ordinary addressing-mode syntax and so must be
+                checked before falling into parse_m68k_operand().
+ Parameters:    text/length = the source text
+                pos = position to test at
+                keyword = the upper-case ASCII word to test for
+ Returns:       non-zero if 'keyword' matches at 'pos'
+ ******************************************************************/
+static int peek_keyword(const uint8_t *text, size_t length, size_t pos, const char *keyword)
+{
+    size_t klen = strlen(keyword);
+    size_t i;
+
+    if (pos + klen > length)
+    {
+        return 0;
+    }
+    for (i = 0; i < klen; i++)
+    {
+        if (toupper((int) text[pos + i]) != keyword[i])
+        {
+            return 0;
+        }
+    }
+    if (pos + klen < length && assemble_is_ident_char(text[pos + klen]))
+    {
+        return 0;
+    }
+    return 1;
+}
+
+/*******************************************************************
+ Function:      encode_logic
+ Description:   Encodes AND/OR/EOR/ANDI/ORI/EORI, including the
+                ANDI/ORI/EORI #imm,CCR and #imm,SR fixed-opcode forms.
+                Like encode_add_sub(), the plain AND/OR mnemonics
+                auto-detect the ea+Dn->Dn, Dn+ea->ea and ANDI/ORI-
+                shaped immediate-to-memory encodings from the parsed
+                operands; EOR has no ea+Dn->Dn form at all (its
+                register operand is always the source, never a
+                destination read), so it auto-detects only between
+                the Dn-source register form and the EORI-shaped
+                immediate form.
+ Parameters:    context = the assembly context
+                kind = 0 for AND, 1 for OR, 2 for EOR
+                force_kind = M68K_FORCE_AUTO or M68K_FORCE_I (there is
+                             no address-register form for logical ops)
+                size = the parsed .B/.W/.L size suffix
+                text/length = the operand text following the mnemonic
+ Returns:       NULL if successful, otherwise a static error block
+ ******************************************************************/
+static _kernel_oserror *encode_logic(assemble_context_t *context, int kind, uint32_t force_kind,
+                                      m68k_size_t size, const uint8_t *text, size_t length)
+{
+    static const uint16_t base_rw[3]  = { 0xC000u, 0x8000u, 0xB000u };
+    static const uint16_t base_imm[3] = { 0x0200u, 0x0000u, 0x0A00u };
+    static const uint16_t base_ccr[3] = { 0x023Cu, 0x003Cu, 0x0A3Cu };
+    static const uint16_t base_sr[3]  = { 0x027Cu, 0x007Cu, 0x0A7Cu };
+
+    size_t pos = 0;
+    m68k_operand_t src, dst;
+    uint16_t src_ea, dst_ea, src_ext[2], dst_ext[2];
+    unsigned char src_ext_count, dst_ext_count;
+    uint16_t opword;
+    _kernel_oserror *error;
+
+    if (size == M68K_SIZE_NONE)
+    {
+        return assemble_set_error(ASSEMBLE_CPU_M68K, ASSEMBLE_ERROR_TYPE_SYNTAX, ASSEMBLE_M68K_ERR_BAD_SIZE,
+                                   "Requires a .B/.W/.L size suffix");
+    }
+
+    pos += assemble_skip_spaces(text + pos, length - pos);
+    error = parse_m68k_operand(context, text, length, &pos, &src);
+    if (error != NULL)
+    {
+        return error;
+    }
+    pos += assemble_skip_spaces(text + pos, length - pos);
+    if (!(pos < length && text[pos] == ','))
+    {
+        return assemble_set_error(ASSEMBLE_CPU_M68K, ASSEMBLE_ERROR_TYPE_SYNTAX, ASSEMBLE_M68K_ERR_NONE,
+                                   "Expected ','");
+    }
+    pos += 1;
+    pos += assemble_skip_spaces(text + pos, length - pos);
+
+    if (force_kind == M68K_FORCE_I && src.mode == M68K_EA_OTHER && src.reg == M68K_SUB_IMMEDIATE)
+    {
+        if (peek_keyword(text, length, pos, "CCR"))
+        {
+            if (size != M68K_SIZE_B)
+            {
+                return assemble_set_error(ASSEMBLE_CPU_M68K, ASSEMBLE_ERROR_TYPE_SYNTAX, ASSEMBLE_M68K_ERR_BAD_SIZE,
+                                           "ANDI/ORI/EORI to CCR must be .B");
+            }
+            error = check_trailing(text, length, pos + 3);
+            if (error != NULL) { return error; }
+            error = m68k_encode_ea(context, &src, size, M68K_EAM_IMMEDIATE, 0, &src_ea, src_ext, &src_ext_count);
+            if (error != NULL) { return error; }
+            error = assemble_emit_word_be(context, ASSEMBLE_CPU_M68K, base_ccr[kind]);
+            if (error != NULL) { return error; }
+            return emit_ext_words(context, src_ext, src_ext_count);
+        }
+        if (peek_keyword(text, length, pos, "SR"))
+        {
+            if (size != M68K_SIZE_W)
+            {
+                return assemble_set_error(ASSEMBLE_CPU_M68K, ASSEMBLE_ERROR_TYPE_SYNTAX, ASSEMBLE_M68K_ERR_BAD_SIZE,
+                                           "ANDI/ORI/EORI to SR must be .W");
+            }
+            error = check_trailing(text, length, pos + 2);
+            if (error != NULL) { return error; }
+            error = m68k_encode_ea(context, &src, size, M68K_EAM_IMMEDIATE, 0, &src_ea, src_ext, &src_ext_count);
+            if (error != NULL) { return error; }
+            error = assemble_emit_word_be(context, ASSEMBLE_CPU_M68K, base_sr[kind]);
+            if (error != NULL) { return error; }
+            return emit_ext_words(context, src_ext, src_ext_count);
+        }
+    }
+
+    error = parse_m68k_operand(context, text, length, &pos, &dst);
+    if (error != NULL)
+    {
+        return error;
+    }
+    error = check_trailing(text, length, pos);
+    if (error != NULL)
+    {
+        return error;
+    }
+
+    if (force_kind == M68K_FORCE_I)
+    {
+        if (src.mode != M68K_EA_OTHER || src.reg != M68K_SUB_IMMEDIATE)
+        {
+            return assemble_set_error(ASSEMBLE_CPU_M68K, ASSEMBLE_ERROR_TYPE_BAD_OPERAND, ASSEMBLE_M68K_ERR_BAD_EA,
+                                       "ANDI/ORI/EORI requires an immediate source");
+        }
+        error = m68k_encode_ea(context, &src, size, M68K_EAM_IMMEDIATE, 0, &src_ea, src_ext, &src_ext_count);
+        if (error != NULL) { return error; }
+        error = m68k_encode_ea(context, &dst, size, M68K_EAM_DATA_ALTERABLE, (uint32_t) src_ext_count * 2u,
+                                &dst_ea, dst_ext, &dst_ext_count);
+        if (error != NULL) { return error; }
+        opword = (uint16_t) (base_imm[kind] | (m68k_std_size_bits(size) << 6) | dst_ea);
+        error = assemble_emit_word_be(context, ASSEMBLE_CPU_M68K, opword);
+        if (error != NULL) { return error; }
+        error = emit_ext_words(context, src_ext, src_ext_count);
+        if (error != NULL) { return error; }
+        return emit_ext_words(context, dst_ext, dst_ext_count);
+    }
+
+    if (kind == 2)
+    {
+        if (src.mode == M68K_EA_OTHER && src.reg == M68K_SUB_IMMEDIATE)
+        {
+            error = m68k_encode_ea(context, &src, size, M68K_EAM_IMMEDIATE, 0, &src_ea, src_ext, &src_ext_count);
+            if (error != NULL) { return error; }
+            error = m68k_encode_ea(context, &dst, size, M68K_EAM_DATA_ALTERABLE, (uint32_t) src_ext_count * 2u,
+                                    &dst_ea, dst_ext, &dst_ext_count);
+            if (error != NULL) { return error; }
+            opword = (uint16_t) (base_imm[kind] | (m68k_std_size_bits(size) << 6) | dst_ea);
+            error = assemble_emit_word_be(context, ASSEMBLE_CPU_M68K, opword);
+            if (error != NULL) { return error; }
+            error = emit_ext_words(context, src_ext, src_ext_count);
+            if (error != NULL) { return error; }
+            return emit_ext_words(context, dst_ext, dst_ext_count);
+        }
+        if (src.mode != M68K_EA_DN)
+        {
+            return assemble_set_error(ASSEMBLE_CPU_M68K, ASSEMBLE_ERROR_TYPE_BAD_OPERAND,
+                                       ASSEMBLE_M68K_ERR_EA_NOT_ALLOWED, "EOR source must be a data register");
+        }
+        error = m68k_encode_ea(context, &dst, size, M68K_EAM_DATA_ALTERABLE, 0, &dst_ea, dst_ext, &dst_ext_count);
+        if (error != NULL) { return error; }
+        opword = (uint16_t) (base_rw[kind] | (((uint32_t) src.reg) << 9) | ((4u + m68k_std_size_bits(size)) << 6) | dst_ea);
+        error = assemble_emit_word_be(context, ASSEMBLE_CPU_M68K, opword);
+        if (error != NULL) { return error; }
+        return emit_ext_words(context, dst_ext, dst_ext_count);
+    }
+
+    if (dst.mode == M68K_EA_DN)
+    {
+        error = m68k_encode_ea(context, &src, size, M68K_EAM_DATA, 0, &src_ea, src_ext, &src_ext_count);
+        if (error != NULL) { return error; }
+        opword = (uint16_t) (base_rw[kind] | (((uint32_t) dst.reg) << 9) | (m68k_std_size_bits(size) << 6) | src_ea);
+        error = assemble_emit_word_be(context, ASSEMBLE_CPU_M68K, opword);
+        if (error != NULL) { return error; }
+        return emit_ext_words(context, src_ext, src_ext_count);
+    }
+
+    if (src.mode == M68K_EA_OTHER && src.reg == M68K_SUB_IMMEDIATE)
+    {
+        error = m68k_encode_ea(context, &src, size, M68K_EAM_IMMEDIATE, 0, &src_ea, src_ext, &src_ext_count);
+        if (error != NULL) { return error; }
+        error = m68k_encode_ea(context, &dst, size, M68K_EAM_DATA_ALTERABLE, (uint32_t) src_ext_count * 2u,
+                                &dst_ea, dst_ext, &dst_ext_count);
+        if (error != NULL) { return error; }
+        opword = (uint16_t) (base_imm[kind] | (m68k_std_size_bits(size) << 6) | dst_ea);
+        error = assemble_emit_word_be(context, ASSEMBLE_CPU_M68K, opword);
+        if (error != NULL) { return error; }
+        error = emit_ext_words(context, src_ext, src_ext_count);
+        if (error != NULL) { return error; }
+        return emit_ext_words(context, dst_ext, dst_ext_count);
+    }
+
+    if (src.mode != M68K_EA_DN)
+    {
+        return assemble_set_error(ASSEMBLE_CPU_M68K, ASSEMBLE_ERROR_TYPE_BAD_OPERAND, ASSEMBLE_M68K_ERR_EA_NOT_ALLOWED,
+                                   "AND/OR with a memory destination requires a data-register source");
+    }
+
+    error = m68k_encode_ea(context, &dst, size, M68K_EAM_MEMORY_ALTERABLE, 0, &dst_ea, dst_ext, &dst_ext_count);
+    if (error != NULL)
+    {
+        return error;
+    }
+    opword = (uint16_t) (base_rw[kind] | (((uint32_t) src.reg) << 9) | ((4u + m68k_std_size_bits(size)) << 6) | dst_ea);
+    error = assemble_emit_word_be(context, ASSEMBLE_CPU_M68K, opword);
+    if (error != NULL)
+    {
+        return error;
+    }
+    return emit_ext_words(context, dst_ext, dst_ext_count);
+}
+
 static _kernel_oserror *dispatch_family(assemble_context_t *context, const m68k_mnemonic_entry_t *entry,
                                          m68k_size_t size, const uint8_t *text, size_t length)
 {
@@ -1911,6 +2169,9 @@ static _kernel_oserror *dispatch_family(assemble_context_t *context, const m68k_
 
         case FAM_NBCD:
             return encode_nbcd(context, size, text, length);
+
+        case FAM_LOGIC:
+            return encode_logic(context, (int) entry->param1, entry->param2, size, text, length);
 
         default:
             break;

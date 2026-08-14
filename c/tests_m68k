@@ -501,6 +501,66 @@ static const uint8_t     bytes_sbcd[]           = { 0x83, 0x08 };
 static const char *const lines_nbcd[]           = { "NBCD D0", NULL };
 static const uint8_t     bytes_nbcd[]           = { 0x48, 0x00 };
 
+/* ---- Logical family (stage 3) ---------------------------------------
+   Hand-derived from the real MC68000 opcode map, same discipline as
+   the arithmetic family above. */
+
+static const char *const lines_and_ea_dn[]  = { "AND.W D0,D1", NULL };
+static const uint8_t     bytes_and_ea_dn[]  = { 0xC2, 0x40 };
+
+static const char *const lines_and_reverse[] = { "AND.W D1,(A0)", NULL };
+static const uint8_t     bytes_and_reverse[] = { 0xC3, 0x50 };
+
+static const char *const lines_or_ea_dn[]   = { "OR.W D0,D1", NULL };
+static const uint8_t     bytes_or_ea_dn[]   = { 0x82, 0x40 };
+
+static const char *const lines_eor[]        = { "EOR.W D0,D1", NULL };
+static const uint8_t     bytes_eor[]        = { 0xB1, 0x41 };
+
+static const char *const lines_andi[]       = { "ANDI.W #&F0,D0", NULL };
+static const uint8_t     bytes_andi[]       = { 0x02, 0x40, 0x00, 0xF0 };
+
+static const char *const lines_ori[]        = { "ORI.B #&0F,D1", NULL };
+static const uint8_t     bytes_ori[]        = { 0x00, 0x01, 0x00, 0x0F };
+
+static const char *const lines_eori[]       = { "EORI.L #&12345678,D2", NULL };
+static const uint8_t     bytes_eori[]       = { 0x0A, 0x82, 0x12, 0x34, 0x56, 0x78 };
+
+static const char *const lines_andi_ccr[]   = { "ANDI.B #&F0,CCR", NULL };
+static const uint8_t     bytes_andi_ccr[]   = { 0x02, 0x3C, 0x00, 0xF0 };
+
+static const char *const lines_ori_sr[]     = { "ORI.W #&8000,SR", NULL };
+static const uint8_t     bytes_ori_sr[]     = { 0x00, 0x7C, 0x80, 0x00 };
+
+static const char *const lines_eori_ccr[]   = { "EORI.B #&FF,CCR", NULL };
+static const uint8_t     bytes_eori_ccr[]   = { 0x0A, 0x3C, 0x00, 0xFF };
+
+/* Tokenised AND/EOR/OR/NOT -- BASIC tokenises the keyword substring
+   regardless of what follows, so the raw source byte is the token
+   value, not ASCII 'A'/'E'/'O'/'N'. */
+static const char lines_and_token_raw[] = { (char) 0x80, '.', 'W', ' ', 'D', '0', ',', 'D', '1', '\0' };
+static const char *const lines_and_token[] = { lines_and_token_raw, NULL };
+static const uint8_t     bytes_and_token[] = { 0xC2, 0x40 };
+
+static const char lines_eor_token_raw[] = { (char) 0x82, '.', 'W', ' ', 'D', '0', ',', 'D', '1', '\0' };
+static const char *const lines_eor_token[] = { lines_eor_token_raw, NULL };
+static const uint8_t     bytes_eor_token[] = { 0xB1, 0x41 };
+
+static const char lines_or_token_raw[] = { (char) 0x84, '.', 'W', ' ', 'D', '0', ',', 'D', '1', '\0' };
+static const char *const lines_or_token[] = { lines_or_token_raw, NULL };
+static const uint8_t     bytes_or_token[] = { 0x82, 0x40 };
+
+static const char lines_not_token_raw[] = { (char) 0xAC, '.', 'L', ' ', 'D', '0', '\0' };
+static const char *const lines_not_token[] = { lines_not_token_raw, NULL };
+static const uint8_t     bytes_not_token[] = { 0x46, 0x80 };
+
+/* Tokenised AND followed by more letters (ANDI): confirms the mnemonic
+   reader keeps scanning ASCII after the token byte, not just
+   substituting it in isolation. */
+static const char lines_andi_token_raw[] = { (char) 0x80, 'I', '.', 'W', ' ', '#', '1', ',', 'D', '0', '\0' };
+static const char *const lines_andi_token[] = { lines_andi_token_raw, NULL };
+static const uint8_t     bytes_andi_token[] = { 0x02, 0x40, 0x00, 0x01 };
+
 /* ---- Error cases --------------------------------------------------- */
 
 static const char *const lines_err_bad_mnemonic[]  = { "FOOBAR", NULL };
@@ -520,6 +580,9 @@ static const char *const lines_err_addx_mismatch[] = { "ADDX.W D0,-(A0)", NULL }
 static const char *const lines_err_cmp_mem_dst[]   = { "CMP.W D0,(A0)", NULL };
 static const char *const lines_err_cmpm_not_inc[]  = { "CMPM.B (A0),(A1)+", NULL };
 static const char *const lines_err_chk_size[]      = { "CHK.L D0,D1", NULL };
+static const char *const lines_err_eor_mem_src[]   = { "EOR.W (A0),D0", NULL };
+static const char *const lines_err_ori_sr_size[]   = { "ORI.B #1,SR", NULL };
+static const char *const lines_err_and_an_dst[]    = { "AND.L D0,A0", NULL };
 
 static const test_case_t tests[] = {
     { "NOP",                                lines_nop,               bytes_nop,               sizeof(bytes_nop),               0 },
@@ -576,6 +639,22 @@ static const test_case_t tests[] = {
     { "SBCD",                               lines_sbcd,              bytes_sbcd,              sizeof(bytes_sbcd),              0 },
     { "NBCD",                               lines_nbcd,              bytes_nbcd,              sizeof(bytes_nbcd),              0 },
 
+    { "AND ea+Dn->Dn",                      lines_and_ea_dn,         bytes_and_ea_dn,         sizeof(bytes_and_ea_dn),         0 },
+    { "AND Dn+ea->ea (reverse)",            lines_and_reverse,       bytes_and_reverse,       sizeof(bytes_and_reverse),       0 },
+    { "OR ea+Dn->Dn",                       lines_or_ea_dn,          bytes_or_ea_dn,          sizeof(bytes_or_ea_dn),          0 },
+    { "EOR Dn,ea",                          lines_eor,               bytes_eor,               sizeof(bytes_eor),               0 },
+    { "ANDI",                               lines_andi,              bytes_andi,              sizeof(bytes_andi),              0 },
+    { "ORI",                                lines_ori,               bytes_ori,               sizeof(bytes_ori),               0 },
+    { "EORI",                               lines_eori,              bytes_eori,              sizeof(bytes_eori),              0 },
+    { "ANDI #imm,CCR",                      lines_andi_ccr,          bytes_andi_ccr,          sizeof(bytes_andi_ccr),          0 },
+    { "ORI #imm,SR",                        lines_ori_sr,            bytes_ori_sr,            sizeof(bytes_ori_sr),            0 },
+    { "EORI #imm,CCR",                      lines_eori_ccr,          bytes_eori_ccr,          sizeof(bytes_eori_ccr),          0 },
+    { "tokenised AND",                      lines_and_token,         bytes_and_token,         sizeof(bytes_and_token),         0 },
+    { "tokenised EOR",                      lines_eor_token,         bytes_eor_token,         sizeof(bytes_eor_token),         0 },
+    { "tokenised OR",                       lines_or_token,          bytes_or_token,          sizeof(bytes_or_token),          0 },
+    { "tokenised NOT",                      lines_not_token,         bytes_not_token,         sizeof(bytes_not_token),         0 },
+    { "tokenised AND, ANDI continuation",   lines_andi_token,        bytes_andi_token,        sizeof(bytes_andi_token),        0 },
+
     { "error: bad mnemonic",                lines_err_bad_mnemonic,  NULL, 0, 1 },
     { "error: MOVE requires a size suffix", lines_err_move_no_size,  NULL, 0, 1 },
     { "error: MOVE bad size suffix",        lines_err_move_bad_size, NULL, 0, 1 },
@@ -592,7 +671,10 @@ static const test_case_t tests[] = {
     { "error: ADDX operand shape mismatch", lines_err_addx_mismatch, NULL, 0, 1 },
     { "error: CMP memory destination",      lines_err_cmp_mem_dst,   NULL, 0, 1 },
     { "error: CMPM requires postincrement", lines_err_cmpm_not_inc,  NULL, 0, 1 },
-    { "error: CHK does not support .L",     lines_err_chk_size,      NULL, 0, 1 }
+    { "error: CHK does not support .L",     lines_err_chk_size,      NULL, 0, 1 },
+    { "error: EOR memory source",           lines_err_eor_mem_src,   NULL, 0, 1 },
+    { "error: ORI to SR must be .W",        lines_err_ori_sr_size,   NULL, 0, 1 },
+    { "error: AND with An destination",     lines_err_and_an_dst,    NULL, 0, 1 }
 };
 
 int run_tests_m68k(void)
