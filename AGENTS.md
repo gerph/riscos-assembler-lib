@@ -18,7 +18,7 @@ The project builds as three separate pieces, each with its own Makefile:
 | `MakefileTests,fe1`   | `command` (`aif`) | `AssembleTest` — `c/tests` calls each backend's `run_tests_<name>()` in sequence and returns the total failure count as the exit code |
 | `Makefile,fe1`        | `command` (`aif`) | `Assemble` — a real `*Assemble -cpu <cpu> -input <source> -output <binary>` command-line tool, linking against the built `libAssemble` |
 
-Six backends exist today:
+Seven backends exist today:
 
 | Backend      | Files                                    | Instruction set(s)              |
 |--------------|-------------------------------------------|----------------------------------|
@@ -28,6 +28,7 @@ Six backends exist today:
 | Z80          | `h/assemble_z80`, `c/assemble_z80`         | Z80, including common undocumented forms |
 | ARM32        | `h/assemble_arm32`, `c/assemble_arm32`     | base ARM (ARMv4-ARMv8 AArch32 subset) + legacy FPA + classic VFP scalar + partial NEON/SIMD (dialect via OPT bits, see below) |
 | RISC-V       | `h/assemble_riscv`, `c/assemble_riscv`     | RV32I base integer ISA + Zicsr (single dialect, see below) |
+| m68k         | `h/assemble_m68k`, `c/assemble_m68k`       | Motorola MC68000 base instruction set (single dialect for instructions, one OPT bit for directive syntax, see below) |
 
 Shared infrastructure lives in `h/assemble_common` / `c/assemble_common`.
 A directory of every backend -- for enumeration and by-class/by-name lookup,
@@ -968,6 +969,100 @@ from the start rather than after a wrong first pass.
   looked up via the same `find_opcode()` used for real mnemonics —
   avoids duplicating each real branch's opcode/funct3 a second time.
 
+### m68k (`assemble_m68k`)
+
+Not ported from a single source the way x86-64/6502/6809 are —
+`m68k/` (github.com/Urethramancer/m68k, MIT-licensed, third-party Go
+implementation, untracked — see "Source material handling" below) was
+read for instruction coverage, addressing-mode encoding
+(`assembler/helpers.go`'s `encodeEA`, the model behind
+`m68k_encode_ea` here) and syntax shape. It covers the full standard
+MC68000 instruction set with no 68010+/68020+/FPU/PMMU extensions,
+matching this backend's own declared scope exactly. Every actual
+opcode bit pattern in this backend was hand-derived from the real
+MC68000 opcode map and cross-checked against known reference
+encodings (`NOP`=`4E71`, `RTS`=`4E75`, and others), not copied from
+that reference project's own code.
+
+Three things the reference project got wrong or left incomplete,
+found by cross-checking its own test suite and docs against each
+other rather than trusting it as a single oracle (the same discipline
+as the x86-64/RISC-V lessons above):
+
+- `MOVE from CCR` (`CCR,<ea>`) is a 68010 addition, not genuine
+  MC68000 — the reference implements it anyway (with its own code
+  comment admitting the discrepancy), but its own `docs/instructions.txt`
+  catalogue omits it while listing `MOVE to CCR` as legitimate. This
+  backend rejects `MOVE from CCR` (`ASSEMBLE_M68K_ERR_NOT_ON_MC68000`)
+  and implements `MOVE to CCR`, `MOVE to/from SR` and `MOVE to/from USP`.
+- `CMPM` is listed in the reference's own instruction catalogue but has
+  no implementation anywhere in its code — its encoding was derived
+  and verified independently, not ported.
+- `ROXL`/`ROXR` have opcode-table entries in the reference but are
+  never actually wired into its mnemonic dispatch (dead table rows) —
+  the opcode bits were trustworthy to reuse, the encoder wiring and
+  test vectors needed deriving fresh.
+
+Design points specific to this backend, beyond the general
+addressing-mode/registry/directive conventions above:
+
+- Real MC68000 opcodes are bit-field encoded from EA/register/size,
+  not one row per mnemonic+mode the way 6809/6502 use — so
+  `m68k_mnemonics[]` carries a `family` tag and a per-family encoder
+  function does the real work, the same shape `assemble_arm32` uses,
+  rather than a flat literal opcode table.
+- `ADD`/`SUB`/`CMP`/`AND`/`OR` auto-detect which real opcode shape
+  their operands require (plain register form, the `ADDA`/`CMPA`-
+  shaped address-register-destination form, or the `ADDI`/`CMPI`-
+  shaped immediate-to-memory form) from the parsed operands'
+  addressing modes — this is *not* the same kind of relaxation
+  `MOVEQ`/`ADDQ`/`SUBQ`'s deliberate non-auto-selection avoids (see
+  `h/assemble_m68k`'s deficiencies comment): only one of those
+  encodings is ever legal for a given combination of addressing
+  modes, so there's no genuine choice being made, unlike shortening
+  `MOVE.L #imm,Dn` to `MOVEQ` based on the immediate's *value*.
+- `Bcc`/`BRA`/`BSR` require an explicit `.S`/`.W` displacement-size
+  suffix (no relaxation, same reasoning as RISC-V's `LI`/`CALL`
+  always emitting their fixed-size form); the displacement is always
+  computed against the address of the extension word that would
+  follow the opcode (`context->address + 2`, plus a `pc_bias` for a
+  second operand's own PC-relative extension), not the opcode's own
+  address, matching real MC68000 timing.
+- `Bcc`/`Scc`/`DBcc` (46 mnemonics: 14 real `Bcc` conditions + `BRA` +
+  `BSR`, 16 `Scc`, 16 `DBcc`) are recognised structurally — a
+  `B`/`S`/`DB` prefix or root plus a condition-code suffix matched
+  against the 16 standard conditions (`CC`/`HS` and `CS`/`LO`
+  accepted as synonyms) — rather than as 46 separate mnemonic-table
+  rows, the same technique `assemble_arm32` uses for its own
+  condition-code suffix mnemonics. This is tried only after an exact
+  `find_mnemonic()` lookup fails, so it can never shadow a real table
+  entry.
+- `MOVEM`'s register-list mask is bit-reversed for a predecrement
+  destination (`m68k_reverse_movem_mask`) — verified algebraically
+  that `predecrement_bit(Rn) = 15 - normal_bit(Rn)` holds for both the
+  `D0`-`D7` and `A0`-`A7` register groups, rather than assumed from a
+  half-remembered convention.
+- `AND`/`OR`/`EOR`/`NOT` collide with BASIC's tokenised keywords
+  (`&80`/`&84`/`&82`/`&AC`, confirmed directly against
+  `riscos-basictokenise`'s own token table), handled the same way
+  `assemble_6809`/`assemble_z80`/`assemble_riscv` handle their own
+  colliding keywords — `NOT` is a new fourth case none of those
+  backends needed, since none of them has a bare `NOT` mnemonic
+  (`assemble_6809` has `COM`, `assemble_riscv` has `XOR` not `EOR`/`NOT`).
+- Directive syntax is selectable via `ASSEMBLE_M68K_OPT_NATIVE_DIRECTIVES`
+  (bit 4): clear (default) gives the shared `DCB`/`DCW`/`DCD`
+  convention (matching 6502/6809/RISC-V); set gives idiomatic 68k
+  `DC.B`/`DC.W`/`DC.L`/`DS.B`/`DS.W`/`DS.L`. `read_mnemonic()` gains a
+  special case scoped to just the `DC`/`DS` roots to consume a
+  trailing `.`+size-letter as part of the mnemonic token itself —
+  every other mnemonic's size suffix is parsed separately by
+  `parse_size_suffix()`, after the mnemonic root. Unlike the reference
+  project, `DC.B`/`DCB` don't auto-pad odd lengths to an even boundary
+  (matching every other backend's `DCB` convention here) — this
+  matters more on m68k than elsewhere, since an odd-addressed
+  word/long access raises a genuine Address Error exception on real
+  MC68000 hardware.
+
 ## The Assembler module (`module/`)
 
 A separate RISC OS **module** component, `Assembler`, lives in its own
@@ -1031,9 +1126,12 @@ patches and their `Guide,fff` docs), `riscos64-rtrussell-bbcbasic/` (a
 full clone of the BBC BASIC source this port is based on), `armips/`
 (a clone of the armips cross-assembler, whose `Archs/ARM/ThumbOpcodes.cpp`/
 `CThumbInstruction.cpp` were read as ground truth for the classic Thumb
-backend), and `RISCV-RV32I-Assembler` (a teaching RV32I assembler read
+backend), `RISCV-RV32I-Assembler` (a teaching RV32I assembler read
 for instruction coverage and general shape, not syntax — see the
-RISC-V section above). Don't add these to git, and don't treat anything under
+RISC-V section above), and `m68k/` (a third-party Go 68000 assembler/
+disassembler/VM, read for instruction coverage and addressing-mode
+encoding shape, not ported directly — see the m68k section above).
+Don't add these to git, and don't treat anything under
 `/riscos-built/Sources` as canonical (per the global project instructions)
 — if you need to re-examine the 6502/6809 patches, detokenise with
 `riscos-basicdetokenise -i <file>` first (see the `using-bbcbasic` skill).
@@ -1052,11 +1150,11 @@ across the existing backends and worth keeping consistent if you add another:
   same line and assigns the expression's *value*, not the address.
 - `OPT <expr>` is always a no-op that just validates/consumes its
   expression — pass/listing control is the caller's responsibility.
-- Pseudo-ops that emit raw data (`DCB`/`DCW`/`DCD` for 6502/6809/RISC-V,
-  or `DB`/`DW`/`DD`/`DQ`/`EQUB`/`EQUD`/`EQUQ`/`EQUW` for x86-64, which
-  are ordinary table-driven mnemonics there, not special-cased) use the
-  backend's native endianness (little-endian for 6502/x86-64/RISC-V,
-  big-endian for 6809).
+- Pseudo-ops that emit raw data (`DCB`/`DCW`/`DCD` for 6502/6809/RISC-V/
+  m68k, or `DB`/`DW`/`DD`/`DQ`/`EQUB`/`EQUD`/`EQUQ`/`EQUW` for x86-64,
+  which are ordinary table-driven mnemonics there, not special-cased)
+  use the backend's native endianness (little-endian for
+  6502/x86-64/RISC-V, big-endian for 6809/m68k).
 - Every header (`h/assemble_common` and every backend/registry header) has
   a "Known deficiencies"/"Known limitation(s)" comment, placed right after
   the `#include`s and before the main type declarations, stating plainly

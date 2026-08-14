@@ -25,13 +25,14 @@ designed to make that straightforward for a future caller.
 | Z80     | `h.assemble_z80`   | `c.assemble_z80`      | Z80 (including common undocumented forms)     |
 | ARM32   | `h.assemble_arm32` | `c.assemble_arm32`    | Base ARM (ARMv4 through the AArch32 subset of ARMv8) + legacy FPA + classic VFP scalar + partial NEON/SIMD (dialect via `opt` bits, see below) |
 | RISC-V  | `h.assemble_riscv` | `c.assemble_riscv`    | RV32I base integer ISA + Zicsr, plus the standard NOP/MV/LI/J/JR/RET/CALL/branch-vs-zero pseudo-instructions |
+| m68k    | `h.assemble_m68k`  | `c.assemble_m68k`     | Motorola MC68000, base instruction set only (dialect via `opt` bit for directive syntax, see below) |
 
 Shared infrastructure (the assembly context, error reporting, byte/word
 emission helpers) lives in `h.assemble_common` / `c.assemble_common`.
 
 ## Discovering backends at runtime
 
-A caller doesn't need to know the six backends above in advance, or
+A caller doesn't need to know the seven backends above in advance, or
 `#include` each backend's own header directly: `h.assemble_registry` /
 `c.assemble_registry` provide a directory of every backend, so a caller can
 enumerate what's available or look one up by CPU class or by name.
@@ -69,6 +70,7 @@ derived):
 | Z80     | 4  | `DD`/`FD CB`-prefixed bit/rotate/shift on `(IX+d)`/`(IY+d)`, or `LD (IX+d),n` |
 | ARM32   | 4  | any ARM-state instruction word, or Thumb `BL`/`BLX`'s two-halfword pair (also 4 bytes, from one call) |
 | RISC-V  | 8  | the `LI`/`CALL` pseudo-instructions, which always expand to a fixed two-instruction pair |
+| m68k    | 10 | an immediate-family instruction (`ANDI`/`ORI`/`EORI`/`ADDI`/`SUBI`/`CMPI` or `MOVE.L #imm`) combining a `.L` immediate with an absolute-long `(xxxxxxxx).L` destination -- the only base-MC68000 shape with two independent 4-byte extension-word groups on one opcode |
 
 `assemble_find_by_name()` also matches a small table of CLI-style aliases —
 a name that selects a backend plus a preset default OPT value, eg `65c02`,
@@ -426,6 +428,57 @@ instruction when the value happens to fit -- this keeps a line's
 assembled size independent of whether a forward-referenced label has
 been resolved yet, which matters because this library assembles one
 line at a time across multiple passes (see `AGENTS.md`).
+
+### m68k (base MC68000)
+
+Covers the full standard Motorola MC68000 instruction set and all 12
+of its addressing modes -- no 68010/68020/68030/68040/68060
+extensions, no 68881/68882 FPU, no 68851 PMMU. There is a single
+instruction-set dialect (`context->opt` carries no CPU-specific bits
+for the instruction set itself), but one dialect bit controls the
+spelling of the data pseudo-ops:
+
+```c
+#define ASSEMBLE_M68K_OPT_NATIVE_DIRECTIVES (1u << 4)  /* 0x10 */
+```
+
+Clear (the default) selects this library's shared `DCB`/`DCW`/`DCD`
+convention, matching 6502/6809/RISC-V; set selects idiomatic 68k
+`DC.B`/`DC.W`/`DC.L`/`DS.B`/`DS.W`/`DS.L` (`DS.*` reserves zero-filled
+space, with no equivalent in the shared dialect -- 6502/6809/RISC-V's
+`DCB`/`DCW`/`DCD` don't have one either). `EQU` and `OPT` behave
+identically in both dialects.
+
+Branch displacement size (`BRA`/`BSR`/`Bcc`) must always be written
+explicitly as `.S` (8-bit) or `.W` (16-bit); there is no relaxation
+between the two forms, the same reasoning as RISC-V's `LI`/`CALL`
+always emitting their full fixed-size form -- this library assembles
+one line at a time across caller-driven passes, so an instruction
+whose size depends on a forward reference's eventual value has
+nowhere safe to live. `Scc`/`DBcc` are recognised structurally (a
+`B`/`S`/`DB` prefix plus one of the 16 standard condition-code
+suffixes, `CC`/`HS` and `CS`/`LO` accepted as synonyms) rather than as
+separate mnemonic-table rows, checked only after an exact
+mnemonic-table match fails.
+
+`ADD`/`SUB`/`CMP`/`AND`/`OR` automatically produce whichever real
+opcode shape their operands require (the plain register-to-register
+form, the address-register-destination `ADDA`/`CMPA`-shaped form, or
+the immediate-to-memory `ADDI`/`CMPI`-shaped form) -- this is not an
+optional relaxation the way an immediate-value-triggered `MOVEQ`/
+`ADDQ`/`SUBQ` shortening would be (which this backend never does
+automatically; write those explicitly), since only one of those
+encodings is ever legal for a given combination of operand addressing
+modes.
+
+`MOVE from CCR` (`CCR,<ea>`) is a 68010 addition, not genuine MC68000,
+and is deliberately rejected (`ASSEMBLE_M68K_ERR_NOT_ON_MC68000`)
+rather than silently assembled; `MOVE to CCR`, `MOVE to/from SR` and
+`MOVE to/from USP` are all genuine MC68000 and are supported. `AND`/
+`OR`/`EOR`/`NOT` collide with BASIC's own tokenised keywords (bytes
+`&80`/`&84`/`&82`/`&AC`), handled the same way as the 6809/Z80/RISC-V
+backends handle their own colliding keywords: the token byte is
+expanded back to its ASCII spelling before the mnemonic reader runs.
 
 ## Licence
 
