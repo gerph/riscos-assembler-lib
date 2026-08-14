@@ -36,11 +36,19 @@
      every other backend in this library never growing/shrinking an
      instruction's size between passes (see assemble_riscv's LI/CALL
      for the same reasoning).
-   - MOVE.L #imm,Dn is never automatically shortened to MOVEQ; the
-     caller must write MOVEQ explicitly if that encoding is wanted.
-     This keeps every instruction's size a direct, predictable function
-     of what was written, matching the Bcc .S/.W policy above, rather
-     than adding a second, silent size-choice mechanism.
+   - MOVE.L #imm,Dn is never automatically shortened to MOVEQ, nor is
+     ADD/SUB/CMP #imm,Dn ever shortened to ADDQ/SUBQ; the caller must
+     write MOVEQ/ADDQ/SUBQ explicitly if that (shorter, but different)
+     encoding is wanted. This keeps every instruction's size a direct,
+     predictable function of what was written, matching the Bcc .S/.W
+     policy above, rather than adding a second, silent size-choice
+     mechanism. This is distinct from ADD/SUB/CMP's automatic choice
+     between their ADDA/CMPA-shaped, ADDI/CMPI-shaped and plain
+     register-form encodings depending on the parsed operands' own
+     addressing modes (Dn/An/memory) -- that choice isn't optional
+     the way an immediate-value-triggered shortening would be, since
+     only one of those encodings is even legal for a given operand
+     shape in the first place.
    - No MOVEM/MOVEP/Bcc/DBcc PC-relative-versus-absolute addressing-mode
      auto-selection; the caller writes whichever addressing-mode syntax
      it wants explicitly. */

@@ -407,6 +407,100 @@ static const uint8_t     bytes_dcd[] = { 0x12, 0x34, 0x56, 0x78 };
 static const char *const lines_opt[] = { "OPT 3", "NOP", NULL };
 static const uint8_t     bytes_opt[] = { 0x4E, 0x71 };
 
+/* ---- Arithmetic family (stage 2) -----------------------------------
+   Every encoding below was hand-derived from the real MC68000 opcode
+   map (ADD/SUB/CMP's 'RRR SS eeeeee' / 'RRR opmode eeeeee' fields,
+   ADDQ/SUBQ's 'ddd' immediate field, ADDX/SUBX/ABCD/SBCD's R/M bit),
+   not ported from the m68k/ reference project (which this family's
+   design draws on for instruction coverage only). */
+
+static const char *const lines_add_ea_dn[]      = { "ADD.W D0,D1", NULL };
+static const uint8_t     bytes_add_ea_dn[]      = { 0xD2, 0x40 };
+
+static const char *const lines_add_mem_dn[]     = { "ADD.L (A0),D1", NULL };
+static const uint8_t     bytes_add_mem_dn[]     = { 0xD2, 0x90 };
+
+static const char *const lines_add_reverse[]    = { "ADD.W D1,(A0)", NULL };
+static const uint8_t     bytes_add_reverse[]    = { 0xD3, 0x50 };
+
+static const char *const lines_add_an_src[]     = { "ADD.W A0,D0", NULL };
+static const uint8_t     bytes_add_an_src[]     = { 0xD0, 0x48 };
+
+static const char *const lines_add_auto_adda[]  = { "ADD.L D0,A0", NULL };
+static const uint8_t     bytes_add_auto_adda[]  = { 0xD1, 0xC0 };
+
+static const char *const lines_adda[]           = { "ADDA.W #4,A0", NULL };
+static const uint8_t     bytes_adda[]           = { 0xD0, 0xFC, 0x00, 0x04 };
+
+static const char *const lines_add_auto_addi[]  = { "ADD.W #5,(A0)", NULL };
+static const uint8_t     bytes_add_auto_addi[]  = { 0x06, 0x50, 0x00, 0x05 };
+
+static const char *const lines_addi[]           = { "ADDI.W #5,D0", NULL };
+static const uint8_t     bytes_addi[]           = { 0x06, 0x40, 0x00, 0x05 };
+
+static const char *const lines_sub_ea_dn[]      = { "SUB.W D0,D1", NULL };
+static const uint8_t     bytes_sub_ea_dn[]      = { 0x92, 0x40 };
+
+static const char *const lines_addq[]           = { "ADDQ.W #3,D0", NULL };
+static const uint8_t     bytes_addq[]           = { 0x56, 0x40 };
+
+static const char *const lines_addq_an_eight[]  = { "ADDQ.L #8,A0", NULL };
+static const uint8_t     bytes_addq_an_eight[]  = { 0x50, 0x88 };
+
+static const char *const lines_subq[]           = { "SUBQ.B #1,D0", NULL };
+static const uint8_t     bytes_subq[]           = { 0x53, 0x00 };
+
+static const char *const lines_addx_dn[]        = { "ADDX.W D1,D0", NULL };
+static const uint8_t     bytes_addx_dn[]        = { 0xD1, 0x41 };
+
+static const char *const lines_addx_predec[]    = { "ADDX.L -(A1),-(A0)", NULL };
+static const uint8_t     bytes_addx_predec[]    = { 0xD1, 0x89 };
+
+static const char *const lines_mulu[]           = { "MULU.W D1,D0", NULL };
+static const uint8_t     bytes_mulu[]           = { 0xC0, 0xC1 };
+
+static const char *const lines_divs_no_suffix[] = { "DIVS D1,D0", NULL };
+static const uint8_t     bytes_divs_no_suffix[] = { 0x81, 0xC1 };
+
+static const char *const lines_cmp[]            = { "CMP.W D0,D1", NULL };
+static const uint8_t     bytes_cmp[]            = { 0xB2, 0x40 };
+
+static const char *const lines_cmpa[]           = { "CMPA.L A0,A1", NULL };
+static const uint8_t     bytes_cmpa[]           = { 0xB3, 0xC8 };
+
+static const char *const lines_cmpi[]           = { "CMPI.W #5,D0", NULL };
+static const uint8_t     bytes_cmpi[]           = { 0x0C, 0x40, 0x00, 0x05 };
+
+static const char *const lines_cmpm[]           = { "CMPM.B (A0)+,(A1)+", NULL };
+static const uint8_t     bytes_cmpm[]           = { 0xB3, 0x08 };
+
+static const char *const lines_tst[]            = { "TST.W D0", NULL };
+static const uint8_t     bytes_tst[]            = { 0x4A, 0x40 };
+
+static const char *const lines_clr[]            = { "CLR.L D0", NULL };
+static const uint8_t     bytes_clr[]            = { 0x42, 0x80 };
+
+static const char *const lines_neg[]            = { "NEG.B D0", NULL };
+static const uint8_t     bytes_neg[]            = { 0x44, 0x00 };
+
+static const char *const lines_negx[]           = { "NEGX.W (A0)", NULL };
+static const uint8_t     bytes_negx[]           = { 0x40, 0x50 };
+
+static const char *const lines_not[]            = { "NOT.L D0", NULL };
+static const uint8_t     bytes_not[]            = { 0x46, 0x80 };
+
+static const char *const lines_chk[]            = { "CHK D0,D1", NULL };
+static const uint8_t     bytes_chk[]            = { 0x43, 0x80 };
+
+static const char *const lines_abcd[]           = { "ABCD D0,D1", NULL };
+static const uint8_t     bytes_abcd[]           = { 0xC3, 0x00 };
+
+static const char *const lines_sbcd[]           = { "SBCD -(A0),-(A1)", NULL };
+static const uint8_t     bytes_sbcd[]           = { 0x83, 0x08 };
+
+static const char *const lines_nbcd[]           = { "NBCD D0", NULL };
+static const uint8_t     bytes_nbcd[]           = { 0x48, 0x00 };
+
 /* ---- Error cases --------------------------------------------------- */
 
 static const char *const lines_err_bad_mnemonic[]  = { "FOOBAR", NULL };
@@ -419,6 +513,13 @@ static const char *const lines_err_move_dst_imm[]  = { "MOVE.L D0,#5", NULL };
 static const char *const lines_err_move_missing[]  = { "MOVE.W D0", NULL };
 static const char *const lines_err_equ_no_label[]  = { "EQU &10", NULL };
 static const char *const lines_err_bad_ea[]        = { "MOVE.W (D0),D1", NULL };
+static const char *const lines_err_adda_byte[]     = { "ADD.B D0,A0", NULL };
+static const char *const lines_err_addq_range[]    = { "ADDQ.W #9,D0", NULL };
+static const char *const lines_err_addq_an_byte[]  = { "ADDQ.B #1,A0", NULL };
+static const char *const lines_err_addx_mismatch[] = { "ADDX.W D0,-(A0)", NULL };
+static const char *const lines_err_cmp_mem_dst[]   = { "CMP.W D0,(A0)", NULL };
+static const char *const lines_err_cmpm_not_inc[]  = { "CMPM.B (A0),(A1)+", NULL };
+static const char *const lines_err_chk_size[]      = { "CHK.L D0,D1", NULL };
 
 static const test_case_t tests[] = {
     { "NOP",                                lines_nop,               bytes_nop,               sizeof(bytes_nop),               0 },
@@ -445,6 +546,36 @@ static const test_case_t tests[] = {
     { "DCD pseudo-op (big-endian)",         lines_dcd,               bytes_dcd,               sizeof(bytes_dcd),               0 },
     { "OPT pseudo-op is a no-op",           lines_opt,               bytes_opt,               sizeof(bytes_opt),               0 },
 
+    { "ADD ea+Dn->Dn",                      lines_add_ea_dn,         bytes_add_ea_dn,         sizeof(bytes_add_ea_dn),         0 },
+    { "ADD memory+Dn->Dn",                  lines_add_mem_dn,        bytes_add_mem_dn,        sizeof(bytes_add_mem_dn),        0 },
+    { "ADD Dn+ea->ea (reverse)",            lines_add_reverse,       bytes_add_reverse,       sizeof(bytes_add_reverse),       0 },
+    { "ADD with An source",                 lines_add_an_src,        bytes_add_an_src,        sizeof(bytes_add_an_src),        0 },
+    { "ADD auto-selects ADDA shape",        lines_add_auto_adda,     bytes_add_auto_adda,     sizeof(bytes_add_auto_adda),     0 },
+    { "ADDA explicit",                      lines_adda,              bytes_adda,              sizeof(bytes_adda),              0 },
+    { "ADD auto-selects ADDI shape",        lines_add_auto_addi,     bytes_add_auto_addi,     sizeof(bytes_add_auto_addi),     0 },
+    { "ADDI explicit, Dn destination",      lines_addi,              bytes_addi,              sizeof(bytes_addi),              0 },
+    { "SUB ea+Dn->Dn",                      lines_sub_ea_dn,         bytes_sub_ea_dn,         sizeof(bytes_sub_ea_dn),         0 },
+    { "ADDQ",                               lines_addq,              bytes_addq,              sizeof(bytes_addq),              0 },
+    { "ADDQ #8 (ddd field wraps to 0)",     lines_addq_an_eight,     bytes_addq_an_eight,     sizeof(bytes_addq_an_eight),     0 },
+    { "SUBQ",                               lines_subq,              bytes_subq,              sizeof(bytes_subq),              0 },
+    { "ADDX Dn,Dn",                         lines_addx_dn,           bytes_addx_dn,           sizeof(bytes_addx_dn),           0 },
+    { "ADDX -(An),-(An)",                   lines_addx_predec,       bytes_addx_predec,       sizeof(bytes_addx_predec),       0 },
+    { "MULU",                               lines_mulu,              bytes_mulu,              sizeof(bytes_mulu),              0 },
+    { "DIVS with no size suffix",           lines_divs_no_suffix,    bytes_divs_no_suffix,    sizeof(bytes_divs_no_suffix),    0 },
+    { "CMP",                                lines_cmp,               bytes_cmp,               sizeof(bytes_cmp),               0 },
+    { "CMPA",                               lines_cmpa,              bytes_cmpa,              sizeof(bytes_cmpa),              0 },
+    { "CMPI",                               lines_cmpi,              bytes_cmpi,              sizeof(bytes_cmpi),              0 },
+    { "CMPM",                               lines_cmpm,              bytes_cmpm,              sizeof(bytes_cmpm),              0 },
+    { "TST",                                lines_tst,               bytes_tst,               sizeof(bytes_tst),               0 },
+    { "CLR",                                lines_clr,               bytes_clr,               sizeof(bytes_clr),               0 },
+    { "NEG",                                lines_neg,               bytes_neg,               sizeof(bytes_neg),               0 },
+    { "NEGX",                               lines_negx,              bytes_negx,              sizeof(bytes_negx),              0 },
+    { "NOT",                                lines_not,               bytes_not,               sizeof(bytes_not),               0 },
+    { "CHK",                                lines_chk,               bytes_chk,               sizeof(bytes_chk),               0 },
+    { "ABCD",                               lines_abcd,              bytes_abcd,              sizeof(bytes_abcd),              0 },
+    { "SBCD",                               lines_sbcd,              bytes_sbcd,              sizeof(bytes_sbcd),              0 },
+    { "NBCD",                               lines_nbcd,              bytes_nbcd,              sizeof(bytes_nbcd),              0 },
+
     { "error: bad mnemonic",                lines_err_bad_mnemonic,  NULL, 0, 1 },
     { "error: MOVE requires a size suffix", lines_err_move_no_size,  NULL, 0, 1 },
     { "error: MOVE bad size suffix",        lines_err_move_bad_size, NULL, 0, 1 },
@@ -454,7 +585,14 @@ static const test_case_t tests[] = {
     { "error: MOVE destination immediate",  lines_err_move_dst_imm,  NULL, 0, 1 },
     { "error: MOVE missing destination",    lines_err_move_missing,  NULL, 0, 1 },
     { "error: EQU without a label",         lines_err_equ_no_label,  NULL, 0, 1 },
-    { "error: bad addressing mode syntax",  lines_err_bad_ea,        NULL, 0, 1 }
+    { "error: bad addressing mode syntax",  lines_err_bad_ea,        NULL, 0, 1 },
+    { "error: ADDA does not support .B",    lines_err_adda_byte,     NULL, 0, 1 },
+    { "error: ADDQ immediate out of range", lines_err_addq_range,    NULL, 0, 1 },
+    { "error: ADDQ.B cannot target An",     lines_err_addq_an_byte,  NULL, 0, 1 },
+    { "error: ADDX operand shape mismatch", lines_err_addx_mismatch, NULL, 0, 1 },
+    { "error: CMP memory destination",      lines_err_cmp_mem_dst,   NULL, 0, 1 },
+    { "error: CMPM requires postincrement", lines_err_cmpm_not_inc,  NULL, 0, 1 },
+    { "error: CHK does not support .L",     lines_err_chk_size,      NULL, 0, 1 }
 };
 
 int run_tests_m68k(void)

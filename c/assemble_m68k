@@ -852,14 +852,39 @@ static _kernel_oserror *m68k_encode_ea(assemble_context_t *context,
 typedef enum m68k_family
 {
     FAM_MOVE,
-    FAM_NOOP
+    FAM_NOOP,
+    FAM_ONE_OP,      /* CLR/NEG/NEGX/NOT/TST: <ea>, .B/.W/.L */
+    FAM_ADD_SUB,     /* ADD/SUB/ADDA/SUBA/ADDI/SUBI, param1 selects which */
+    FAM_ADDX_SUBX,
+    FAM_ADDQ_SUBQ,
+    FAM_MUL_DIV,     /* MULU/MULS/DIVU/DIVS */
+    FAM_CMP,         /* CMP/CMPA/CMPI, param1 selects which */
+    FAM_CMPM,
+    FAM_CHK,
+    FAM_BCD,         /* ABCD/SBCD, param1: 0=ABCD 1=SBCD */
+    FAM_NBCD
 } m68k_family_t;
+
+/* FAM_ADD_SUB/FAM_CMP 'force_kind' values (param2): auto-detect the
+   opcode shape from the parsed operands (0), force the address-
+   register destination shape -- ADDA/SUBA/CMPA (1), or force the
+   immediate-source/data-alterable-destination shape -- ADDI/SUBI/CMPI
+   (2). The plain ADD/SUB/CMP mnemonics use 0 and still produce the
+   ADDA- or ADDI-shaped encoding automatically when the operands
+   require it (there is no other legal encoding for those operand
+   shapes, so this is not an optional relaxation the way MOVEQ's
+   auto-selection would be -- see h/assemble_m68k's deficiencies
+   comment on that distinction). */
+#define M68K_FORCE_AUTO 0u
+#define M68K_FORCE_A    1u
+#define M68K_FORCE_I    2u
 
 typedef struct m68k_mnemonic_entry
 {
     const char    *root;
     m68k_family_t  family;
     uint32_t       param1;
+    uint32_t       param2;
     unsigned char  size_mask;   /* bit0=B bit1=W bit2=L allowed, 0 = no size suffix accepted at all */
 } m68k_mnemonic_entry_t;
 
@@ -871,12 +896,47 @@ typedef struct m68k_mnemonic_entry
 #define SZ_NONE 0u
 
 static const m68k_mnemonic_entry_t m68k_mnemonics[] = {
-    { "MOVE",  FAM_MOVE, 0, SZ_BWL },
-    { "MOVEA", FAM_MOVE, 0, SZ_WL },
-    { "MOVEQ", FAM_MOVE, 0, SZ_NONE },
+    { "MOVE",  FAM_MOVE, 0, 0, SZ_BWL },
+    { "MOVEA", FAM_MOVE, 0, 0, SZ_WL },
+    { "MOVEQ", FAM_MOVE, 0, 0, SZ_NONE },
 
-    { "NOP", FAM_NOOP, 0x4E71, SZ_NONE },
-    { "RTS", FAM_NOOP, 0x4E75, SZ_NONE }
+    { "NOP", FAM_NOOP, 0x4E71, 0, SZ_NONE },
+    { "RTS", FAM_NOOP, 0x4E75, 0, SZ_NONE },
+
+    { "CLR",  FAM_ONE_OP, 0x4200, 0, SZ_BWL },
+    { "NEG",  FAM_ONE_OP, 0x4400, 0, SZ_BWL },
+    { "NEGX", FAM_ONE_OP, 0x4000, 0, SZ_BWL },
+    { "NOT",  FAM_ONE_OP, 0x4600, 0, SZ_BWL },
+    { "TST",  FAM_ONE_OP, 0x4A00, 0, SZ_BWL },
+
+    { "ADD",  FAM_ADD_SUB, 0, M68K_FORCE_AUTO, SZ_BWL },
+    { "SUB",  FAM_ADD_SUB, 1, M68K_FORCE_AUTO, SZ_BWL },
+    { "ADDA", FAM_ADD_SUB, 0, M68K_FORCE_A,    SZ_WL },
+    { "SUBA", FAM_ADD_SUB, 1, M68K_FORCE_A,    SZ_WL },
+    { "ADDI", FAM_ADD_SUB, 0, M68K_FORCE_I,    SZ_BWL },
+    { "SUBI", FAM_ADD_SUB, 1, M68K_FORCE_I,    SZ_BWL },
+
+    { "ADDX", FAM_ADDX_SUBX, 0, 0, SZ_BWL },
+    { "SUBX", FAM_ADDX_SUBX, 1, 0, SZ_BWL },
+
+    { "ADDQ", FAM_ADDQ_SUBQ, 0, 0, SZ_BWL },
+    { "SUBQ", FAM_ADDQ_SUBQ, 1, 0, SZ_BWL },
+
+    { "MULU", FAM_MUL_DIV, 0xC0C0, 0, SZ_W },
+    { "MULS", FAM_MUL_DIV, 0xC1C0, 0, SZ_W },
+    { "DIVU", FAM_MUL_DIV, 0x80C0, 0, SZ_W },
+    { "DIVS", FAM_MUL_DIV, 0x81C0, 0, SZ_W },
+
+    { "CMP",  FAM_CMP, 0, M68K_FORCE_AUTO, SZ_BWL },
+    { "CMPA", FAM_CMP, 0, M68K_FORCE_A,    SZ_WL },
+    { "CMPI", FAM_CMP, 0, M68K_FORCE_I,    SZ_BWL },
+    { "CMPM", FAM_CMPM, 0, 0, SZ_BWL },
+
+    { "CHK",  FAM_CHK, 0, 0, SZ_NONE },
+
+    { "ABCD", FAM_BCD, 0, 0, SZ_NONE },
+    { "SBCD", FAM_BCD, 1, 0, SZ_NONE },
+    { "NBCD", FAM_NBCD, 0, 0, SZ_NONE }
 };
 
 #define NUM_MNEMONICS (sizeof(m68k_mnemonics) / sizeof(m68k_mnemonics[0]))
@@ -949,6 +1009,14 @@ static _kernel_oserror *parse_size_suffix(const uint8_t *text, size_t length, si
     }
     *out_size = M68K_SIZE_NONE;
     return NULL;
+}
+
+/* The standard 68000 size-field encoding (00=B, 01=W, 10=L), used by
+   almost every instruction in this backend except MOVE/MOVEA, which
+   has its own quirky 01/11/10 pattern encoded inline in encode_move(). */
+static uint16_t m68k_std_size_bits(m68k_size_t size)
+{
+    return (uint16_t) ((size == M68K_SIZE_B) ? 0u : (size == M68K_SIZE_W) ? 1u : 2u);
 }
 
 /*******************************************************************
@@ -1122,6 +1190,683 @@ static _kernel_oserror *encode_noop(assemble_context_t *context, uint16_t opcode
     return assemble_emit_word_be(context, ASSEMBLE_CPU_M68K, opcode);
 }
 
+/*******************************************************************
+ Function:      parse_two_operands
+ Description:   Parses 'src,dst' -- the common shape used by most
+                two-operand instructions in this backend.
+ Parameters:    context = the assembly context
+                text/length = the operand text following the mnemonic
+                out_src, out_dst = [[out]] the parsed operands
+ Returns:       NULL if successful, otherwise a static error block
+ ******************************************************************/
+static _kernel_oserror *parse_two_operands(assemble_context_t *context, const uint8_t *text, size_t length,
+                                            m68k_operand_t *out_src, m68k_operand_t *out_dst)
+{
+    size_t pos = 0;
+    _kernel_oserror *error;
+
+    pos += assemble_skip_spaces(text + pos, length - pos);
+    error = parse_m68k_operand(context, text, length, &pos, out_src);
+    if (error != NULL)
+    {
+        return error;
+    }
+    pos += assemble_skip_spaces(text + pos, length - pos);
+    if (!(pos < length && text[pos] == ','))
+    {
+        return assemble_set_error(ASSEMBLE_CPU_M68K, ASSEMBLE_ERROR_TYPE_SYNTAX, ASSEMBLE_M68K_ERR_NONE,
+                                   "Expected ','");
+    }
+    pos += 1;
+    pos += assemble_skip_spaces(text + pos, length - pos);
+    error = parse_m68k_operand(context, text, length, &pos, out_dst);
+    if (error != NULL)
+    {
+        return error;
+    }
+    return check_trailing(text, length, pos);
+}
+
+static _kernel_oserror *emit_ext_words(assemble_context_t *context, const uint16_t ext[2], unsigned char count)
+{
+    _kernel_oserror *error = NULL;
+
+    if (count >= 1)
+    {
+        error = assemble_emit_word_be(context, ASSEMBLE_CPU_M68K, ext[0]);
+    }
+    if (error == NULL && count >= 2)
+    {
+        error = assemble_emit_word_be(context, ASSEMBLE_CPU_M68K, ext[1]);
+    }
+    return error;
+}
+
+/*******************************************************************
+ Function:      encode_one_op
+ Description:   Encodes CLR/NEG/NEGX/NOT/TST: a single data-alterable
+                operand (never An), size .B/.W/.L.
+ Parameters:    context = the assembly context
+                base_opcode = the opcode with size/ea fields clear
+                size = the parsed .B/.W/.L size suffix
+                text/length = the operand text following the mnemonic
+ Returns:       NULL if successful, otherwise a static error block
+ ******************************************************************/
+static _kernel_oserror *encode_one_op(assemble_context_t *context, uint16_t base_opcode, m68k_size_t size,
+                                       const uint8_t *text, size_t length)
+{
+    size_t pos = 0;
+    m68k_operand_t dst;
+    uint16_t dst_ea, dst_ext[2];
+    unsigned char dst_ext_count;
+    _kernel_oserror *error;
+
+    if (size == M68K_SIZE_NONE)
+    {
+        return assemble_set_error(ASSEMBLE_CPU_M68K, ASSEMBLE_ERROR_TYPE_SYNTAX, ASSEMBLE_M68K_ERR_BAD_SIZE,
+                                   "Requires a .B/.W/.L size suffix");
+    }
+
+    pos += assemble_skip_spaces(text + pos, length - pos);
+    error = parse_m68k_operand(context, text, length, &pos, &dst);
+    if (error != NULL)
+    {
+        return error;
+    }
+    error = check_trailing(text, length, pos);
+    if (error != NULL)
+    {
+        return error;
+    }
+
+    error = m68k_encode_ea(context, &dst, size, M68K_EAM_DATA_ALTERABLE, 0, &dst_ea, dst_ext, &dst_ext_count);
+    if (error != NULL)
+    {
+        return error;
+    }
+
+    error = assemble_emit_word_be(context, ASSEMBLE_CPU_M68K,
+                                   (uint16_t) (base_opcode | (m68k_std_size_bits(size) << 6) | dst_ea));
+    if (error != NULL)
+    {
+        return error;
+    }
+    return emit_ext_words(context, dst_ext, dst_ext_count);
+}
+
+/*******************************************************************
+ Function:      encode_add_sub
+ Description:   Encodes ADD/SUB/ADDA/SUBA/ADDI/SUBI. The plain ADD/SUB
+                mnemonics auto-detect which real opcode shape the
+                operands require (ea+Dn->Dn, Dn+ea->ea, the ADDA/SUBA
+                address-register-destination shape, or the ADDI/SUBI
+                immediate-source shape) -- see the M68K_FORCE_* comment
+                above the mnemonic table for why this isn't the same
+                kind of relaxation MOVEQ's auto-selection would be.
+ Parameters:    context = the assembly context
+                is_sub = 0 for ADD family, 1 for SUB family
+                force_kind = M68K_FORCE_AUTO/M68K_FORCE_A/M68K_FORCE_I
+                size = the parsed .B/.W/.L size suffix
+                text/length = the operand text following the mnemonic
+ Returns:       NULL if successful, otherwise a static error block
+ ******************************************************************/
+static _kernel_oserror *encode_add_sub(assemble_context_t *context, int is_sub, uint32_t force_kind,
+                                        m68k_size_t size, const uint8_t *text, size_t length)
+{
+    m68k_operand_t src, dst;
+    uint16_t src_ea, dst_ea, src_ext[2], dst_ext[2];
+    unsigned char src_ext_count, dst_ext_count;
+    uint16_t opword;
+    uint16_t top = is_sub ? 0x9000u : 0xD000u;
+    _kernel_oserror *error;
+
+    if (size == M68K_SIZE_NONE)
+    {
+        return assemble_set_error(ASSEMBLE_CPU_M68K, ASSEMBLE_ERROR_TYPE_SYNTAX, ASSEMBLE_M68K_ERR_BAD_SIZE,
+                                   "Requires a .B/.W/.L size suffix");
+    }
+    error = parse_two_operands(context, text, length, &src, &dst);
+    if (error != NULL)
+    {
+        return error;
+    }
+
+    if (force_kind == M68K_FORCE_I)
+    {
+        if (src.mode != M68K_EA_OTHER || src.reg != M68K_SUB_IMMEDIATE)
+        {
+            return assemble_set_error(ASSEMBLE_CPU_M68K, ASSEMBLE_ERROR_TYPE_BAD_OPERAND, ASSEMBLE_M68K_ERR_BAD_EA,
+                                       "ADDI/SUBI requires an immediate source");
+        }
+        error = m68k_encode_ea(context, &src, size, M68K_EAM_IMMEDIATE, 0, &src_ea, src_ext, &src_ext_count);
+        if (error != NULL)
+        {
+            return error;
+        }
+        error = m68k_encode_ea(context, &dst, size, M68K_EAM_DATA_ALTERABLE, (uint32_t) src_ext_count * 2u,
+                                &dst_ea, dst_ext, &dst_ext_count);
+        if (error != NULL)
+        {
+            return error;
+        }
+        opword = (uint16_t) ((is_sub ? 0x0400u : 0x0600u) | (m68k_std_size_bits(size) << 6) | dst_ea);
+        error = assemble_emit_word_be(context, ASSEMBLE_CPU_M68K, opword);
+        if (error != NULL) { return error; }
+        error = emit_ext_words(context, src_ext, src_ext_count);
+        if (error != NULL) { return error; }
+        return emit_ext_words(context, dst_ext, dst_ext_count);
+    }
+
+    if (force_kind == M68K_FORCE_A || dst.mode == M68K_EA_AN)
+    {
+        uint16_t opmode;
+
+        if (dst.mode != M68K_EA_AN)
+        {
+            return assemble_set_error(ASSEMBLE_CPU_M68K, ASSEMBLE_ERROR_TYPE_BAD_OPERAND,
+                                       ASSEMBLE_M68K_ERR_EA_NOT_ALLOWED, "ADDA/SUBA destination must be an address register");
+        }
+        if (size == M68K_SIZE_B)
+        {
+            return assemble_set_error(ASSEMBLE_CPU_M68K, ASSEMBLE_ERROR_TYPE_SYNTAX, ASSEMBLE_M68K_ERR_BAD_SIZE,
+                                       "ADDA/SUBA does not support .B");
+        }
+        opmode = (size == M68K_SIZE_L) ? 7u : 3u;
+        error = m68k_encode_ea(context, &src, size, M68K_EAM_ALL, 0, &src_ea, src_ext, &src_ext_count);
+        if (error != NULL)
+        {
+            return error;
+        }
+        opword = (uint16_t) (top | (((uint32_t) dst.reg) << 9) | (opmode << 6) | src_ea);
+        error = assemble_emit_word_be(context, ASSEMBLE_CPU_M68K, opword);
+        if (error != NULL) { return error; }
+        return emit_ext_words(context, src_ext, src_ext_count);
+    }
+
+    if (dst.mode == M68K_EA_DN)
+    {
+        error = m68k_encode_ea(context, &src, size, M68K_EAM_ALL, 0, &src_ea, src_ext, &src_ext_count);
+        if (error != NULL)
+        {
+            return error;
+        }
+        opword = (uint16_t) (top | (((uint32_t) dst.reg) << 9) | (m68k_std_size_bits(size) << 6) | src_ea);
+        error = assemble_emit_word_be(context, ASSEMBLE_CPU_M68K, opword);
+        if (error != NULL) { return error; }
+        return emit_ext_words(context, src_ext, src_ext_count);
+    }
+
+    if (src.mode == M68K_EA_OTHER && src.reg == M68K_SUB_IMMEDIATE)
+    {
+        error = m68k_encode_ea(context, &src, size, M68K_EAM_IMMEDIATE, 0, &src_ea, src_ext, &src_ext_count);
+        if (error != NULL)
+        {
+            return error;
+        }
+        error = m68k_encode_ea(context, &dst, size, M68K_EAM_DATA_ALTERABLE, (uint32_t) src_ext_count * 2u,
+                                &dst_ea, dst_ext, &dst_ext_count);
+        if (error != NULL)
+        {
+            return error;
+        }
+        opword = (uint16_t) ((is_sub ? 0x0400u : 0x0600u) | (m68k_std_size_bits(size) << 6) | dst_ea);
+        error = assemble_emit_word_be(context, ASSEMBLE_CPU_M68K, opword);
+        if (error != NULL) { return error; }
+        error = emit_ext_words(context, src_ext, src_ext_count);
+        if (error != NULL) { return error; }
+        return emit_ext_words(context, dst_ext, dst_ext_count);
+    }
+
+    if (src.mode != M68K_EA_DN)
+    {
+        return assemble_set_error(ASSEMBLE_CPU_M68K, ASSEMBLE_ERROR_TYPE_BAD_OPERAND, ASSEMBLE_M68K_ERR_EA_NOT_ALLOWED,
+                                   "ADD/SUB with a memory destination requires a data-register source");
+    }
+
+    error = m68k_encode_ea(context, &dst, size, M68K_EAM_MEMORY_ALTERABLE, 0, &dst_ea, dst_ext, &dst_ext_count);
+    if (error != NULL)
+    {
+        return error;
+    }
+    opword = (uint16_t) (top | (((uint32_t) src.reg) << 9) | ((4u + m68k_std_size_bits(size)) << 6) | dst_ea);
+    error = assemble_emit_word_be(context, ASSEMBLE_CPU_M68K, opword);
+    if (error != NULL) { return error; }
+    return emit_ext_words(context, dst_ext, dst_ext_count);
+}
+
+/*******************************************************************
+ Function:      encode_addq_subq
+ Description:   Encodes ADDQ/SUBQ #imm,<ea> (imm 1-8, with 8 encoded
+                as the field value 0). Destination is any alterable
+                addressing mode; .B cannot target an address register.
+ ******************************************************************/
+static _kernel_oserror *encode_addq_subq(assemble_context_t *context, int is_sub, m68k_size_t size,
+                                          const uint8_t *text, size_t length)
+{
+    size_t pos = 0;
+    int32_t imm;
+    m68k_operand_t dst;
+    uint16_t dst_ea, dst_ext[2];
+    unsigned char dst_ext_count;
+    uint16_t ddd, opword;
+    _kernel_oserror *error;
+
+    if (size == M68K_SIZE_NONE)
+    {
+        return assemble_set_error(ASSEMBLE_CPU_M68K, ASSEMBLE_ERROR_TYPE_SYNTAX, ASSEMBLE_M68K_ERR_BAD_SIZE,
+                                   "ADDQ/SUBQ requires a .B/.W/.L size suffix");
+    }
+
+    pos += assemble_skip_spaces(text + pos, length - pos);
+    if (!(pos < length && text[pos] == '#'))
+    {
+        return assemble_set_error(ASSEMBLE_CPU_M68K, ASSEMBLE_ERROR_TYPE_BAD_OPERAND, ASSEMBLE_M68K_ERR_BAD_EA,
+                                   "ADDQ/SUBQ requires an immediate source");
+    }
+    pos += 1;
+    error = eval_numeric(context, text, length, &pos, &imm);
+    if (error != NULL)
+    {
+        return error;
+    }
+    if (imm < 1 || imm > 8)
+    {
+        return assemble_set_error(ASSEMBLE_CPU_M68K, ASSEMBLE_ERROR_TYPE_RANGE, ASSEMBLE_M68K_ERR_IMMEDIATE_RANGE,
+                                   "ADDQ/SUBQ immediate out of range 1..8");
+    }
+    pos += assemble_skip_spaces(text + pos, length - pos);
+    if (!(pos < length && text[pos] == ','))
+    {
+        return assemble_set_error(ASSEMBLE_CPU_M68K, ASSEMBLE_ERROR_TYPE_SYNTAX, ASSEMBLE_M68K_ERR_NONE,
+                                   "Expected ','");
+    }
+    pos += 1;
+    pos += assemble_skip_spaces(text + pos, length - pos);
+    error = parse_m68k_operand(context, text, length, &pos, &dst);
+    if (error != NULL)
+    {
+        return error;
+    }
+    error = check_trailing(text, length, pos);
+    if (error != NULL)
+    {
+        return error;
+    }
+
+    if (dst.mode == M68K_EA_AN && size == M68K_SIZE_B)
+    {
+        return assemble_set_error(ASSEMBLE_CPU_M68K, ASSEMBLE_ERROR_TYPE_SYNTAX, ASSEMBLE_M68K_ERR_BAD_SIZE,
+                                   "ADDQ/SUBQ.B cannot target an address register");
+    }
+
+    error = m68k_encode_ea(context, &dst, size, M68K_EAM_ALTERABLE, 0, &dst_ea, dst_ext, &dst_ext_count);
+    if (error != NULL)
+    {
+        return error;
+    }
+
+    ddd = (uint16_t) ((imm == 8) ? 0 : imm);
+    opword = (uint16_t) (0x5000u | (is_sub ? 0x0100u : 0u) | (ddd << 9) | (m68k_std_size_bits(size) << 6) | dst_ea);
+
+    error = assemble_emit_word_be(context, ASSEMBLE_CPU_M68K, opword);
+    if (error != NULL)
+    {
+        return error;
+    }
+    return emit_ext_words(context, dst_ext, dst_ext_count);
+}
+
+/*******************************************************************
+ Function:      encode_addx_subx
+ Description:   Encodes ADDX/SUBX Dy,Dx or ADDX/SUBX -(Ay),-(Ax).
+ ******************************************************************/
+static _kernel_oserror *encode_addx_subx(assemble_context_t *context, int is_sub, m68k_size_t size,
+                                          const uint8_t *text, size_t length)
+{
+    m68k_operand_t src, dst;
+    uint16_t opword;
+    unsigned char rm;
+    _kernel_oserror *error;
+
+    if (size == M68K_SIZE_NONE)
+    {
+        return assemble_set_error(ASSEMBLE_CPU_M68K, ASSEMBLE_ERROR_TYPE_SYNTAX, ASSEMBLE_M68K_ERR_BAD_SIZE,
+                                   "ADDX/SUBX requires a .B/.W/.L size suffix");
+    }
+
+    error = parse_two_operands(context, text, length, &src, &dst);
+    if (error != NULL)
+    {
+        return error;
+    }
+
+    if (src.mode == M68K_EA_DN && dst.mode == M68K_EA_DN)
+    {
+        rm = 0;
+    }
+    else if (src.mode == M68K_EA_AN_PREDEC && dst.mode == M68K_EA_AN_PREDEC)
+    {
+        rm = 1;
+    }
+    else
+    {
+        return assemble_set_error(ASSEMBLE_CPU_M68K, ASSEMBLE_ERROR_TYPE_BAD_OPERAND, ASSEMBLE_M68K_ERR_BAD_EA,
+                                   "ADDX/SUBX requires two data registers or two predecrement operands");
+    }
+
+    opword = (uint16_t) ((is_sub ? 0x9100u : 0xD100u) | (((uint32_t) dst.reg) << 9) |
+                          (m68k_std_size_bits(size) << 6) | ((uint32_t) rm << 3) | src.reg);
+    return assemble_emit_word_be(context, ASSEMBLE_CPU_M68K, opword);
+}
+
+/*******************************************************************
+ Function:      encode_mul_div
+ Description:   Encodes MULU/MULS/DIVU/DIVS <ea>,Dn. Source is always
+                word-sized regardless of any (redundant) size suffix
+                written; destination must be a data register.
+ ******************************************************************/
+static _kernel_oserror *encode_mul_div(assemble_context_t *context, uint16_t base_opcode,
+                                        const uint8_t *text, size_t length)
+{
+    m68k_operand_t src, dst;
+    uint16_t src_ea, src_ext[2];
+    unsigned char src_ext_count;
+    _kernel_oserror *error;
+
+    error = parse_two_operands(context, text, length, &src, &dst);
+    if (error != NULL)
+    {
+        return error;
+    }
+    if (dst.mode != M68K_EA_DN)
+    {
+        return assemble_set_error(ASSEMBLE_CPU_M68K, ASSEMBLE_ERROR_TYPE_BAD_OPERAND, ASSEMBLE_M68K_ERR_EA_NOT_ALLOWED,
+                                   "MULU/MULS/DIVU/DIVS destination must be a data register");
+    }
+
+    error = m68k_encode_ea(context, &src, M68K_SIZE_W, M68K_EAM_DATA, 0, &src_ea, src_ext, &src_ext_count);
+    if (error != NULL)
+    {
+        return error;
+    }
+
+    error = assemble_emit_word_be(context, ASSEMBLE_CPU_M68K,
+                                   (uint16_t) (base_opcode | (((uint32_t) dst.reg) << 9) | src_ea));
+    if (error != NULL)
+    {
+        return error;
+    }
+    return emit_ext_words(context, src_ext, src_ext_count);
+}
+
+/*******************************************************************
+ Function:      encode_cmp
+ Description:   Encodes CMP/CMPA/CMPI, with the same auto-detection
+                policy as encode_add_sub() -- see M68K_FORCE_* above.
+                Unlike ADD/SUB, plain CMP has no 'Dn+ea->ea' reverse
+                direction at all; a memory destination is only ever
+                reachable via the immediate-source (CMPI) shape.
+ ******************************************************************/
+static _kernel_oserror *encode_cmp(assemble_context_t *context, uint32_t force_kind, m68k_size_t size,
+                                    const uint8_t *text, size_t length)
+{
+    m68k_operand_t src, dst;
+    uint16_t src_ea, dst_ea, src_ext[2], dst_ext[2];
+    unsigned char src_ext_count, dst_ext_count;
+    uint16_t opword;
+    _kernel_oserror *error;
+
+    if (size == M68K_SIZE_NONE)
+    {
+        return assemble_set_error(ASSEMBLE_CPU_M68K, ASSEMBLE_ERROR_TYPE_SYNTAX, ASSEMBLE_M68K_ERR_BAD_SIZE,
+                                   "Requires a .B/.W/.L size suffix");
+    }
+    error = parse_two_operands(context, text, length, &src, &dst);
+    if (error != NULL)
+    {
+        return error;
+    }
+
+    if (force_kind == M68K_FORCE_I)
+    {
+        if (src.mode != M68K_EA_OTHER || src.reg != M68K_SUB_IMMEDIATE)
+        {
+            return assemble_set_error(ASSEMBLE_CPU_M68K, ASSEMBLE_ERROR_TYPE_BAD_OPERAND, ASSEMBLE_M68K_ERR_BAD_EA,
+                                       "CMPI requires an immediate source");
+        }
+        error = m68k_encode_ea(context, &src, size, M68K_EAM_IMMEDIATE, 0, &src_ea, src_ext, &src_ext_count);
+        if (error != NULL) { return error; }
+        error = m68k_encode_ea(context, &dst, size, M68K_EAM_DATA_ALTERABLE, (uint32_t) src_ext_count * 2u,
+                                &dst_ea, dst_ext, &dst_ext_count);
+        if (error != NULL) { return error; }
+        opword = (uint16_t) (0x0C00u | (m68k_std_size_bits(size) << 6) | dst_ea);
+        error = assemble_emit_word_be(context, ASSEMBLE_CPU_M68K, opword);
+        if (error != NULL) { return error; }
+        error = emit_ext_words(context, src_ext, src_ext_count);
+        if (error != NULL) { return error; }
+        return emit_ext_words(context, dst_ext, dst_ext_count);
+    }
+
+    if (force_kind == M68K_FORCE_A || dst.mode == M68K_EA_AN)
+    {
+        uint16_t opmode;
+
+        if (dst.mode != M68K_EA_AN)
+        {
+            return assemble_set_error(ASSEMBLE_CPU_M68K, ASSEMBLE_ERROR_TYPE_BAD_OPERAND,
+                                       ASSEMBLE_M68K_ERR_EA_NOT_ALLOWED, "CMPA destination must be an address register");
+        }
+        if (size == M68K_SIZE_B)
+        {
+            return assemble_set_error(ASSEMBLE_CPU_M68K, ASSEMBLE_ERROR_TYPE_SYNTAX, ASSEMBLE_M68K_ERR_BAD_SIZE,
+                                       "CMPA does not support .B");
+        }
+        opmode = (size == M68K_SIZE_L) ? 7u : 3u;
+        error = m68k_encode_ea(context, &src, size, M68K_EAM_ALL, 0, &src_ea, src_ext, &src_ext_count);
+        if (error != NULL) { return error; }
+        opword = (uint16_t) (0xB000u | (((uint32_t) dst.reg) << 9) | (opmode << 6) | src_ea);
+        error = assemble_emit_word_be(context, ASSEMBLE_CPU_M68K, opword);
+        if (error != NULL) { return error; }
+        return emit_ext_words(context, src_ext, src_ext_count);
+    }
+
+    if (dst.mode == M68K_EA_DN)
+    {
+        error = m68k_encode_ea(context, &src, size, M68K_EAM_ALL, 0, &src_ea, src_ext, &src_ext_count);
+        if (error != NULL) { return error; }
+        opword = (uint16_t) (0xB000u | (((uint32_t) dst.reg) << 9) | (m68k_std_size_bits(size) << 6) | src_ea);
+        error = assemble_emit_word_be(context, ASSEMBLE_CPU_M68K, opword);
+        if (error != NULL) { return error; }
+        return emit_ext_words(context, src_ext, src_ext_count);
+    }
+
+    if (src.mode == M68K_EA_OTHER && src.reg == M68K_SUB_IMMEDIATE)
+    {
+        error = m68k_encode_ea(context, &src, size, M68K_EAM_IMMEDIATE, 0, &src_ea, src_ext, &src_ext_count);
+        if (error != NULL) { return error; }
+        error = m68k_encode_ea(context, &dst, size, M68K_EAM_DATA_ALTERABLE, (uint32_t) src_ext_count * 2u,
+                                &dst_ea, dst_ext, &dst_ext_count);
+        if (error != NULL) { return error; }
+        opword = (uint16_t) (0x0C00u | (m68k_std_size_bits(size) << 6) | dst_ea);
+        error = assemble_emit_word_be(context, ASSEMBLE_CPU_M68K, opword);
+        if (error != NULL) { return error; }
+        error = emit_ext_words(context, src_ext, src_ext_count);
+        if (error != NULL) { return error; }
+        return emit_ext_words(context, dst_ext, dst_ext_count);
+    }
+
+    return assemble_set_error(ASSEMBLE_CPU_M68K, ASSEMBLE_ERROR_TYPE_BAD_OPERAND, ASSEMBLE_M68K_ERR_EA_NOT_ALLOWED,
+                               "CMP destination must be a data or address register (use CMPI for a memory destination)");
+}
+
+/*******************************************************************
+ Function:      encode_cmpm
+ Description:   Encodes CMPM (Ay)+,(Ax)+ -- the only addressing mode
+                CMPM accepts for either operand.
+ ******************************************************************/
+static _kernel_oserror *encode_cmpm(assemble_context_t *context, m68k_size_t size,
+                                     const uint8_t *text, size_t length)
+{
+    m68k_operand_t src, dst;
+    _kernel_oserror *error;
+
+    if (size == M68K_SIZE_NONE)
+    {
+        return assemble_set_error(ASSEMBLE_CPU_M68K, ASSEMBLE_ERROR_TYPE_SYNTAX, ASSEMBLE_M68K_ERR_BAD_SIZE,
+                                   "CMPM requires a .B/.W/.L size suffix");
+    }
+
+    error = parse_two_operands(context, text, length, &src, &dst);
+    if (error != NULL)
+    {
+        return error;
+    }
+    if (src.mode != M68K_EA_AN_POSTINC || dst.mode != M68K_EA_AN_POSTINC)
+    {
+        return assemble_set_error(ASSEMBLE_CPU_M68K, ASSEMBLE_ERROR_TYPE_BAD_OPERAND, ASSEMBLE_M68K_ERR_BAD_EA,
+                                   "CMPM requires two postincrement operands, eg (A0)+,(A1)+");
+    }
+
+    return assemble_emit_word_be(context, ASSEMBLE_CPU_M68K,
+                                  (uint16_t) (0xB108u | (((uint32_t) dst.reg) << 9) |
+                                              (m68k_std_size_bits(size) << 6) | src.reg));
+}
+
+/*******************************************************************
+ Function:      encode_chk
+ Description:   Encodes CHK <ea>,Dn. Word-only; no size suffix is
+                written (CHK.L is a 68020 addition, out of scope).
+ ******************************************************************/
+static _kernel_oserror *encode_chk(assemble_context_t *context, m68k_size_t size,
+                                    const uint8_t *text, size_t length)
+{
+    m68k_operand_t src, dst;
+    uint16_t src_ea, src_ext[2];
+    unsigned char src_ext_count;
+    _kernel_oserror *error;
+
+    if (size != M68K_SIZE_NONE)
+    {
+        return assemble_set_error(ASSEMBLE_CPU_M68K, ASSEMBLE_ERROR_TYPE_SYNTAX, ASSEMBLE_M68K_ERR_BAD_SIZE,
+                                   "CHK does not take a size suffix (it is always word-sized)");
+    }
+
+    error = parse_two_operands(context, text, length, &src, &dst);
+    if (error != NULL)
+    {
+        return error;
+    }
+    if (dst.mode != M68K_EA_DN)
+    {
+        return assemble_set_error(ASSEMBLE_CPU_M68K, ASSEMBLE_ERROR_TYPE_BAD_OPERAND, ASSEMBLE_M68K_ERR_EA_NOT_ALLOWED,
+                                   "CHK destination must be a data register");
+    }
+
+    error = m68k_encode_ea(context, &src, M68K_SIZE_W, M68K_EAM_DATA, 0, &src_ea, src_ext, &src_ext_count);
+    if (error != NULL)
+    {
+        return error;
+    }
+
+    error = assemble_emit_word_be(context, ASSEMBLE_CPU_M68K,
+                                   (uint16_t) (0x4180u | (((uint32_t) dst.reg) << 9) | src_ea));
+    if (error != NULL)
+    {
+        return error;
+    }
+    return emit_ext_words(context, src_ext, src_ext_count);
+}
+
+/*******************************************************************
+ Function:      encode_bcd
+ Description:   Encodes ABCD/SBCD Dy,Dx or ABCD/SBCD -(Ay),-(Ax) --
+                the same two operand shapes as ADDX/SUBX, always byte
+                sized with no suffix written.
+ ******************************************************************/
+static _kernel_oserror *encode_bcd(assemble_context_t *context, int is_sbcd, m68k_size_t size,
+                                    const uint8_t *text, size_t length)
+{
+    m68k_operand_t src, dst;
+    unsigned char rm;
+    _kernel_oserror *error;
+
+    if (size != M68K_SIZE_NONE)
+    {
+        return assemble_set_error(ASSEMBLE_CPU_M68K, ASSEMBLE_ERROR_TYPE_SYNTAX, ASSEMBLE_M68K_ERR_BAD_SIZE,
+                                   "ABCD/SBCD does not take a size suffix (it is always byte-sized)");
+    }
+
+    error = parse_two_operands(context, text, length, &src, &dst);
+    if (error != NULL)
+    {
+        return error;
+    }
+
+    if (src.mode == M68K_EA_DN && dst.mode == M68K_EA_DN)
+    {
+        rm = 0;
+    }
+    else if (src.mode == M68K_EA_AN_PREDEC && dst.mode == M68K_EA_AN_PREDEC)
+    {
+        rm = 1;
+    }
+    else
+    {
+        return assemble_set_error(ASSEMBLE_CPU_M68K, ASSEMBLE_ERROR_TYPE_BAD_OPERAND, ASSEMBLE_M68K_ERR_BAD_EA,
+                                   "ABCD/SBCD requires two data registers or two predecrement operands");
+    }
+
+    return assemble_emit_word_be(context, ASSEMBLE_CPU_M68K,
+                                  (uint16_t) ((is_sbcd ? 0x8100u : 0xC100u) | (((uint32_t) dst.reg) << 9) |
+                                              ((uint32_t) rm << 3) | src.reg));
+}
+
+/*******************************************************************
+ Function:      encode_nbcd
+ Description:   Encodes NBCD <ea> -- a single data-alterable operand,
+                always byte-sized with no suffix written.
+ ******************************************************************/
+static _kernel_oserror *encode_nbcd(assemble_context_t *context, m68k_size_t size,
+                                     const uint8_t *text, size_t length)
+{
+    size_t pos = 0;
+    m68k_operand_t dst;
+    uint16_t dst_ea, dst_ext[2];
+    unsigned char dst_ext_count;
+    _kernel_oserror *error;
+
+    if (size != M68K_SIZE_NONE)
+    {
+        return assemble_set_error(ASSEMBLE_CPU_M68K, ASSEMBLE_ERROR_TYPE_SYNTAX, ASSEMBLE_M68K_ERR_BAD_SIZE,
+                                   "NBCD does not take a size suffix (it is always byte-sized)");
+    }
+
+    pos += assemble_skip_spaces(text + pos, length - pos);
+    error = parse_m68k_operand(context, text, length, &pos, &dst);
+    if (error != NULL)
+    {
+        return error;
+    }
+    error = check_trailing(text, length, pos);
+    if (error != NULL)
+    {
+        return error;
+    }
+
+    error = m68k_encode_ea(context, &dst, M68K_SIZE_B, M68K_EAM_DATA_ALTERABLE, 0, &dst_ea, dst_ext, &dst_ext_count);
+    if (error != NULL)
+    {
+        return error;
+    }
+
+    error = assemble_emit_word_be(context, ASSEMBLE_CPU_M68K, (uint16_t) (0x4800u | dst_ea));
+    if (error != NULL)
+    {
+        return error;
+    }
+    return emit_ext_words(context, dst_ext, dst_ext_count);
+}
+
 static _kernel_oserror *dispatch_family(assemble_context_t *context, const m68k_mnemonic_entry_t *entry,
                                          m68k_size_t size, const uint8_t *text, size_t length)
 {
@@ -1136,6 +1881,36 @@ static _kernel_oserror *dispatch_family(assemble_context_t *context, const m68k_
 
         case FAM_NOOP:
             return encode_noop(context, (uint16_t) entry->param1, text, length);
+
+        case FAM_ONE_OP:
+            return encode_one_op(context, (uint16_t) entry->param1, size, text, length);
+
+        case FAM_ADD_SUB:
+            return encode_add_sub(context, (int) entry->param1, entry->param2, size, text, length);
+
+        case FAM_ADDX_SUBX:
+            return encode_addx_subx(context, (int) entry->param1, size, text, length);
+
+        case FAM_ADDQ_SUBQ:
+            return encode_addq_subq(context, (int) entry->param1, size, text, length);
+
+        case FAM_MUL_DIV:
+            return encode_mul_div(context, (uint16_t) entry->param1, text, length);
+
+        case FAM_CMP:
+            return encode_cmp(context, entry->param2, size, text, length);
+
+        case FAM_CMPM:
+            return encode_cmpm(context, size, text, length);
+
+        case FAM_CHK:
+            return encode_chk(context, size, text, length);
+
+        case FAM_BCD:
+            return encode_bcd(context, (int) entry->param1, size, text, length);
+
+        case FAM_NBCD:
+            return encode_nbcd(context, size, text, length);
 
         default:
             break;
