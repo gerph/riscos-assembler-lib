@@ -1169,6 +1169,17 @@ line-at-a-time backends in a **stateful** SWI interface (`Assembler_Create`,
 many `Assembler_AssembleLine` calls, which the library's own `assemble_context_t`
 has no notion of (that's just one call's inputs/outputs).
 
+**RISC OS Open allocation status**: `module/cmhg/modhead`'s SWI chunk
+(`&C0000`) and error base (`&840000`) are still placeholders marked
+`UNALLOCATED` in comments — the registration request
+(`module/allocations/Assembler-allocation.yaml`/`,fb0`/`-email.txt`) was
+sent to `allocate@riscosopen.org` on 2026-08-14 (cc'd to Charles Ferguson)
+but no reply had been received as of that date. Do not release the module
+publicly, or treat the current SWI/error numbers as final, until the real
+allocated values come back and are substituted into `modhead`. See the
+`allocating-resources` skill for the registration process and the
+`sending-email` skill for how the email itself was sent.
+
 Build order matters: `module/Makefile,fe1` has `INCLUDES = C:Assemble.` and
 `LIBS = C:Assemble.o.libAssemble`, so the top-level `MakefileLib,fe1` must be
 built *and exported* (`riscos-amu -f MakefileLib export_hdr export_libs`)
