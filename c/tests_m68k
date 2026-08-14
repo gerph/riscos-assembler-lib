@@ -600,6 +600,73 @@ static const uint8_t     bytes_ror_imm[]   = { 0xE8, 0x58 };
 static const char *const lines_roxr_mem[]  = { "ROXR (A0)", NULL };
 static const uint8_t     bytes_roxr_mem[]  = { 0xE4, 0xD0 };
 
+/* ---- Program control (stage 5) --------------------------------------
+   Backward label references, matching the addressing-mode tests
+   above. A couple of these (JSR absolute-long, STOP) are cross-checked
+   directly against m68k/tests/asm_test.go's own vectors, cited where
+   used; the rest are hand-derived from the opcode map. */
+
+static const char *const lines_bra_s[]  = { ".loop", "NOP", "BRA.S loop", NULL };
+static const uint8_t     bytes_bra_s[]  = { 0x4E, 0x71, 0x60, 0xFC };
+
+static const char *const lines_beq_s[]  = { ".loop", "NOP", "BEQ.S loop", NULL };
+static const uint8_t     bytes_beq_s[]  = { 0x4E, 0x71, 0x67, 0xFC };
+
+static const char *const lines_bsr_w[]  = { ".loop", "NOP", "BSR.W loop", NULL };
+static const uint8_t     bytes_bsr_w[]  = { 0x4E, 0x71, 0x61, 0x00, 0xFF, 0xFC };
+
+static const char *const lines_dbra[]   = { ".loop", "NOP", "DBRA D0,loop", NULL };
+static const uint8_t     bytes_dbra[]   = { 0x4E, 0x71, 0x51, 0xC8, 0xFF, 0xFC };
+
+static const char *const lines_dbeq[]   = { ".loop", "NOP", "DBEQ D1,loop", NULL };
+static const uint8_t     bytes_dbeq[]   = { 0x4E, 0x71, 0x57, 0xC9, 0xFF, 0xFC };
+
+static const char *const lines_seq[]    = { "SEQ D0", NULL };
+static const uint8_t     bytes_seq[]    = { 0x57, 0xC0 };
+
+static const char *const lines_sle[]    = { "SLE (A0)", NULL };
+static const uint8_t     bytes_sle[]    = { 0x5F, 0xD0 };
+
+static const char *const lines_jmp[]    = { "JMP (A0)", NULL };
+static const uint8_t     bytes_jmp[]    = { 0x4E, 0xD0 };
+
+/* jsr $E.l -> 4E B9 00 00 00 0E, per m68k/tests/asm_test.go's
+   TestFlowControl_Encodings. */
+static const char *const lines_jsr[]    = { "JSR (&E).L", NULL };
+static const uint8_t     bytes_jsr[]    = { 0x4E, 0xB9, 0x00, 0x00, 0x00, 0x0E };
+
+static const char *const lines_trap1[]  = { "TRAP #1", NULL };
+static const uint8_t     bytes_trap1[]  = { 0x4E, 0x41 };
+
+static const char *const lines_trap15[] = { "TRAP #15", NULL };
+static const uint8_t     bytes_trap15[] = { 0x4E, 0x4F };
+
+/* stop #$2700 -> 4E 72 27 00, per m68k/tests/asm_test.go's
+   TestBasicEncodings. */
+static const char *const lines_stop[]   = { "STOP #&2700", NULL };
+static const uint8_t     bytes_stop[]   = { 0x4E, 0x72, 0x27, 0x00 };
+
+static const char *const lines_link[]   = { "LINK A6,#-8", NULL };
+static const uint8_t     bytes_link[]   = { 0x4E, 0x56, 0xFF, 0xF8 };
+
+static const char *const lines_unlk[]   = { "UNLK A6", NULL };
+static const uint8_t     bytes_unlk[]   = { 0x4E, 0x5E };
+
+static const char *const lines_rtr[]     = { "RTR", NULL };
+static const uint8_t     bytes_rtr[]     = { 0x4E, 0x77 };
+
+static const char *const lines_rte[]     = { "RTE", NULL };
+static const uint8_t     bytes_rte[]     = { 0x4E, 0x73 };
+
+static const char *const lines_reset[]   = { "RESET", NULL };
+static const uint8_t     bytes_reset[]   = { 0x4E, 0x70 };
+
+static const char *const lines_illegal[] = { "ILLEGAL", NULL };
+static const uint8_t     bytes_illegal[] = { 0x4A, 0xFC };
+
+static const char *const lines_trapv[]   = { "TRAPV", NULL };
+static const uint8_t     bytes_trapv[]   = { 0x4E, 0x76 };
+
 /* ---- Error cases --------------------------------------------------- */
 
 static const char *const lines_err_bad_mnemonic[]  = { "FOOBAR", NULL };
@@ -628,6 +695,13 @@ static const char *const lines_err_shift_range[]   = { "ASL.W #9,D0", NULL };
 static const char *const lines_err_shift_dn_alone[]= { "ASL D0", NULL };
 static const char *const lines_err_shift_mem_size[]= { "LSR.B (A0)", NULL };
 static const char *const lines_err_btst_src[]      = { "BTST (A0),D0", NULL };
+static const char *const lines_err_branch_no_size[]= { "BEQ label", NULL };
+static const char *const lines_err_branch_s_range[]= { ".far EQU &9000", "BEQ.S far", NULL };
+static const char *const lines_err_dbcc_missing[]  = { "DBEQ D0", NULL };
+static const char *const lines_err_trap_range[]    = { "TRAP #16", NULL };
+static const char *const lines_err_scc_size[]       = { "SEQ.B D0", NULL };
+static const char *const lines_err_jmp_dn[]        = { "JMP D0", NULL };
+static const char *const lines_err_link_dn[]       = { "LINK D0,#0", NULL };
 
 static const test_case_t tests[] = {
     { "NOP",                                lines_nop,               bytes_nop,               sizeof(bytes_nop),               0 },
@@ -713,6 +787,26 @@ static const test_case_t tests[] = {
     { "ROR immediate count",                lines_ror_imm,           bytes_ror_imm,           sizeof(bytes_ror_imm),           0 },
     { "ROXR memory form",                   lines_roxr_mem,          bytes_roxr_mem,          sizeof(bytes_roxr_mem),          0 },
 
+    { "BRA.S",                              lines_bra_s,             bytes_bra_s,             sizeof(bytes_bra_s),             0 },
+    { "BEQ.S (structural Bcc)",             lines_beq_s,             bytes_beq_s,             sizeof(bytes_beq_s),             0 },
+    { "BSR.W",                              lines_bsr_w,             bytes_bsr_w,             sizeof(bytes_bsr_w),             0 },
+    { "DBRA",                               lines_dbra,              bytes_dbra,              sizeof(bytes_dbra),              0 },
+    { "DBEQ (structural DBcc)",             lines_dbeq,              bytes_dbeq,              sizeof(bytes_dbeq),              0 },
+    { "SEQ (structural Scc), Dn dest",      lines_seq,               bytes_seq,               sizeof(bytes_seq),               0 },
+    { "SLE, memory destination",            lines_sle,               bytes_sle,               sizeof(bytes_sle),               0 },
+    { "JMP",                                lines_jmp,               bytes_jmp,               sizeof(bytes_jmp),               0 },
+    { "JSR absolute long",                  lines_jsr,               bytes_jsr,               sizeof(bytes_jsr),               0 },
+    { "TRAP #1",                            lines_trap1,             bytes_trap1,             sizeof(bytes_trap1),             0 },
+    { "TRAP #15",                           lines_trap15,            bytes_trap15,            sizeof(bytes_trap15),            0 },
+    { "STOP",                               lines_stop,              bytes_stop,              sizeof(bytes_stop),              0 },
+    { "LINK",                               lines_link,              bytes_link,              sizeof(bytes_link),              0 },
+    { "UNLK",                               lines_unlk,              bytes_unlk,              sizeof(bytes_unlk),              0 },
+    { "RTR",                                lines_rtr,               bytes_rtr,               sizeof(bytes_rtr),               0 },
+    { "RTE",                                lines_rte,               bytes_rte,               sizeof(bytes_rte),               0 },
+    { "RESET",                              lines_reset,             bytes_reset,             sizeof(bytes_reset),             0 },
+    { "ILLEGAL",                            lines_illegal,           bytes_illegal,           sizeof(bytes_illegal),           0 },
+    { "TRAPV",                              lines_trapv,             bytes_trapv,             sizeof(bytes_trapv),             0 },
+
     { "error: bad mnemonic",                lines_err_bad_mnemonic,  NULL, 0, 1 },
     { "error: MOVE requires a size suffix", lines_err_move_no_size,  NULL, 0, 1 },
     { "error: MOVE bad size suffix",        lines_err_move_bad_size, NULL, 0, 1 },
@@ -738,7 +832,14 @@ static const test_case_t tests[] = {
     { "error: shift count out of range",    lines_err_shift_range,    NULL, 0, 1 },
     { "error: shift with bare Dn operand",  lines_err_shift_dn_alone, NULL, 0, 1 },
     { "error: memory shift with .B suffix", lines_err_shift_mem_size, NULL, 0, 1 },
-    { "error: BTST memory source",          lines_err_btst_src,       NULL, 0, 1 }
+    { "error: BTST memory source",          lines_err_btst_src,       NULL, 0, 1 },
+    { "error: Bcc requires .S/.W suffix",   lines_err_branch_no_size, NULL, 0, 1 },
+    { "error: BEQ.S target out of range",   lines_err_branch_s_range, NULL, 0, 1 },
+    { "error: DBcc missing target",         lines_err_dbcc_missing,   NULL, 0, 1 },
+    { "error: TRAP vector out of range",    lines_err_trap_range,     NULL, 0, 1 },
+    { "error: Scc does not support .B",     lines_err_scc_size,       NULL, 0, 1 },
+    { "error: JMP to a data register",      lines_err_jmp_dn,         NULL, 0, 1 },
+    { "error: LINK with a data register",   lines_err_link_dn,        NULL, 0, 1 }
 };
 
 int run_tests_m68k(void)

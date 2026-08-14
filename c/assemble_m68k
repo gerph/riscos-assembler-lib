@@ -44,7 +44,8 @@ typedef enum m68k_size
     M68K_SIZE_NONE = 0,  /* no suffix given, or suffix not applicable */
     M68K_SIZE_B,
     M68K_SIZE_W,
-    M68K_SIZE_L
+    M68K_SIZE_L,
+    M68K_SIZE_S          /* Bcc/BRA/BSR's mandatory 8-bit-displacement suffix only */
 } m68k_size_t;
 
 /* The eight EA "mode" field values, matching the real 3-bit mode field
@@ -106,6 +107,8 @@ typedef struct m68k_operand
 #define M68K_EAM_PC_INDEX   (1u << 10)
 #define M68K_EAM_IMMEDIATE  (1u << 11)
 
+#define M68K_EAM_CONTROL          (M68K_EAM_AN_IND | M68K_EAM_AN_DISP | M68K_EAM_AN_INDEX | \
+                                    M68K_EAM_ABS_SHORT | M68K_EAM_ABS_LONG | M68K_EAM_PC_DISP | M68K_EAM_PC_INDEX)
 #define M68K_EAM_MEMORY           (M68K_EAM_AN_IND | M68K_EAM_AN_POSTINC | M68K_EAM_AN_PREDEC | \
                                     M68K_EAM_AN_DISP | M68K_EAM_AN_INDEX | M68K_EAM_ABS_SHORT | \
                                     M68K_EAM_ABS_LONG | M68K_EAM_PC_DISP | M68K_EAM_PC_INDEX | M68K_EAM_IMMEDIATE)
@@ -879,7 +882,12 @@ typedef enum m68k_family
     FAM_NBCD,
     FAM_LOGIC,       /* AND/OR/EOR/ANDI/ORI/EORI, param1: 0=AND 1=OR 2=EOR, param2 selects force_kind */
     FAM_BIT_OP,      /* BTST/BSET/BCLR/BCHG, param1: 0=BTST 1=BCHG 2=BCLR 3=BSET */
-    FAM_SHIFT        /* ASx/LSx/ROXx/ROx, param1=type (0=AS 1=LS 2=ROX 3=RO), param2=direction (0=right 1=left) */
+    FAM_SHIFT,       /* ASx/LSx/ROXx/ROx, param1=type (0=AS 1=LS 2=ROX 3=RO), param2=direction (0=right 1=left) */
+    FAM_JMP_JSR,     /* JMP/JSR, param1 = base opcode */
+    FAM_TRAP,        /* TRAP #vector */
+    FAM_STOP,        /* STOP #imm */
+    FAM_LINK,        /* LINK An,#disp16 */
+    FAM_UNLK         /* UNLK An */
 } m68k_family_t;
 
 /* FAM_ADD_SUB/FAM_CMP 'force_kind' values (param2): auto-detect the
@@ -908,8 +916,10 @@ typedef struct m68k_mnemonic_entry
 #define SZ_B    0x1u
 #define SZ_W    0x2u
 #define SZ_L    0x4u
+#define SZ_S    0x8u    /* Bcc/BRA/BSR's mandatory .S suffix only */
 #define SZ_BWL  (SZ_B | SZ_W | SZ_L)
 #define SZ_WL   (SZ_W | SZ_L)
+#define SZ_SW   (SZ_S | SZ_W)
 #define SZ_NONE 0u
 
 static const m68k_mnemonic_entry_t m68k_mnemonics[] = {
@@ -917,8 +927,20 @@ static const m68k_mnemonic_entry_t m68k_mnemonics[] = {
     { "MOVEA", FAM_MOVE, 0, 0, SZ_WL },
     { "MOVEQ", FAM_MOVE, 0, 0, SZ_NONE },
 
-    { "NOP", FAM_NOOP, 0x4E71, 0, SZ_NONE },
-    { "RTS", FAM_NOOP, 0x4E75, 0, SZ_NONE },
+    { "NOP",     FAM_NOOP, 0x4E71, 0, SZ_NONE },
+    { "RTS",     FAM_NOOP, 0x4E75, 0, SZ_NONE },
+    { "RTR",     FAM_NOOP, 0x4E77, 0, SZ_NONE },
+    { "RTE",     FAM_NOOP, 0x4E73, 0, SZ_NONE },
+    { "RESET",   FAM_NOOP, 0x4E70, 0, SZ_NONE },
+    { "ILLEGAL", FAM_NOOP, 0x4AFC, 0, SZ_NONE },
+    { "TRAPV",   FAM_NOOP, 0x4E76, 0, SZ_NONE },
+
+    { "JMP", FAM_JMP_JSR, 0x4EC0, 0, SZ_NONE },
+    { "JSR", FAM_JMP_JSR, 0x4E80, 0, SZ_NONE },
+    { "TRAP", FAM_TRAP, 0, 0, SZ_NONE },
+    { "STOP", FAM_STOP, 0, 0, SZ_NONE },
+    { "LINK", FAM_LINK, 0, 0, SZ_NONE },
+    { "UNLK", FAM_UNLK, 0, 0, SZ_NONE },
 
     { "CLR",  FAM_ONE_OP, 0x4200, 0, SZ_BWL },
     { "NEG",  FAM_ONE_OP, 0x4400, 0, SZ_BWL },
@@ -1046,9 +1068,10 @@ static _kernel_oserror *parse_size_suffix(const uint8_t *text, size_t length, si
         if (ch == 'B') { *out_size = M68K_SIZE_B; *pos_inout = pos + 2; return NULL; }
         if (ch == 'W') { *out_size = M68K_SIZE_W; *pos_inout = pos + 2; return NULL; }
         if (ch == 'L') { *out_size = M68K_SIZE_L; *pos_inout = pos + 2; return NULL; }
+        if (ch == 'S') { *out_size = M68K_SIZE_S; *pos_inout = pos + 2; return NULL; }
 
         return assemble_set_error(ASSEMBLE_CPU_M68K, ASSEMBLE_ERROR_TYPE_SYNTAX, ASSEMBLE_M68K_ERR_BAD_SIZE,
-                                   "Invalid size suffix (expected .B, .W or .L)");
+                                   "Invalid size suffix (expected .B, .W, .L, or .S for a branch)");
     }
     *out_size = M68K_SIZE_NONE;
     return NULL;
@@ -2342,6 +2365,451 @@ static _kernel_oserror *encode_shift(assemble_context_t *context, uint32_t type,
                                "Shift/rotate count must be a data register or #immediate");
 }
 
+/*******************************************************************
+ Function:      encode_jmp_jsr
+ Description:   Encodes JMP/JSR <ea>. Destination must be a control
+                addressing mode (memory-indirect or PC-relative, not a
+                register, postincrement/predecrement or immediate).
+ ******************************************************************/
+static _kernel_oserror *encode_jmp_jsr(assemble_context_t *context, uint16_t base,
+                                        const uint8_t *text, size_t length)
+{
+    size_t pos = 0;
+    m68k_operand_t dst;
+    uint16_t dst_ea, dst_ext[2];
+    unsigned char dst_ext_count;
+    _kernel_oserror *error;
+
+    pos += assemble_skip_spaces(text + pos, length - pos);
+    error = parse_m68k_operand(context, text, length, &pos, &dst);
+    if (error != NULL)
+    {
+        return error;
+    }
+    error = check_trailing(text, length, pos);
+    if (error != NULL)
+    {
+        return error;
+    }
+
+    error = m68k_encode_ea(context, &dst, M68K_SIZE_L, M68K_EAM_CONTROL, 0, &dst_ea, dst_ext, &dst_ext_count);
+    if (error != NULL)
+    {
+        return error;
+    }
+
+    error = assemble_emit_word_be(context, ASSEMBLE_CPU_M68K, (uint16_t) (base | dst_ea));
+    if (error != NULL)
+    {
+        return error;
+    }
+    return emit_ext_words(context, dst_ext, dst_ext_count);
+}
+
+/*******************************************************************
+ Function:      encode_trap
+ Description:   Encodes TRAP #vector (vector 0-15).
+ ******************************************************************/
+static _kernel_oserror *encode_trap(assemble_context_t *context, const uint8_t *text, size_t length)
+{
+    size_t pos = 0;
+    int32_t vec;
+    _kernel_oserror *error;
+
+    pos += assemble_skip_spaces(text + pos, length - pos);
+    if (!(pos < length && text[pos] == '#'))
+    {
+        return assemble_set_error(ASSEMBLE_CPU_M68K, ASSEMBLE_ERROR_TYPE_BAD_OPERAND, ASSEMBLE_M68K_ERR_BAD_EA,
+                                   "TRAP requires an immediate vector number");
+    }
+    pos += 1;
+    error = eval_numeric(context, text, length, &pos, &vec);
+    if (error != NULL)
+    {
+        return error;
+    }
+    if (vec < 0 || vec > 15)
+    {
+        return assemble_set_error(ASSEMBLE_CPU_M68K, ASSEMBLE_ERROR_TYPE_RANGE, ASSEMBLE_M68K_ERR_IMMEDIATE_RANGE,
+                                   "TRAP vector out of range 0..15");
+    }
+    error = check_trailing(text, length, pos);
+    if (error != NULL)
+    {
+        return error;
+    }
+
+    return assemble_emit_word_be(context, ASSEMBLE_CPU_M68K, (uint16_t) (0x4E40u | (uint32_t) vec));
+}
+
+/*******************************************************************
+ Function:      encode_stop
+ Description:   Encodes STOP #imm -- a fixed opcode followed by one
+                16-bit immediate word (the SR value to load).
+ ******************************************************************/
+static _kernel_oserror *encode_stop(assemble_context_t *context, const uint8_t *text, size_t length)
+{
+    size_t pos = 0;
+    int32_t imm;
+    _kernel_oserror *error;
+
+    pos += assemble_skip_spaces(text + pos, length - pos);
+    if (!(pos < length && text[pos] == '#'))
+    {
+        return assemble_set_error(ASSEMBLE_CPU_M68K, ASSEMBLE_ERROR_TYPE_BAD_OPERAND, ASSEMBLE_M68K_ERR_BAD_EA,
+                                   "STOP requires an immediate operand");
+    }
+    pos += 1;
+    error = eval_numeric(context, text, length, &pos, &imm);
+    if (error != NULL)
+    {
+        return error;
+    }
+    if (imm < -32768 || imm > 65535)
+    {
+        return assemble_set_error(ASSEMBLE_CPU_M68K, ASSEMBLE_ERROR_TYPE_RANGE, ASSEMBLE_M68K_ERR_IMMEDIATE_RANGE,
+                                   "STOP immediate out of range");
+    }
+    error = check_trailing(text, length, pos);
+    if (error != NULL)
+    {
+        return error;
+    }
+
+    error = assemble_emit_word_be(context, ASSEMBLE_CPU_M68K, 0x4E72u);
+    if (error != NULL)
+    {
+        return error;
+    }
+    return assemble_emit_word_be(context, ASSEMBLE_CPU_M68K, (uint16_t) imm);
+}
+
+/*******************************************************************
+ Function:      encode_link
+ Description:   Encodes LINK An,#disp16 (word displacement only --
+                LINK.L's 32-bit displacement is a 68020 addition).
+ ******************************************************************/
+static _kernel_oserror *encode_link(assemble_context_t *context, const uint8_t *text, size_t length)
+{
+    size_t pos = 0;
+    uint16_t reg;
+    int32_t disp;
+    _kernel_oserror *error;
+
+    pos += assemble_skip_spaces(text + pos, length - pos);
+    if (!parse_addr_register(text, length, &pos, &reg))
+    {
+        return assemble_set_error(ASSEMBLE_CPU_M68K, ASSEMBLE_ERROR_TYPE_BAD_OPERAND, ASSEMBLE_M68K_ERR_BAD_REGISTER,
+                                   "LINK requires an address register");
+    }
+    pos += assemble_skip_spaces(text + pos, length - pos);
+    if (!(pos < length && text[pos] == ','))
+    {
+        return assemble_set_error(ASSEMBLE_CPU_M68K, ASSEMBLE_ERROR_TYPE_SYNTAX, ASSEMBLE_M68K_ERR_NONE,
+                                   "Expected ','");
+    }
+    pos += 1;
+    pos += assemble_skip_spaces(text + pos, length - pos);
+    if (!(pos < length && text[pos] == '#'))
+    {
+        return assemble_set_error(ASSEMBLE_CPU_M68K, ASSEMBLE_ERROR_TYPE_BAD_OPERAND, ASSEMBLE_M68K_ERR_BAD_EA,
+                                   "LINK requires an immediate displacement");
+    }
+    pos += 1;
+    error = eval_numeric(context, text, length, &pos, &disp);
+    if (error != NULL)
+    {
+        return error;
+    }
+    if (disp < -32768 || disp > 32767)
+    {
+        return assemble_set_error(ASSEMBLE_CPU_M68K, ASSEMBLE_ERROR_TYPE_RANGE, ASSEMBLE_M68K_ERR_DISPLACEMENT_RANGE,
+                                   "LINK displacement out of range");
+    }
+    error = check_trailing(text, length, pos);
+    if (error != NULL)
+    {
+        return error;
+    }
+
+    error = assemble_emit_word_be(context, ASSEMBLE_CPU_M68K, (uint16_t) (0x4E50u | reg));
+    if (error != NULL)
+    {
+        return error;
+    }
+    return assemble_emit_word_be(context, ASSEMBLE_CPU_M68K, (uint16_t) disp);
+}
+
+/*******************************************************************
+ Function:      encode_unlk
+ Description:   Encodes UNLK An.
+ ******************************************************************/
+static _kernel_oserror *encode_unlk(assemble_context_t *context, const uint8_t *text, size_t length)
+{
+    size_t pos = 0;
+    uint16_t reg;
+    _kernel_oserror *error;
+
+    pos += assemble_skip_spaces(text + pos, length - pos);
+    if (!parse_addr_register(text, length, &pos, &reg))
+    {
+        return assemble_set_error(ASSEMBLE_CPU_M68K, ASSEMBLE_ERROR_TYPE_BAD_OPERAND, ASSEMBLE_M68K_ERR_BAD_REGISTER,
+                                   "UNLK requires an address register");
+    }
+    error = check_trailing(text, length, pos);
+    if (error != NULL)
+    {
+        return error;
+    }
+
+    return assemble_emit_word_be(context, ASSEMBLE_CPU_M68K, (uint16_t) (0x4E58u | reg));
+}
+
+/* ---- Bcc/BRA/BSR, Scc, DBcc -----------------------------------------
+   These 46 mnemonics (14 real Bcc conditions + BRA + BSR, 16 Scc
+   conditions, 16 DBcc conditions) are recognised structurally --
+   root/prefix plus a condition-code suffix -- rather than as 46
+   separate mnemonic-table rows, the same technique assemble_arm32
+   uses for its own condition-code suffix mnemonics. */
+
+/*******************************************************************
+ Function:      match_condition
+ Description:   Matches an upper-case condition-code mnemonic suffix
+                (eg "EQ", "HI", "CC") against the 16 standard 68000
+                conditions. CC/HS and CS/LO are accepted as synonyms.
+ Parameters:    suffix = the upper-case suffix text (NUL-terminated)
+                out_cc = [[out]] the matched 4-bit condition code
+ Returns:       non-zero if 'suffix' names a real condition
+ ******************************************************************/
+static int match_condition(const char *suffix, uint16_t *out_cc)
+{
+    static const struct { const char *name; uint16_t cc; } table[] = {
+        { "T", 0 }, { "F", 1 }, { "HI", 2 }, { "LS", 3 }, { "CC", 4 }, { "HS", 4 },
+        { "CS", 5 }, { "LO", 5 }, { "NE", 6 }, { "EQ", 7 }, { "VC", 8 }, { "VS", 9 },
+        { "PL", 10 }, { "MI", 11 }, { "GE", 12 }, { "LT", 13 }, { "GT", 14 }, { "LE", 15 }
+    };
+    size_t i;
+
+    for (i = 0; i < sizeof(table) / sizeof(table[0]); i++)
+    {
+        if (strcmp(suffix, table[i].name) == 0)
+        {
+            *out_cc = table[i].cc;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/*******************************************************************
+ Function:      try_match_branch_scc_dbcc
+ Description:   Tests whether 'root' (the mnemonic already read by
+                read_mnemonic()) is BRA, BSR, or a structural Bcc/Scc/
+                DBcc mnemonic, and if so which kind and condition.
+ Parameters:    root = the upper-case mnemonic root
+                out_kind = [[out]] 0=Bcc/BRA/BSR, 1=Scc, 2=DBcc
+                out_cc = [[out]] the 4-bit condition code (BRA=0,
+                         BSR=1, matching their real opcode field values)
+ Returns:       non-zero if 'root' matched
+ ******************************************************************/
+static int try_match_branch_scc_dbcc(const char *root, int *out_kind, uint16_t *out_cc)
+{
+    size_t len = strlen(root);
+
+    if (strcmp(root, "BRA") == 0) { *out_kind = 0; *out_cc = 0; return 1; }
+    if (strcmp(root, "BSR") == 0) { *out_kind = 0; *out_cc = 1; return 1; }
+    if (len >= 2 && root[0] == 'B' && match_condition(root + 1, out_cc) && *out_cc >= 2)
+    {
+        *out_kind = 0;
+        return 1;
+    }
+    if (len >= 2 && root[0] == 'S' && match_condition(root + 1, out_cc))
+    {
+        *out_kind = 1;
+        return 1;
+    }
+    if (strcmp(root, "DBRA") == 0) { *out_kind = 2; *out_cc = 1; return 1; }
+    if (len >= 3 && root[0] == 'D' && root[1] == 'B' && match_condition(root + 2, out_cc))
+    {
+        *out_kind = 2;
+        return 1;
+    }
+    return 0;
+}
+
+/*******************************************************************
+ Function:      encode_branch
+ Description:   Encodes Bcc/BRA/BSR. The displacement is always
+                relative to the address of the extension word that
+                would follow the opcode (context->address + 2); for
+                .S it is packed into the opcode's own low byte instead
+                (and must be non-zero, since a zero low byte is the
+                CPU's own signal for the .W word-displacement form).
+ Parameters:    context = the assembly context
+                cc = the 4-bit condition code (0=BRA, 1=BSR, 2-15=Bcc)
+                size = the parsed size suffix -- must be .S or .W
+                text/length = the operand text following the mnemonic
+ Returns:       NULL if successful, otherwise a static error block
+ ******************************************************************/
+static _kernel_oserror *encode_branch(assemble_context_t *context, uint16_t cc, m68k_size_t size,
+                                       const uint8_t *text, size_t length)
+{
+    size_t pos = 0;
+    int32_t target, disp;
+    _kernel_oserror *error;
+
+    if (size != M68K_SIZE_S && size != M68K_SIZE_W)
+    {
+        return assemble_set_error(ASSEMBLE_CPU_M68K, ASSEMBLE_ERROR_TYPE_SYNTAX,
+                                   ASSEMBLE_M68K_ERR_BRANCH_SIZE_REQUIRED,
+                                   "Bcc/BRA/BSR requires an explicit .S or .W size suffix");
+    }
+
+    pos += assemble_skip_spaces(text + pos, length - pos);
+    error = eval_numeric(context, text, length, &pos, &target);
+    if (error != NULL)
+    {
+        return error;
+    }
+    error = check_trailing(text, length, pos);
+    if (error != NULL)
+    {
+        return error;
+    }
+
+    disp = target - (int32_t) (context->address + 2u);
+
+    if (size == M68K_SIZE_S)
+    {
+        if (disp < -128 || disp > 127 || disp == 0)
+        {
+            return assemble_set_error(ASSEMBLE_CPU_M68K, ASSEMBLE_ERROR_TYPE_RANGE, ASSEMBLE_M68K_ERR_BRANCH_RANGE,
+                                       "Branch target out of range for .S (or exactly the following "
+                                       "instruction, which needs .W)");
+        }
+        return assemble_emit_word_be(context, ASSEMBLE_CPU_M68K,
+                                      (uint16_t) (0x6000u | (cc << 8) | ((uint32_t) disp & 0xFFu)));
+    }
+
+    if (disp < -32768 || disp > 32767)
+    {
+        return assemble_set_error(ASSEMBLE_CPU_M68K, ASSEMBLE_ERROR_TYPE_RANGE, ASSEMBLE_M68K_ERR_BRANCH_RANGE,
+                                   "Branch target out of range for .W");
+    }
+    error = assemble_emit_word_be(context, ASSEMBLE_CPU_M68K, (uint16_t) (0x6000u | (cc << 8)));
+    if (error != NULL)
+    {
+        return error;
+    }
+    return assemble_emit_word_be(context, ASSEMBLE_CPU_M68K, (uint16_t) disp);
+}
+
+/*******************************************************************
+ Function:      encode_scc
+ Description:   Encodes Scc <ea> -- a single byte-sized data-alterable
+                operand, no size suffix.
+ ******************************************************************/
+static _kernel_oserror *encode_scc(assemble_context_t *context, uint16_t cc, m68k_size_t size,
+                                    const uint8_t *text, size_t length)
+{
+    size_t pos = 0;
+    m68k_operand_t dst;
+    uint16_t dst_ea, dst_ext[2];
+    unsigned char dst_ext_count;
+    _kernel_oserror *error;
+
+    if (size != M68K_SIZE_NONE)
+    {
+        return assemble_set_error(ASSEMBLE_CPU_M68K, ASSEMBLE_ERROR_TYPE_SYNTAX, ASSEMBLE_M68K_ERR_BAD_SIZE,
+                                   "Scc does not take a size suffix (it is always byte-sized)");
+    }
+
+    pos += assemble_skip_spaces(text + pos, length - pos);
+    error = parse_m68k_operand(context, text, length, &pos, &dst);
+    if (error != NULL)
+    {
+        return error;
+    }
+    error = check_trailing(text, length, pos);
+    if (error != NULL)
+    {
+        return error;
+    }
+
+    error = m68k_encode_ea(context, &dst, M68K_SIZE_B, M68K_EAM_DATA_ALTERABLE, 0, &dst_ea, dst_ext, &dst_ext_count);
+    if (error != NULL)
+    {
+        return error;
+    }
+
+    error = assemble_emit_word_be(context, ASSEMBLE_CPU_M68K, (uint16_t) (0x50C0u | (cc << 8) | dst_ea));
+    if (error != NULL)
+    {
+        return error;
+    }
+    return emit_ext_words(context, dst_ext, dst_ext_count);
+}
+
+/*******************************************************************
+ Function:      encode_dbcc
+ Description:   Encodes DBcc Dn,<target> (DBRA is DBcc with cc=F).
+                The branch displacement is always word-sized, no size
+                suffix accepted.
+ ******************************************************************/
+static _kernel_oserror *encode_dbcc(assemble_context_t *context, uint16_t cc, m68k_size_t size,
+                                     const uint8_t *text, size_t length)
+{
+    size_t pos = 0;
+    uint16_t reg;
+    int32_t target, disp;
+    _kernel_oserror *error;
+
+    if (size != M68K_SIZE_NONE)
+    {
+        return assemble_set_error(ASSEMBLE_CPU_M68K, ASSEMBLE_ERROR_TYPE_SYNTAX, ASSEMBLE_M68K_ERR_BAD_SIZE,
+                                   "DBcc does not take a size suffix (its displacement is always word-sized)");
+    }
+
+    pos += assemble_skip_spaces(text + pos, length - pos);
+    if (!parse_data_register(text, length, &pos, &reg))
+    {
+        return assemble_set_error(ASSEMBLE_CPU_M68K, ASSEMBLE_ERROR_TYPE_BAD_OPERAND, ASSEMBLE_M68K_ERR_BAD_REGISTER,
+                                   "DBcc requires a data register");
+    }
+    pos += assemble_skip_spaces(text + pos, length - pos);
+    if (!(pos < length && text[pos] == ','))
+    {
+        return assemble_set_error(ASSEMBLE_CPU_M68K, ASSEMBLE_ERROR_TYPE_SYNTAX, ASSEMBLE_M68K_ERR_NONE,
+                                   "Expected ','");
+    }
+    pos += 1;
+    pos += assemble_skip_spaces(text + pos, length - pos);
+    error = eval_numeric(context, text, length, &pos, &target);
+    if (error != NULL)
+    {
+        return error;
+    }
+    error = check_trailing(text, length, pos);
+    if (error != NULL)
+    {
+        return error;
+    }
+
+    disp = target - (int32_t) (context->address + 2u);
+    if (disp < -32768 || disp > 32767)
+    {
+        return assemble_set_error(ASSEMBLE_CPU_M68K, ASSEMBLE_ERROR_TYPE_RANGE, ASSEMBLE_M68K_ERR_BRANCH_RANGE,
+                                   "DBcc branch target out of range");
+    }
+
+    error = assemble_emit_word_be(context, ASSEMBLE_CPU_M68K, (uint16_t) (0x50C8u | (cc << 8) | reg));
+    if (error != NULL)
+    {
+        return error;
+    }
+    return assemble_emit_word_be(context, ASSEMBLE_CPU_M68K, (uint16_t) disp);
+}
+
 static _kernel_oserror *dispatch_family(assemble_context_t *context, const m68k_mnemonic_entry_t *entry,
                                          m68k_size_t size, const uint8_t *text, size_t length)
 {
@@ -2395,6 +2863,21 @@ static _kernel_oserror *dispatch_family(assemble_context_t *context, const m68k_
 
         case FAM_SHIFT:
             return encode_shift(context, entry->param1, entry->param2, size, text, length);
+
+        case FAM_JMP_JSR:
+            return encode_jmp_jsr(context, (uint16_t) entry->param1, text, length);
+
+        case FAM_TRAP:
+            return encode_trap(context, text, length);
+
+        case FAM_STOP:
+            return encode_stop(context, text, length);
+
+        case FAM_LINK:
+            return encode_link(context, text, length);
+
+        case FAM_UNLK:
+            return encode_unlk(context, text, length);
 
         default:
             break;
@@ -2617,6 +3100,26 @@ _kernel_oserror *assemble_m68k_line(assemble_context_t *context,
     entry = find_mnemonic(mnemonic);
     if (entry == NULL)
     {
+        int kind;
+        uint16_t cc;
+
+        if (try_match_branch_scc_dbcc(mnemonic, &kind, &cc))
+        {
+            error = parse_size_suffix(line, line_length, &pos, &size);
+            if (error != NULL)
+            {
+                return error;
+            }
+            pos += assemble_skip_spaces(line + pos, line_length - pos);
+
+            switch (kind)
+            {
+                case 0: return encode_branch(context, cc, size, line + pos, line_length - pos);
+                case 1: return encode_scc(context, cc, size, line + pos, line_length - pos);
+                default: return encode_dbcc(context, cc, size, line + pos, line_length - pos);
+            }
+        }
+
         return assemble_set_error(ASSEMBLE_CPU_M68K, ASSEMBLE_ERROR_TYPE_BAD_MNEMONIC, ASSEMBLE_M68K_ERR_NONE,
                                    "Mnemonic not recognised");
     }
@@ -2628,7 +3131,8 @@ _kernel_oserror *assemble_m68k_line(assemble_context_t *context,
     }
     if (size != M68K_SIZE_NONE)
     {
-        unsigned char bit = (size == M68K_SIZE_B) ? SZ_B : (size == M68K_SIZE_W) ? SZ_W : SZ_L;
+        unsigned char bit = (size == M68K_SIZE_B) ? SZ_B : (size == M68K_SIZE_W) ? SZ_W :
+                             (size == M68K_SIZE_L) ? SZ_L : SZ_S;
 
         if ((entry->size_mask & bit) == 0)
         {
