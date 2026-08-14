@@ -1055,6 +1055,25 @@ static size_t read_mnemonic(const uint8_t *text, size_t length, char *out)
         pos += 1;
     }
 
+    /* DC.B/DC.W/DC.L/DS.B/DS.W/DS.L (the native-directive dialect's
+       data pseudo-ops) are the only mnemonics in this backend that
+       carry a '.' as part of the mnemonic token itself, rather than
+       as a separate size suffix parsed afterwards by
+       parse_size_suffix() -- scoped to just these two roots, not a
+       general "allow dots in identifiers" change. */
+    if (count == 2 && (memcmp(out, "DC", 2) == 0 || memcmp(out, "DS", 2) == 0) &&
+        pos + 1 < length && text[pos] == '.')
+    {
+        int ch = toupper((int) text[pos + 1]);
+
+        if (ch == 'B' || ch == 'W' || ch == 'L')
+        {
+            out[count++] = '.';
+            out[count++] = (char) ch;
+            pos += 2;
+        }
+    }
+
     out[count] = '\0';
     return pos;
 }
@@ -3554,17 +3573,18 @@ static _kernel_oserror *dispatch_family(assemble_context_t *context, const m68k_
 
 /*******************************************************************
  Function:      assemble_dc
- Description:   Assembles a DCB/DCW/DCD pseudo-op: a comma-separated
+ Description:   Assembles a DCB/DCW/DCD (or, in the native-directive
+                dialect, DC.B/DC.W/DC.L) pseudo-op: a comma-separated
                 list of expressions, each emitted as a byte, 16-bit
                 word or 32-bit doubleword respectively, big-endian.
                 No padding is added for an odd byte count -- see
                 h/assemble_m68k's deficiencies comment.
  Parameters:    context = the assembly context
-                mnemonic = "DCB", "DCW" or "DCD"
+                unit = 'B', 'W' or 'L'
                 text/length = the operand text following the mnemonic
  Returns:       NULL if successful, otherwise a static error block
  ******************************************************************/
-static _kernel_oserror *assemble_dc(assemble_context_t *context, const char *mnemonic,
+static _kernel_oserror *assemble_dc(assemble_context_t *context, char unit,
                                      const uint8_t *text, size_t length)
 {
     size_t pos = 0;
@@ -3581,11 +3601,11 @@ static _kernel_oserror *assemble_dc(assemble_context_t *context, const char *mne
             return error;
         }
 
-        if (strcmp(mnemonic, "DCB") == 0)
+        if (unit == 'B')
         {
             error = assemble_emit_byte(context, ASSEMBLE_CPU_M68K, (uint8_t) (number & 0xFF));
         }
-        else if (strcmp(mnemonic, "DCW") == 0)
+        else if (unit == 'W')
         {
             error = assemble_emit_word_be(context, ASSEMBLE_CPU_M68K, (uint16_t) (number & 0xFFFF));
         }
@@ -3608,6 +3628,65 @@ static _kernel_oserror *assemble_dc(assemble_context_t *context, const char *mne
     }
 
     return check_trailing(text, length, pos);
+}
+
+/*******************************************************************
+ Function:      assemble_ds
+ Description:   Assembles a DS.B/DS.W/DS.L pseudo-op (native-directive
+                dialect only, matching real 68k assembler convention;
+                the shared DCB/DCW/DCD dialect has no DS-family
+                equivalent, same as 6502/6809/RISC-V): reserves 'count'
+                bytes/words/longs of zero-filled space.
+ Parameters:    context = the assembly context
+                unit = 'B', 'W' or 'L'
+                text/length = the operand text following the mnemonic
+ Returns:       NULL if successful, otherwise a static error block
+ ******************************************************************/
+static _kernel_oserror *assemble_ds(assemble_context_t *context, char unit,
+                                     const uint8_t *text, size_t length)
+{
+    size_t pos = 0;
+    int32_t count;
+    int32_t i;
+    _kernel_oserror *error;
+
+    pos += assemble_skip_spaces(text + pos, length - pos);
+    error = eval_numeric(context, text, length, &pos, &count);
+    if (error != NULL)
+    {
+        return error;
+    }
+    error = check_trailing(text, length, pos);
+    if (error != NULL)
+    {
+        return error;
+    }
+    if (count < 0)
+    {
+        return assemble_set_error(ASSEMBLE_CPU_M68K, ASSEMBLE_ERROR_TYPE_RANGE, ASSEMBLE_M68K_ERR_NONE,
+                                   "DS count cannot be negative");
+    }
+
+    for (i = 0; i < count; i++)
+    {
+        if (unit == 'B')
+        {
+            error = assemble_emit_byte(context, ASSEMBLE_CPU_M68K, 0);
+        }
+        else if (unit == 'W')
+        {
+            error = assemble_emit_word_be(context, ASSEMBLE_CPU_M68K, 0);
+        }
+        else
+        {
+            error = assemble_emit_dword_be(context, ASSEMBLE_CPU_M68K, 0);
+        }
+        if (error != NULL)
+        {
+            return error;
+        }
+    }
+    return NULL;
 }
 
 /*******************************************************************
@@ -3757,10 +3836,25 @@ _kernel_oserror *assemble_m68k_line(assemble_context_t *context,
         return check_trailing(line, line_length, pos);
     }
 
-    if (strcmp(mnemonic, "DCB") == 0 || strcmp(mnemonic, "DCW") == 0 || strcmp(mnemonic, "DCD") == 0)
+    if (context->opt & ASSEMBLE_M68K_OPT_NATIVE_DIRECTIVES)
     {
+        if (strcmp(mnemonic, "DC.B") == 0 || strcmp(mnemonic, "DC.W") == 0 || strcmp(mnemonic, "DC.L") == 0)
+        {
+            pos += assemble_skip_spaces(line + pos, line_length - pos);
+            return assemble_dc(context, mnemonic[3], line + pos, line_length - pos);
+        }
+        if (strcmp(mnemonic, "DS.B") == 0 || strcmp(mnemonic, "DS.W") == 0 || strcmp(mnemonic, "DS.L") == 0)
+        {
+            pos += assemble_skip_spaces(line + pos, line_length - pos);
+            return assemble_ds(context, mnemonic[3], line + pos, line_length - pos);
+        }
+    }
+    else if (strcmp(mnemonic, "DCB") == 0 || strcmp(mnemonic, "DCW") == 0 || strcmp(mnemonic, "DCD") == 0)
+    {
+        char unit = (mnemonic[2] == 'B') ? 'B' : (mnemonic[2] == 'W') ? 'W' : 'L';
+
         pos += assemble_skip_spaces(line + pos, line_length - pos);
-        return assemble_dc(context, mnemonic, line + pos, line_length - pos);
+        return assemble_dc(context, unit, line + pos, line_length - pos);
     }
 
     entry = find_mnemonic(mnemonic);

@@ -232,6 +232,7 @@ typedef struct test_case
     const uint8_t      *expected;  /* concatenated bytes across all lines */
     size_t              expected_length;
     int                 expect_error;
+    uint32_t            opt;       /* context->opt for this case; 0 unless stated in the initialiser */
 } test_case_t;
 
 static int run_case(const test_case_t *test)
@@ -249,7 +250,7 @@ static int run_case(const test_case_t *test)
     context.buffer = output;
     context.buffer_length = (int32_t) sizeof(output);
     context.address = 0x8000;
-    context.opt = 0;
+    context.opt = test->opt;
     context.resolve_expr = test_resolve_expr;
     context.assign_var = test_assign_var;
     context.user_data = &state;
@@ -727,6 +728,35 @@ static const uint8_t     bytes_movep_store[] = { 0x01, 0x89, 0x00, 0x04 };
 static const char *const lines_movep_load[]  = { "MOVEP.L 8(A2),D3", NULL };
 static const uint8_t     bytes_movep_load[]  = { 0x07, 0x4A, 0x00, 0x08 };
 
+/* ---- Native directive dialect (stage 7) ------------------------------
+   Same underlying data as the shared-dialect DCB/DCW/DCD tests above,
+   written with ASSEMBLE_M68K_OPT_NATIVE_DIRECTIVES set. */
+
+static const char *const lines_dcb_native[] = { "DC.B 1,2,3", NULL };
+static const uint8_t     bytes_dcb_native[] = { 0x01, 0x02, 0x03 };
+
+static const char *const lines_dcw_native[] = { "DC.W &1234,&5678", NULL };
+static const uint8_t     bytes_dcw_native[] = { 0x12, 0x34, 0x56, 0x78 };
+
+static const char *const lines_dcd_native[] = { "DC.L &12345678", NULL };
+static const uint8_t     bytes_dcd_native[] = { 0x12, 0x34, 0x56, 0x78 };
+
+static const char *const lines_dsb_native[] = { "DS.B 3", NULL };
+static const uint8_t     bytes_dsb_native[] = { 0x00, 0x00, 0x00 };
+
+static const char *const lines_dsw_native[] = { "DS.W 2", NULL };
+static const uint8_t     bytes_dsw_native[] = { 0x00, 0x00, 0x00, 0x00 };
+
+static const char *const lines_dsl_native[] = { "DS.L 1", NULL };
+static const uint8_t     bytes_dsl_native[] = { 0x00, 0x00, 0x00, 0x00 };
+
+/* EQU/OPT are unaffected by the dialect bit. */
+static const char *const lines_equ_native[] = { ".const EQU &2A", "MOVEQ #const,D0", NULL };
+static const uint8_t     bytes_equ_native[] = { 0x70, 0x2A };
+
+static const char *const lines_opt_native[] = { "OPT 3", "NOP", NULL };
+static const uint8_t     bytes_opt_native[] = { 0x4E, 0x71 };
+
 /* ---- Error cases --------------------------------------------------- */
 
 static const char *const lines_err_bad_mnemonic[]  = { "FOOBAR", NULL };
@@ -773,6 +803,8 @@ static const char *const lines_err_swap_an[]       = { "SWAP A0", NULL };
 static const char *const lines_err_ext_no_size[]   = { "EXT D0", NULL };
 static const char *const lines_err_tas_an[]        = { "TAS A0", NULL };
 static const char *const lines_err_move_usp_src[]  = { "MOVE D0,USP", NULL };
+static const char *const lines_err_dc_native_off[] = { "DC.B 1,2,3", NULL };  /* dialect bit clear */
+static const char *const lines_err_dcb_native_on[] = { "DCB 1,2,3", NULL };   /* dialect bit set */
 
 static const test_case_t tests[] = {
     { "NOP",                                lines_nop,               bytes_nop,               sizeof(bytes_nop),               0 },
@@ -898,6 +930,15 @@ static const test_case_t tests[] = {
     { "MOVEP store",                        lines_movep_store,       bytes_movep_store,       sizeof(bytes_movep_store),       0 },
     { "MOVEP load",                         lines_movep_load,        bytes_movep_load,        sizeof(bytes_movep_load),        0 },
 
+    { "DC.B (native dialect)",  lines_dcb_native, bytes_dcb_native, sizeof(bytes_dcb_native), 0, ASSEMBLE_M68K_OPT_NATIVE_DIRECTIVES },
+    { "DC.W (native dialect)",  lines_dcw_native, bytes_dcw_native, sizeof(bytes_dcw_native), 0, ASSEMBLE_M68K_OPT_NATIVE_DIRECTIVES },
+    { "DC.L (native dialect)",  lines_dcd_native, bytes_dcd_native, sizeof(bytes_dcd_native), 0, ASSEMBLE_M68K_OPT_NATIVE_DIRECTIVES },
+    { "DS.B (native dialect)",  lines_dsb_native, bytes_dsb_native, sizeof(bytes_dsb_native), 0, ASSEMBLE_M68K_OPT_NATIVE_DIRECTIVES },
+    { "DS.W (native dialect)",  lines_dsw_native, bytes_dsw_native, sizeof(bytes_dsw_native), 0, ASSEMBLE_M68K_OPT_NATIVE_DIRECTIVES },
+    { "DS.L (native dialect)",  lines_dsl_native, bytes_dsl_native, sizeof(bytes_dsl_native), 0, ASSEMBLE_M68K_OPT_NATIVE_DIRECTIVES },
+    { "EQU unaffected by native dialect", lines_equ_native, bytes_equ_native, sizeof(bytes_equ_native), 0, ASSEMBLE_M68K_OPT_NATIVE_DIRECTIVES },
+    { "OPT unaffected by native dialect", lines_opt_native, bytes_opt_native, sizeof(bytes_opt_native), 0, ASSEMBLE_M68K_OPT_NATIVE_DIRECTIVES },
+
     { "error: bad mnemonic",                lines_err_bad_mnemonic,  NULL, 0, 1 },
     { "error: MOVE requires a size suffix", lines_err_move_no_size,  NULL, 0, 1 },
     { "error: MOVE bad size suffix",        lines_err_move_bad_size, NULL, 0, 1 },
@@ -941,7 +982,10 @@ static const test_case_t tests[] = {
     { "error: SWAP with an address register", lines_err_swap_an,      NULL, 0, 1 },
     { "error: EXT requires a size suffix",  lines_err_ext_no_size,    NULL, 0, 1 },
     { "error: TAS with an address register",lines_err_tas_an,         NULL, 0, 1 },
-    { "error: MOVE An,USP source not An",   lines_err_move_usp_src,   NULL, 0, 1 }
+    { "error: MOVE An,USP source not An",   lines_err_move_usp_src,   NULL, 0, 1 },
+    { "error: DC.B not recognised with dialect bit clear", lines_err_dc_native_off, NULL, 0, 1, 0 },
+    { "error: DCB not recognised with dialect bit set", lines_err_dcb_native_on, NULL, 0, 1,
+      ASSEMBLE_M68K_OPT_NATIVE_DIRECTIVES }
 };
 
 int run_tests_m68k(void)
