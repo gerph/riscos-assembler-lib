@@ -1,0 +1,1071 @@
+/*******************************************************************
+ * File:        tests_m68k
+ * Purpose:     Self-tests for the assemble_m68k library. Provides a
+ *              minimal stand-in for BASIC's expression evaluator and
+ *              variable table so lines can be assembled and checked
+ *              against expected byte sequences.
+ * Author:      Charles Ferguson (Gerph)
+ ******************************************************************/
+
+#include <stdio.h>
+#include <string.h>
+#include <ctype.h>
+
+#include "tests.h"
+#include "assemble_m68k.h"
+
+#define MAX_SYMBOLS 32
+#define MAX_OUTPUT  64
+
+typedef struct symbol
+{
+    char             name[32];
+    assemble_value_t value;
+} symbol_t;
+
+typedef struct test_state
+{
+    symbol_t symbols[MAX_SYMBOLS];
+    size_t   symbol_count;
+} test_state_t;
+
+static _kernel_oserror test_error_block;
+
+static _kernel_oserror *test_error(const char *message)
+{
+    test_error_block.errnum = 0;
+    strncpy(test_error_block.errmess, message, sizeof(test_error_block.errmess) - 1);
+    test_error_block.errmess[sizeof(test_error_block.errmess) - 1] = '\0';
+    return &test_error_block;
+}
+
+static int hex_digit_value(uint8_t ch)
+{
+    if (ch >= '0' && ch <= '9')
+    {
+        return ch - '0';
+    }
+    return toupper((int) ch) - 'A' + 10;
+}
+
+/* As well as '&' (BASIC's own hex prefix, matching the other backends'
+   test harnesses), this understands '$' -- the 68000's native hex
+   prefix -- purely as a convenience for writing readable m68k test
+   source; the production assemble_m68k_line() never parses numeric
+   literals itself, it always delegates to context->resolve_expr, same
+   as every other backend. */
+static assemble_result_t test_parse_primary(test_state_t *state, const uint8_t *text, size_t length,
+                                             size_t *pos_inout, int32_t *out_value, _kernel_oserror **error)
+{
+    size_t pos = *pos_inout;
+
+    while (pos < length && text[pos] == ' ')
+    {
+        pos += 1;
+    }
+
+    if (pos < length && (text[pos] == '&' || text[pos] == '$'))
+    {
+        int32_t v = 0;
+
+        pos += 1;
+        while (pos < length && isxdigit((int) text[pos]))
+        {
+            v = v * 16 + hex_digit_value(text[pos]);
+            pos += 1;
+        }
+        *out_value = v;
+        *pos_inout = pos;
+        return ASSEMBLE_RESULT_OK;
+    }
+
+    if (pos < length && text[pos] >= '0' && text[pos] <= '9')
+    {
+        int32_t v = 0;
+
+        while (pos < length && text[pos] >= '0' && text[pos] <= '9')
+        {
+            v = v * 10 + (text[pos] - '0');
+            pos += 1;
+        }
+        *out_value = v;
+        *pos_inout = pos;
+        return ASSEMBLE_RESULT_OK;
+    }
+
+    if (pos < length && (isalpha((int) text[pos]) || text[pos] == '_' || text[pos] == '`'))
+    {
+        size_t start = pos;
+        size_t namelen;
+        char name[32];
+        size_t i;
+
+        while (pos < length &&
+               (isalnum((int) text[pos]) || text[pos] == '_' || text[pos] == '`' || text[pos] == '%'))
+        {
+            pos += 1;
+        }
+        namelen = pos - start;
+        if (namelen >= sizeof(name))
+        {
+            namelen = sizeof(name) - 1;
+        }
+        memcpy(name, text + start, namelen);
+        name[namelen] = '\0';
+
+        for (i = 0; i < state->symbol_count; i++)
+        {
+            if (strcmp(state->symbols[i].name, name) == 0)
+            {
+                *out_value = state->symbols[i].value.value.as_integer;
+                *pos_inout = pos;
+                return ASSEMBLE_RESULT_OK;
+            }
+        }
+        *error = test_error("Undefined test symbol");
+        return ASSEMBLE_RESULT_ERROR;
+    }
+
+    *error = test_error("Expected a value");
+    return ASSEMBLE_RESULT_ERROR;
+}
+
+static assemble_result_t test_resolve_expr(void *user_data, const uint8_t *text, size_t length,
+                                            assemble_value_t *value, size_t *consumed, _kernel_oserror **error)
+{
+    test_state_t *state = (test_state_t *) user_data;
+    size_t pos = 0;
+    int32_t result;
+    int negate = 0;
+
+    while (pos < length && text[pos] == ' ')
+    {
+        pos += 1;
+    }
+    if (pos < length && text[pos] == '-')
+    {
+        negate = 1;
+        pos += 1;
+    }
+
+    if (test_parse_primary(state, text, length, &pos, &result, error) != ASSEMBLE_RESULT_OK)
+    {
+        return ASSEMBLE_RESULT_ERROR;
+    }
+    if (negate)
+    {
+        result = -result;
+    }
+
+    for (;;)
+    {
+        size_t save = pos;
+        int op;
+        int32_t rhs;
+
+        while (pos < length && text[pos] == ' ')
+        {
+            pos += 1;
+        }
+        if (!(pos < length && (text[pos] == '+' || text[pos] == '-')))
+        {
+            pos = save;
+            break;
+        }
+        op = text[pos];
+        pos += 1;
+        while (pos < length && text[pos] == ' ')
+        {
+            pos += 1;
+        }
+        if (test_parse_primary(state, text, length, &pos, &rhs, error) != ASSEMBLE_RESULT_OK)
+        {
+            return ASSEMBLE_RESULT_ERROR;
+        }
+        result = (op == '+') ? (result + rhs) : (result - rhs);
+    }
+
+    value->type = ASSEMBLE_VALUE_INTEGER;
+    value->value.as_integer = result;
+    *consumed = pos;
+    return ASSEMBLE_RESULT_OK;
+}
+
+static assemble_result_t test_assign_var(void *user_data, const char *name, size_t name_length,
+                                          const assemble_value_t *value, _kernel_oserror **error)
+{
+    test_state_t *state = (test_state_t *) user_data;
+    char namebuf[32];
+    size_t len = name_length;
+    size_t i;
+
+    if (len >= sizeof(namebuf))
+    {
+        len = sizeof(namebuf) - 1;
+    }
+    memcpy(namebuf, name, len);
+    namebuf[len] = '\0';
+
+    for (i = 0; i < state->symbol_count; i++)
+    {
+        if (strcmp(state->symbols[i].name, namebuf) == 0)
+        {
+            state->symbols[i].value = *value;
+            return ASSEMBLE_RESULT_OK;
+        }
+    }
+    if (state->symbol_count >= MAX_SYMBOLS)
+    {
+        *error = test_error("Test symbol table is full");
+        return ASSEMBLE_RESULT_ERROR;
+    }
+    strcpy(state->symbols[state->symbol_count].name, namebuf);
+    state->symbols[state->symbol_count].value = *value;
+    state->symbol_count += 1;
+    return ASSEMBLE_RESULT_OK;
+}
+
+typedef struct test_case
+{
+    const char        *description;
+    const char *const *lines;      /* NULL-terminated */
+    const uint8_t      *expected;  /* concatenated bytes across all lines */
+    size_t              expected_length;
+    int                 expect_error;
+    uint32_t            opt;       /* context->opt for this case; 0 unless stated in the initialiser */
+} test_case_t;
+
+static int run_case(const test_case_t *test)
+{
+    test_state_t state;
+    assemble_context_t context;
+    uint8_t output[MAX_OUTPUT];
+    uint32_t offset = 0;
+    size_t i;
+    _kernel_oserror *error = NULL;
+    int saw_error = 0;
+
+    state.symbol_count = 0;
+
+    context.buffer = output;
+    context.buffer_length = (int32_t) sizeof(output);
+    context.address = 0x8000;
+    context.opt = test->opt;
+    context.resolve_expr = test_resolve_expr;
+    context.assign_var = test_assign_var;
+    context.user_data = &state;
+    context.bytes_used = 0;
+
+    for (i = 0; test->lines[i] != NULL; i++)
+    {
+        const uint8_t *line = (const uint8_t *) test->lines[i];
+        size_t line_length = strlen(test->lines[i]);
+
+        error = assemble_m68k_line(&context, line, line_length);
+        if (error != NULL)
+        {
+            saw_error = 1;
+            break;
+        }
+
+        if (offset + context.bytes_used > sizeof(output))
+        {
+            printf("FAIL: %s (test output buffer too small)\n", test->description);
+            return 0;
+        }
+        offset += context.bytes_used;
+        context.address += context.bytes_used;
+        context.buffer = output + offset;
+        context.buffer_length = (int32_t) (sizeof(output) - offset);
+    }
+
+    if (test->expect_error)
+    {
+        if (!saw_error)
+        {
+            printf("FAIL: %s (expected an error, none was raised)\n", test->description);
+            return 0;
+        }
+        return 1;
+    }
+
+    if (saw_error)
+    {
+        printf("FAIL: %s (unexpected error: %s)\n", test->description, error->errmess);
+        return 0;
+    }
+
+    if (offset != test->expected_length || memcmp(output, test->expected, offset) != 0)
+    {
+        size_t j;
+
+        printf("FAIL: %s (byte mismatch, got:", test->description);
+        for (j = 0; j < offset; j++)
+        {
+            printf(" %02X", output[j]);
+        }
+        printf(" expected:");
+        for (j = 0; j < test->expected_length; j++)
+        {
+            printf(" %02X", test->expected[j]);
+        }
+        printf(")\n");
+        return 0;
+    }
+
+    return 1;
+}
+
+/* ---- Test case data ----------------------------------------------
+   Independently verifiable canonical cases (NOP/RTS/MOVEQ) and the
+   MOVE.W addressing-mode tour below are cross-checked against
+   m68k/tests/asm_test.go's TestBasicEncodings and
+   TestAddressingModes_Encodings (an untracked third-party reference
+   implementation kept alongside this project -- see AGENTS.md's
+   "Source material handling"), with two adaptations: PC-relative
+   cases use a backward label reference rather than a forward one
+   (this library's line-at-a-time interface has no forward-reference
+   support of its own -- that's the caller's job -- and this test
+   harness's expression evaluator, like every other backend's, only
+   ever sees already-defined symbols), and hex literals are written
+   with BASIC's own '&' prefix to match every other backend's test
+   convention ('$' is also accepted here, see test_parse_primary). */
+
+static const char *const lines_nop[] = { "NOP", NULL };
+static const uint8_t     bytes_nop[] = { 0x4E, 0x71 };
+
+static const char *const lines_rts[] = { "RTS", NULL };
+static const uint8_t     bytes_rts[] = { 0x4E, 0x75 };
+
+static const char *const lines_moveq[] = { "MOVEQ #1,D7", NULL };
+static const uint8_t     bytes_moveq[] = { 0x7E, 0x01 };
+
+static const char *const lines_moveq_neg[] = { "MOVEQ #-1,D0", NULL };
+static const uint8_t     bytes_moveq_neg[] = { 0x70, 0xFF };
+
+/* MOVE.W <ea>,Dn addressing-mode tour, one per mode -- see
+   m68k/tests/asm_test.go's TestAddressingModes_Encodings. */
+
+static const char *const lines_ea_an_ind[]     = { "MOVE.W (A0),D0", NULL };
+static const uint8_t     bytes_ea_an_ind[]     = { 0x30, 0x10 };
+
+static const char *const lines_ea_postinc[]    = { "MOVE.W (A0)+,D1", NULL };
+static const uint8_t     bytes_ea_postinc[]    = { 0x32, 0x18 };
+
+static const char *const lines_ea_predec[]     = { "MOVE.W -(A0),D2", NULL };
+static const uint8_t     bytes_ea_predec[]     = { 0x34, 0x20 };
+
+static const char *const lines_ea_disp[]       = { "MOVE.W 4(A0),D3", NULL };
+static const uint8_t     bytes_ea_disp[]       = { 0x36, 0x28, 0x00, 0x04 };
+
+static const char *const lines_ea_index_w[]    = { "MOVE.W 8(A0,D1.W),D4", NULL };
+static const uint8_t     bytes_ea_index_w[]    = { 0x38, 0x30, 0x10, 0x08 };
+
+static const char *const lines_ea_index_l[]    = { "MOVE.B 2(A2,A3.L),D0", NULL };
+static const uint8_t     bytes_ea_index_l[]    = { 0x10, 0x32, 0xB8, 0x02 };
+
+static const char *const lines_ea_immediate[]  = { "MOVE.W #&ABCD,D6", NULL };
+static const uint8_t     bytes_ea_immediate[]  = { 0x3C, 0x3C, 0xAB, 0xCD };
+
+static const char *const lines_ea_abs_short[]  = { "MOVE.W (&1234).W,D7", NULL };
+static const uint8_t     bytes_ea_abs_short[]  = { 0x3E, 0x38, 0x12, 0x34 };
+
+static const char *const lines_ea_abs_long[]   = { "MOVE.L (&123456).L,D0", NULL };
+static const uint8_t     bytes_ea_abs_long[]   = { 0x20, 0x39, 0x00, 0x12, 0x34, 0x56 };
+
+/* PC-relative displacement: label defined 2 bytes before the MOVE
+   instruction, so the displacement is negative -- see the note above
+   on backward-vs-forward references. */
+static const char *const lines_ea_pc_disp[]    = { ".table", "DCW &1234", "MOVE.W table(PC),D5", NULL };
+static const uint8_t     bytes_ea_pc_disp[]    = { 0x12, 0x34, 0x3A, 0x3A, 0xFF, 0xFC };
+
+/* PC-relative indexed: same idea, with an index register too. */
+static const char *const lines_ea_pc_index[]   = { ".table2", "DCW &1234", "MOVE.W table2(PC,D0.W),D1", NULL };
+static const uint8_t     bytes_ea_pc_index[]   = { 0x12, 0x34, 0x32, 0x3B, 0x00, 0xFC };
+
+/* Parenthesised (d,PC) spelling of the same addressing mode. */
+static const char *const lines_ea_pc_disp_paren[] = { ".table3", "DCW &1234", "MOVE.W (table3,PC),D2", NULL };
+static const uint8_t     bytes_ea_pc_disp_paren[] = { 0x12, 0x34, 0x34, 0x3A, 0xFF, 0xFC };
+
+static const char *const lines_movea[] = { "MOVEA.L A1,A0", NULL };
+static const uint8_t     bytes_movea[] = { 0x20, 0x49 };
+
+static const char *const lines_label[] = { ".here", "MOVE.L here,D0", NULL };
+static const uint8_t     bytes_label[] = { 0x20, 0x39, 0x00, 0x00, 0x80, 0x00 };
+
+static const char *const lines_equ[] = { ".const EQU &2A", "MOVEQ #const,D0", NULL };
+static const uint8_t     bytes_equ[] = { 0x70, 0x2A };
+
+static const char *const lines_dcb[] = { "DCB 1,2,3", NULL };
+static const uint8_t     bytes_dcb[] = { 0x01, 0x02, 0x03 };
+
+static const char *const lines_dcw[] = { "DCW &1234,&5678", NULL };
+static const uint8_t     bytes_dcw[] = { 0x12, 0x34, 0x56, 0x78 };
+
+static const char *const lines_dcd[] = { "DCD &12345678", NULL };
+static const uint8_t     bytes_dcd[] = { 0x12, 0x34, 0x56, 0x78 };
+
+static const char *const lines_opt[] = { "OPT 3", "NOP", NULL };
+static const uint8_t     bytes_opt[] = { 0x4E, 0x71 };
+
+/* ---- Arithmetic family (stage 2) -----------------------------------
+   Every encoding below was hand-derived from the real MC68000 opcode
+   map (ADD/SUB/CMP's 'RRR SS eeeeee' / 'RRR opmode eeeeee' fields,
+   ADDQ/SUBQ's 'ddd' immediate field, ADDX/SUBX/ABCD/SBCD's R/M bit),
+   not ported from the m68k/ reference project (which this family's
+   design draws on for instruction coverage only). */
+
+static const char *const lines_add_ea_dn[]      = { "ADD.W D0,D1", NULL };
+static const uint8_t     bytes_add_ea_dn[]      = { 0xD2, 0x40 };
+
+static const char *const lines_add_mem_dn[]     = { "ADD.L (A0),D1", NULL };
+static const uint8_t     bytes_add_mem_dn[]     = { 0xD2, 0x90 };
+
+static const char *const lines_add_reverse[]    = { "ADD.W D1,(A0)", NULL };
+static const uint8_t     bytes_add_reverse[]    = { 0xD3, 0x50 };
+
+static const char *const lines_add_an_src[]     = { "ADD.W A0,D0", NULL };
+static const uint8_t     bytes_add_an_src[]     = { 0xD0, 0x48 };
+
+static const char *const lines_add_auto_adda[]  = { "ADD.L D0,A0", NULL };
+static const uint8_t     bytes_add_auto_adda[]  = { 0xD1, 0xC0 };
+
+static const char *const lines_adda[]           = { "ADDA.W #4,A0", NULL };
+static const uint8_t     bytes_adda[]           = { 0xD0, 0xFC, 0x00, 0x04 };
+
+static const char *const lines_add_auto_addi[]  = { "ADD.W #5,(A0)", NULL };
+static const uint8_t     bytes_add_auto_addi[]  = { 0x06, 0x50, 0x00, 0x05 };
+
+static const char *const lines_addi[]           = { "ADDI.W #5,D0", NULL };
+static const uint8_t     bytes_addi[]           = { 0x06, 0x40, 0x00, 0x05 };
+
+static const char *const lines_sub_ea_dn[]      = { "SUB.W D0,D1", NULL };
+static const uint8_t     bytes_sub_ea_dn[]      = { 0x92, 0x40 };
+
+static const char *const lines_addq[]           = { "ADDQ.W #3,D0", NULL };
+static const uint8_t     bytes_addq[]           = { 0x56, 0x40 };
+
+static const char *const lines_addq_an_eight[]  = { "ADDQ.L #8,A0", NULL };
+static const uint8_t     bytes_addq_an_eight[]  = { 0x50, 0x88 };
+
+static const char *const lines_subq[]           = { "SUBQ.B #1,D0", NULL };
+static const uint8_t     bytes_subq[]           = { 0x53, 0x00 };
+
+static const char *const lines_addx_dn[]        = { "ADDX.W D1,D0", NULL };
+static const uint8_t     bytes_addx_dn[]        = { 0xD1, 0x41 };
+
+static const char *const lines_addx_predec[]    = { "ADDX.L -(A1),-(A0)", NULL };
+static const uint8_t     bytes_addx_predec[]    = { 0xD1, 0x89 };
+
+static const char *const lines_mulu[]           = { "MULU.W D1,D0", NULL };
+static const uint8_t     bytes_mulu[]           = { 0xC0, 0xC1 };
+
+static const char *const lines_divs_no_suffix[] = { "DIVS D1,D0", NULL };
+static const uint8_t     bytes_divs_no_suffix[] = { 0x81, 0xC1 };
+
+static const char *const lines_cmp[]            = { "CMP.W D0,D1", NULL };
+static const uint8_t     bytes_cmp[]            = { 0xB2, 0x40 };
+
+static const char *const lines_cmpa[]           = { "CMPA.L A0,A1", NULL };
+static const uint8_t     bytes_cmpa[]           = { 0xB3, 0xC8 };
+
+static const char *const lines_cmpi[]           = { "CMPI.W #5,D0", NULL };
+static const uint8_t     bytes_cmpi[]           = { 0x0C, 0x40, 0x00, 0x05 };
+
+static const char *const lines_cmpm[]           = { "CMPM.B (A0)+,(A1)+", NULL };
+static const uint8_t     bytes_cmpm[]           = { 0xB3, 0x08 };
+
+static const char *const lines_tst[]            = { "TST.W D0", NULL };
+static const uint8_t     bytes_tst[]            = { 0x4A, 0x40 };
+
+static const char *const lines_clr[]            = { "CLR.L D0", NULL };
+static const uint8_t     bytes_clr[]            = { 0x42, 0x80 };
+
+static const char *const lines_neg[]            = { "NEG.B D0", NULL };
+static const uint8_t     bytes_neg[]            = { 0x44, 0x00 };
+
+static const char *const lines_negx[]           = { "NEGX.W (A0)", NULL };
+static const uint8_t     bytes_negx[]           = { 0x40, 0x50 };
+
+static const char *const lines_not[]            = { "NOT.L D0", NULL };
+static const uint8_t     bytes_not[]            = { 0x46, 0x80 };
+
+static const char *const lines_chk[]            = { "CHK D0,D1", NULL };
+static const uint8_t     bytes_chk[]            = { 0x43, 0x80 };
+
+static const char *const lines_abcd[]           = { "ABCD D0,D1", NULL };
+static const uint8_t     bytes_abcd[]           = { 0xC3, 0x00 };
+
+static const char *const lines_sbcd[]           = { "SBCD -(A0),-(A1)", NULL };
+static const uint8_t     bytes_sbcd[]           = { 0x83, 0x08 };
+
+static const char *const lines_nbcd[]           = { "NBCD D0", NULL };
+static const uint8_t     bytes_nbcd[]           = { 0x48, 0x00 };
+
+/* ---- Logical family (stage 3) ---------------------------------------
+   Hand-derived from the real MC68000 opcode map, same discipline as
+   the arithmetic family above. */
+
+static const char *const lines_and_ea_dn[]  = { "AND.W D0,D1", NULL };
+static const uint8_t     bytes_and_ea_dn[]  = { 0xC2, 0x40 };
+
+static const char *const lines_and_reverse[] = { "AND.W D1,(A0)", NULL };
+static const uint8_t     bytes_and_reverse[] = { 0xC3, 0x50 };
+
+static const char *const lines_or_ea_dn[]   = { "OR.W D0,D1", NULL };
+static const uint8_t     bytes_or_ea_dn[]   = { 0x82, 0x40 };
+
+static const char *const lines_eor[]        = { "EOR.W D0,D1", NULL };
+static const uint8_t     bytes_eor[]        = { 0xB1, 0x41 };
+
+static const char *const lines_andi[]       = { "ANDI.W #&F0,D0", NULL };
+static const uint8_t     bytes_andi[]       = { 0x02, 0x40, 0x00, 0xF0 };
+
+static const char *const lines_ori[]        = { "ORI.B #&0F,D1", NULL };
+static const uint8_t     bytes_ori[]        = { 0x00, 0x01, 0x00, 0x0F };
+
+static const char *const lines_eori[]       = { "EORI.L #&12345678,D2", NULL };
+static const uint8_t     bytes_eori[]       = { 0x0A, 0x82, 0x12, 0x34, 0x56, 0x78 };
+
+static const char *const lines_andi_ccr[]   = { "ANDI.B #&F0,CCR", NULL };
+static const uint8_t     bytes_andi_ccr[]   = { 0x02, 0x3C, 0x00, 0xF0 };
+
+static const char *const lines_ori_sr[]     = { "ORI.W #&8000,SR", NULL };
+static const uint8_t     bytes_ori_sr[]     = { 0x00, 0x7C, 0x80, 0x00 };
+
+static const char *const lines_eori_ccr[]   = { "EORI.B #&FF,CCR", NULL };
+static const uint8_t     bytes_eori_ccr[]   = { 0x0A, 0x3C, 0x00, 0xFF };
+
+/* Tokenised AND/EOR/OR/NOT -- BASIC tokenises the keyword substring
+   regardless of what follows, so the raw source byte is the token
+   value, not ASCII 'A'/'E'/'O'/'N'. */
+static const char lines_and_token_raw[] = { (char) 0x80, '.', 'W', ' ', 'D', '0', ',', 'D', '1', '\0' };
+static const char *const lines_and_token[] = { lines_and_token_raw, NULL };
+static const uint8_t     bytes_and_token[] = { 0xC2, 0x40 };
+
+static const char lines_eor_token_raw[] = { (char) 0x82, '.', 'W', ' ', 'D', '0', ',', 'D', '1', '\0' };
+static const char *const lines_eor_token[] = { lines_eor_token_raw, NULL };
+static const uint8_t     bytes_eor_token[] = { 0xB1, 0x41 };
+
+static const char lines_or_token_raw[] = { (char) 0x84, '.', 'W', ' ', 'D', '0', ',', 'D', '1', '\0' };
+static const char *const lines_or_token[] = { lines_or_token_raw, NULL };
+static const uint8_t     bytes_or_token[] = { 0x82, 0x40 };
+
+static const char lines_not_token_raw[] = { (char) 0xAC, '.', 'L', ' ', 'D', '0', '\0' };
+static const char *const lines_not_token[] = { lines_not_token_raw, NULL };
+static const uint8_t     bytes_not_token[] = { 0x46, 0x80 };
+
+/* Tokenised AND followed by more letters (ANDI): confirms the mnemonic
+   reader keeps scanning ASCII after the token byte, not just
+   substituting it in isolation. */
+static const char lines_andi_token_raw[] = { (char) 0x80, 'I', '.', 'W', ' ', '#', '1', ',', 'D', '0', '\0' };
+static const char *const lines_andi_token[] = { lines_andi_token_raw, NULL };
+static const uint8_t     bytes_andi_token[] = { 0x02, 0x40, 0x00, 0x01 };
+
+/* Tokenised DIV/MOVE/EXT/STOP/SWAP -- found after the fact by actually
+   tokenising sample source through riscos-basictokenise rather than
+   assuming AND/EOR/OR/NOT (the tokens every other backend also has to
+   handle) were the only collisions m68k has. MOVE is the interesting
+   one: it collides with a *whole family* of mnemonics (MOVE itself,
+   MOVEA/MOVEQ/MOVEM/MOVEP, and the MOVE SR/CCR/USP special forms), all
+   via the same single token byte. SWAP is a BASIC V structured-
+   programming keyword and tokenises as a two-byte extended-page
+   sequence (C8 94), not a single byte -- confirmed directly against
+   riscos-basictokenise, not assumed from the single-byte pattern. */
+static const char lines_divu_token_raw[] = { (char) 0x81, 'U', ' ', 'D', '1', ',', 'D', '0', '\0' };
+static const char *const lines_divu_token[] = { lines_divu_token_raw, NULL };
+static const uint8_t     bytes_divu_token[] = { 0x80, 0xC1 };
+
+static const char lines_move_token_raw[] = { (char) 0xEC, ' ', 'S', 'R', ',', 'D', '0', '\0' };
+static const char *const lines_move_token[] = { lines_move_token_raw, NULL };
+static const uint8_t     bytes_move_token[] = { 0x40, 0xC0 };
+
+static const char lines_moveq_token_raw[] = { (char) 0xEC, 'Q', ' ', '#', '1', ',', 'D', '7', '\0' };
+static const char *const lines_moveq_token[] = { lines_moveq_token_raw, NULL };
+static const uint8_t     bytes_moveq_token[] = { 0x7E, 0x01 };
+
+static const char lines_movea_token_raw[] = { (char) 0xEC, 'A', '.', 'L', ' ', 'A', '1', ',', 'A', '0', '\0' };
+static const char *const lines_movea_token[] = { lines_movea_token_raw, NULL };
+static const uint8_t     bytes_movea_token[] = { 0x20, 0x49 };
+
+static const char lines_movem_token_raw[] = {
+    (char) 0xEC, 'M', '.', 'L', ' ', 'D', '0', '-', 'D', '3', '/', 'A', '0', '-', 'A', '2', ',', '-', '(', 'S', 'P', ')', '\0'
+};
+static const char *const lines_movem_token[] = { lines_movem_token_raw, NULL };
+static const uint8_t     bytes_movem_token[] = { 0x48, 0xE7, 0xF0, 0xE0 };
+
+static const char lines_movep_token_raw[] = {
+    (char) 0xEC, 'P', '.', 'W', ' ', 'D', '0', ',', '4', '(', 'A', '1', ')', '\0'
+};
+static const char *const lines_movep_token[] = { lines_movep_token_raw, NULL };
+static const uint8_t     bytes_movep_token[] = { 0x01, 0x89, 0x00, 0x04 };
+
+static const char lines_ext_token_raw[] = { (char) 0xA2, '.', 'W', ' ', 'D', '0', '\0' };
+static const char *const lines_ext_token[] = { lines_ext_token_raw, NULL };
+static const uint8_t     bytes_ext_token[] = { 0x48, 0x80 };
+
+static const char lines_stop_token_raw[] = { (char) 0xFA, ' ', '#', '&', '2', '7', '0', '0', '\0' };
+static const char *const lines_stop_token[] = { lines_stop_token_raw, NULL };
+static const uint8_t     bytes_stop_token[] = { 0x4E, 0x72, 0x27, 0x00 };
+
+static const char lines_swap_token_raw[] = { (char) 0xC8, (char) 0x94, ' ', 'D', '0', '\0' };
+static const char *const lines_swap_token[] = { lines_swap_token_raw, NULL };
+static const uint8_t     bytes_swap_token[] = { 0x48, 0x40 };
+
+/* ---- Bit ops and shifts/rotates (stage 4) --------------------------
+   Hand-derived from the real MC68000 opcode map. */
+
+static const char *const lines_btst_dyn[]  = { "BTST D1,D0", NULL };
+static const uint8_t     bytes_btst_dyn[]  = { 0x03, 0x00 };
+
+static const char *const lines_btst_static[] = { "BTST #3,D0", NULL };
+static const uint8_t     bytes_btst_static[] = { 0x08, 0x00, 0x00, 0x03 };
+
+static const char *const lines_bset_static[] = { "BSET #7,(A0)", NULL };
+static const uint8_t     bytes_bset_static[] = { 0x08, 0xD0, 0x00, 0x07 };
+
+static const char *const lines_bclr_dyn[]  = { "BCLR D2,D3", NULL };
+static const uint8_t     bytes_bclr_dyn[]  = { 0x05, 0x83 };
+
+static const char *const lines_bchg_static[] = { "BCHG #1,D0", NULL };
+static const uint8_t     bytes_bchg_static[] = { 0x08, 0x40, 0x00, 0x01 };
+
+static const char *const lines_asl_imm[]   = { "ASL.W #1,D0", NULL };
+static const uint8_t     bytes_asl_imm[]   = { 0xE3, 0x40 };
+
+static const char *const lines_asr_reg[]   = { "ASR.L D1,D0", NULL };
+static const uint8_t     bytes_asr_reg[]   = { 0xE2, 0xA0 };
+
+static const char *const lines_lsl_eight[] = { "LSL.B #8,D0", NULL };
+static const uint8_t     bytes_lsl_eight[] = { 0xE1, 0x08 };
+
+static const char *const lines_lsr_mem[]   = { "LSR.W (A0)", NULL };
+static const uint8_t     bytes_lsr_mem[]   = { 0xE2, 0xD0 };
+
+static const char *const lines_roxl_reg[]  = { "ROXL.W D0,D1", NULL };
+static const uint8_t     bytes_roxl_reg[]  = { 0xE1, 0x71 };
+
+static const char *const lines_ror_imm[]   = { "ROR.W #4,D0", NULL };
+static const uint8_t     bytes_ror_imm[]   = { 0xE8, 0x58 };
+
+static const char *const lines_roxr_mem[]  = { "ROXR (A0)", NULL };
+static const uint8_t     bytes_roxr_mem[]  = { 0xE4, 0xD0 };
+
+/* ---- Program control (stage 5) --------------------------------------
+   Backward label references, matching the addressing-mode tests
+   above. A couple of these (JSR absolute-long, STOP) are cross-checked
+   directly against m68k/tests/asm_test.go's own vectors, cited where
+   used; the rest are hand-derived from the opcode map. */
+
+static const char *const lines_bra_s[]  = { ".loop", "NOP", "BRA.S loop", NULL };
+static const uint8_t     bytes_bra_s[]  = { 0x4E, 0x71, 0x60, 0xFC };
+
+static const char *const lines_beq_s[]  = { ".loop", "NOP", "BEQ.S loop", NULL };
+static const uint8_t     bytes_beq_s[]  = { 0x4E, 0x71, 0x67, 0xFC };
+
+static const char *const lines_bsr_w[]  = { ".loop", "NOP", "BSR.W loop", NULL };
+static const uint8_t     bytes_bsr_w[]  = { 0x4E, 0x71, 0x61, 0x00, 0xFF, 0xFC };
+
+static const char *const lines_dbra[]   = { ".loop", "NOP", "DBRA D0,loop", NULL };
+static const uint8_t     bytes_dbra[]   = { 0x4E, 0x71, 0x51, 0xC8, 0xFF, 0xFC };
+
+static const char *const lines_dbeq[]   = { ".loop", "NOP", "DBEQ D1,loop", NULL };
+static const uint8_t     bytes_dbeq[]   = { 0x4E, 0x71, 0x57, 0xC9, 0xFF, 0xFC };
+
+static const char *const lines_seq[]    = { "SEQ D0", NULL };
+static const uint8_t     bytes_seq[]    = { 0x57, 0xC0 };
+
+static const char *const lines_sle[]    = { "SLE (A0)", NULL };
+static const uint8_t     bytes_sle[]    = { 0x5F, 0xD0 };
+
+static const char *const lines_jmp[]    = { "JMP (A0)", NULL };
+static const uint8_t     bytes_jmp[]    = { 0x4E, 0xD0 };
+
+/* jsr $E.l -> 4E B9 00 00 00 0E, per m68k/tests/asm_test.go's
+   TestFlowControl_Encodings. */
+static const char *const lines_jsr[]    = { "JSR (&E).L", NULL };
+static const uint8_t     bytes_jsr[]    = { 0x4E, 0xB9, 0x00, 0x00, 0x00, 0x0E };
+
+static const char *const lines_trap1[]  = { "TRAP #1", NULL };
+static const uint8_t     bytes_trap1[]  = { 0x4E, 0x41 };
+
+static const char *const lines_trap15[] = { "TRAP #15", NULL };
+static const uint8_t     bytes_trap15[] = { 0x4E, 0x4F };
+
+/* stop #$2700 -> 4E 72 27 00, per m68k/tests/asm_test.go's
+   TestBasicEncodings. */
+static const char *const lines_stop[]   = { "STOP #&2700", NULL };
+static const uint8_t     bytes_stop[]   = { 0x4E, 0x72, 0x27, 0x00 };
+
+static const char *const lines_link[]   = { "LINK A6,#-8", NULL };
+static const uint8_t     bytes_link[]   = { 0x4E, 0x56, 0xFF, 0xF8 };
+
+static const char *const lines_unlk[]   = { "UNLK A6", NULL };
+static const uint8_t     bytes_unlk[]   = { 0x4E, 0x5E };
+
+static const char *const lines_rtr[]     = { "RTR", NULL };
+static const uint8_t     bytes_rtr[]     = { 0x4E, 0x77 };
+
+static const char *const lines_rte[]     = { "RTE", NULL };
+static const uint8_t     bytes_rte[]     = { 0x4E, 0x73 };
+
+static const char *const lines_reset[]   = { "RESET", NULL };
+static const uint8_t     bytes_reset[]   = { 0x4E, 0x70 };
+
+static const char *const lines_illegal[] = { "ILLEGAL", NULL };
+static const uint8_t     bytes_illegal[] = { 0x4A, 0xFC };
+
+static const char *const lines_trapv[]   = { "TRAPV", NULL };
+static const uint8_t     bytes_trapv[]   = { 0x4E, 0x76 };
+
+/* ---- Remaining data movement (stage 6) ------------------------------
+   Hand-derived from the real MC68000 opcode map. */
+
+static const char *const lines_move_to_sr[]   = { "MOVE.W (A0),SR", NULL };
+static const uint8_t     bytes_move_to_sr[]   = { 0x46, 0xD0 };
+
+static const char *const lines_move_from_sr[] = { "MOVE SR,D0", NULL };
+static const uint8_t     bytes_move_from_sr[] = { 0x40, 0xC0 };
+
+static const char *const lines_move_to_ccr[]  = { "MOVE.B (A0),CCR", NULL };
+static const uint8_t     bytes_move_to_ccr[]  = { 0x44, 0xD0 };
+
+static const char *const lines_move_an_usp[]  = { "MOVE A0,USP", NULL };
+static const uint8_t     bytes_move_an_usp[]  = { 0x4E, 0x60 };
+
+static const char *const lines_move_usp_an[]  = { "MOVE USP,A1", NULL };
+static const uint8_t     bytes_move_usp_an[]  = { 0x4E, 0x69 };
+
+static const char *const lines_lea_pc[] = { ".table", "DCW &1234", "LEA table(PC),A0", NULL };
+static const uint8_t     bytes_lea_pc[] = { 0x12, 0x34, 0x41, 0xFA, 0xFF, 0xFC };
+
+static const char *const lines_lea_ind[] = { "LEA (A0),A1", NULL };
+static const uint8_t     bytes_lea_ind[] = { 0x43, 0xD0 };
+
+static const char *const lines_pea[]    = { "PEA (A0)", NULL };
+static const uint8_t     bytes_pea[]    = { 0x48, 0x50 };
+
+static const char *const lines_exg_dd[] = { "EXG D0,D1", NULL };
+static const uint8_t     bytes_exg_dd[] = { 0xC1, 0x41 };
+
+static const char *const lines_exg_aa[] = { "EXG A0,A1", NULL };
+static const uint8_t     bytes_exg_aa[] = { 0xC1, 0x49 };
+
+static const char *const lines_exg_da[] = { "EXG D0,A1", NULL };
+static const uint8_t     bytes_exg_da[] = { 0xC1, 0x89 };
+
+static const char *const lines_swap[]   = { "SWAP D0", NULL };
+static const uint8_t     bytes_swap[]   = { 0x48, 0x40 };
+
+static const char *const lines_ext_w[]  = { "EXT.W D0", NULL };
+static const uint8_t     bytes_ext_w[]  = { 0x48, 0x80 };
+
+static const char *const lines_ext_l[]  = { "EXT.L D1", NULL };
+static const uint8_t     bytes_ext_l[]  = { 0x48, 0xC1 };
+
+static const char *const lines_tas[]    = { "TAS D0", NULL };
+static const uint8_t     bytes_tas[]    = { 0x4A, 0xC0 };
+
+static const char *const lines_movem_store[] = { "MOVEM.L D0-D3/A0-A2,-(SP)", NULL };
+static const uint8_t     bytes_movem_store[] = { 0x48, 0xE7, 0xF0, 0xE0 };
+
+static const char *const lines_movem_load[]  = { "MOVEM.W (A0),D0-D1", NULL };
+static const uint8_t     bytes_movem_load[]  = { 0x4C, 0x90, 0x00, 0x03 };
+
+static const char *const lines_movep_store[] = { "MOVEP.W D0,4(A1)", NULL };
+static const uint8_t     bytes_movep_store[] = { 0x01, 0x89, 0x00, 0x04 };
+
+static const char *const lines_movep_load[]  = { "MOVEP.L 8(A2),D3", NULL };
+static const uint8_t     bytes_movep_load[]  = { 0x07, 0x4A, 0x00, 0x08 };
+
+/* ---- Native directive dialect (stage 7) ------------------------------
+   Same underlying data as the shared-dialect DCB/DCW/DCD tests above,
+   written with ASSEMBLE_M68K_OPT_NATIVE_DIRECTIVES set. */
+
+static const char *const lines_dcb_native[] = { "DC.B 1,2,3", NULL };
+static const uint8_t     bytes_dcb_native[] = { 0x01, 0x02, 0x03 };
+
+static const char *const lines_dcw_native[] = { "DC.W &1234,&5678", NULL };
+static const uint8_t     bytes_dcw_native[] = { 0x12, 0x34, 0x56, 0x78 };
+
+static const char *const lines_dcd_native[] = { "DC.L &12345678", NULL };
+static const uint8_t     bytes_dcd_native[] = { 0x12, 0x34, 0x56, 0x78 };
+
+static const char *const lines_dsb_native[] = { "DS.B 3", NULL };
+static const uint8_t     bytes_dsb_native[] = { 0x00, 0x00, 0x00 };
+
+static const char *const lines_dsw_native[] = { "DS.W 2", NULL };
+static const uint8_t     bytes_dsw_native[] = { 0x00, 0x00, 0x00, 0x00 };
+
+static const char *const lines_dsl_native[] = { "DS.L 1", NULL };
+static const uint8_t     bytes_dsl_native[] = { 0x00, 0x00, 0x00, 0x00 };
+
+/* EQU/OPT are unaffected by the dialect bit. */
+static const char *const lines_equ_native[] = { ".const EQU &2A", "MOVEQ #const,D0", NULL };
+static const uint8_t     bytes_equ_native[] = { 0x70, 0x2A };
+
+static const char *const lines_opt_native[] = { "OPT 3", "NOP", NULL };
+static const uint8_t     bytes_opt_native[] = { 0x4E, 0x71 };
+
+/* ---- Error cases --------------------------------------------------- */
+
+static const char *const lines_err_bad_mnemonic[]  = { "FOOBAR", NULL };
+static const char *const lines_err_move_no_size[]  = { "MOVE D0,D1", NULL };
+static const char *const lines_err_move_bad_size[] = { "MOVE.X D0,D1", NULL };
+static const char *const lines_err_movea_byte[]    = { "MOVEA.B D0,A0", NULL };
+static const char *const lines_err_moveq_range[]   = { "MOVEQ #200,D0", NULL };
+static const char *const lines_err_moveq_dst[]     = { "MOVEQ #1,A0", NULL };
+static const char *const lines_err_move_dst_imm[]  = { "MOVE.L D0,#5", NULL };
+static const char *const lines_err_move_missing[]  = { "MOVE.W D0", NULL };
+static const char *const lines_err_equ_no_label[]  = { "EQU &10", NULL };
+static const char *const lines_err_bad_ea[]        = { "MOVE.W (D0),D1", NULL };
+static const char *const lines_err_adda_byte[]     = { "ADD.B D0,A0", NULL };
+static const char *const lines_err_addq_range[]    = { "ADDQ.W #9,D0", NULL };
+static const char *const lines_err_addq_an_byte[]  = { "ADDQ.B #1,A0", NULL };
+static const char *const lines_err_addx_mismatch[] = { "ADDX.W D0,-(A0)", NULL };
+static const char *const lines_err_cmp_mem_dst[]   = { "CMP.W D0,(A0)", NULL };
+static const char *const lines_err_cmpm_not_inc[]  = { "CMPM.B (A0),(A1)+", NULL };
+static const char *const lines_err_chk_size[]      = { "CHK.L D0,D1", NULL };
+static const char *const lines_err_eor_mem_src[]   = { "EOR.W (A0),D0", NULL };
+static const char *const lines_err_ori_sr_size[]   = { "ORI.B #1,SR", NULL };
+static const char *const lines_err_and_an_dst[]    = { "AND.L D0,A0", NULL };
+static const char *const lines_err_btst_range_dn[] = { "BTST #40,D0", NULL };
+static const char *const lines_err_bset_range_mem[]= { "BSET #8,(A0)", NULL };
+static const char *const lines_err_shift_range[]   = { "ASL.W #9,D0", NULL };
+static const char *const lines_err_shift_dn_alone[]= { "ASL D0", NULL };
+static const char *const lines_err_shift_mem_size[]= { "LSR.B (A0)", NULL };
+static const char *const lines_err_btst_src[]      = { "BTST (A0),D0", NULL };
+static const char *const lines_err_branch_no_size[]= { "BEQ label", NULL };
+static const char *const lines_err_branch_s_range[]= { ".far EQU &9000", "BEQ.S far", NULL };
+static const char *const lines_err_dbcc_missing[]  = { "DBEQ D0", NULL };
+static const char *const lines_err_trap_range[]    = { "TRAP #16", NULL };
+static const char *const lines_err_scc_size[]       = { "SEQ.B D0", NULL };
+static const char *const lines_err_jmp_dn[]        = { "JMP D0", NULL };
+static const char *const lines_err_link_dn[]       = { "LINK D0,#0", NULL };
+static const char *const lines_err_move_from_ccr[] = { "MOVE CCR,D0", NULL };
+static const char *const lines_err_movem_size[]    = { "MOVEM.B D0,-(SP)", NULL };
+static const char *const lines_err_movem_range[]   = { "MOVEM.L D0-A2,-(SP)", NULL };
+static const char *const lines_err_movep_dst[]     = { "MOVEP.W D0,D1", NULL };
+static const char *const lines_err_lea_dn[]        = { "LEA D0,A0", NULL };
+static const char *const lines_err_pea_dn[]        = { "PEA D0", NULL };
+static const char *const lines_err_exg_imm[]       = { "EXG D0,#5", NULL };
+static const char *const lines_err_swap_an[]       = { "SWAP A0", NULL };
+static const char *const lines_err_ext_no_size[]   = { "EXT D0", NULL };
+static const char *const lines_err_tas_an[]        = { "TAS A0", NULL };
+static const char *const lines_err_move_usp_src[]  = { "MOVE D0,USP", NULL };
+static const char *const lines_err_dc_native_off[] = { "DC.B 1,2,3", NULL };  /* dialect bit clear */
+static const char *const lines_err_dcb_native_on[] = { "DCB 1,2,3", NULL };   /* dialect bit set */
+
+static const test_case_t tests[] = {
+    { "NOP",                                lines_nop,               bytes_nop,               sizeof(bytes_nop),               0 },
+    { "RTS",                                lines_rts,               bytes_rts,               sizeof(bytes_rts),               0 },
+    { "MOVEQ #1,D7",                        lines_moveq,             bytes_moveq,             sizeof(bytes_moveq),             0 },
+    { "MOVEQ #-1,D0",                       lines_moveq_neg,         bytes_moveq_neg,         sizeof(bytes_moveq_neg),         0 },
+    { "EA: address register indirect",      lines_ea_an_ind,         bytes_ea_an_ind,         sizeof(bytes_ea_an_ind),         0 },
+    { "EA: postincrement",                  lines_ea_postinc,        bytes_ea_postinc,        sizeof(bytes_ea_postinc),        0 },
+    { "EA: predecrement",                   lines_ea_predec,         bytes_ea_predec,         sizeof(bytes_ea_predec),         0 },
+    { "EA: 16-bit displacement",            lines_ea_disp,           bytes_ea_disp,           sizeof(bytes_ea_disp),           0 },
+    { "EA: indexed, .W index",              lines_ea_index_w,        bytes_ea_index_w,        sizeof(bytes_ea_index_w),        0 },
+    { "EA: indexed, .L index",              lines_ea_index_l,        bytes_ea_index_l,        sizeof(bytes_ea_index_l),        0 },
+    { "EA: immediate",                      lines_ea_immediate,      bytes_ea_immediate,      sizeof(bytes_ea_immediate),      0 },
+    { "EA: absolute short",                 lines_ea_abs_short,      bytes_ea_abs_short,      sizeof(bytes_ea_abs_short),      0 },
+    { "EA: absolute long",                  lines_ea_abs_long,       bytes_ea_abs_long,       sizeof(bytes_ea_abs_long),       0 },
+    { "EA: PC-relative displacement",       lines_ea_pc_disp,        bytes_ea_pc_disp,        sizeof(bytes_ea_pc_disp),        0 },
+    { "EA: PC-relative indexed",            lines_ea_pc_index,       bytes_ea_pc_index,       sizeof(bytes_ea_pc_index),       0 },
+    { "EA: PC-relative, (d,PC) spelling",   lines_ea_pc_disp_paren,  bytes_ea_pc_disp_paren,  sizeof(bytes_ea_pc_disp_paren),  0 },
+    { "MOVEA.L A1,A0",                      lines_movea,             bytes_movea,             sizeof(bytes_movea),             0 },
+    { "label address reference",            lines_label,             bytes_label,             sizeof(bytes_label),             0 },
+    { "EQU pseudo-op",                      lines_equ,               bytes_equ,               sizeof(bytes_equ),               0 },
+    { "DCB pseudo-op",                      lines_dcb,               bytes_dcb,               sizeof(bytes_dcb),               0 },
+    { "DCW pseudo-op (big-endian)",         lines_dcw,               bytes_dcw,               sizeof(bytes_dcw),               0 },
+    { "DCD pseudo-op (big-endian)",         lines_dcd,               bytes_dcd,               sizeof(bytes_dcd),               0 },
+    { "OPT pseudo-op is a no-op",           lines_opt,               bytes_opt,               sizeof(bytes_opt),               0 },
+
+    { "ADD ea+Dn->Dn",                      lines_add_ea_dn,         bytes_add_ea_dn,         sizeof(bytes_add_ea_dn),         0 },
+    { "ADD memory+Dn->Dn",                  lines_add_mem_dn,        bytes_add_mem_dn,        sizeof(bytes_add_mem_dn),        0 },
+    { "ADD Dn+ea->ea (reverse)",            lines_add_reverse,       bytes_add_reverse,       sizeof(bytes_add_reverse),       0 },
+    { "ADD with An source",                 lines_add_an_src,        bytes_add_an_src,        sizeof(bytes_add_an_src),        0 },
+    { "ADD auto-selects ADDA shape",        lines_add_auto_adda,     bytes_add_auto_adda,     sizeof(bytes_add_auto_adda),     0 },
+    { "ADDA explicit",                      lines_adda,              bytes_adda,              sizeof(bytes_adda),              0 },
+    { "ADD auto-selects ADDI shape",        lines_add_auto_addi,     bytes_add_auto_addi,     sizeof(bytes_add_auto_addi),     0 },
+    { "ADDI explicit, Dn destination",      lines_addi,              bytes_addi,              sizeof(bytes_addi),              0 },
+    { "SUB ea+Dn->Dn",                      lines_sub_ea_dn,         bytes_sub_ea_dn,         sizeof(bytes_sub_ea_dn),         0 },
+    { "ADDQ",                               lines_addq,              bytes_addq,              sizeof(bytes_addq),              0 },
+    { "ADDQ #8 (ddd field wraps to 0)",     lines_addq_an_eight,     bytes_addq_an_eight,     sizeof(bytes_addq_an_eight),     0 },
+    { "SUBQ",                               lines_subq,              bytes_subq,              sizeof(bytes_subq),              0 },
+    { "ADDX Dn,Dn",                         lines_addx_dn,           bytes_addx_dn,           sizeof(bytes_addx_dn),           0 },
+    { "ADDX -(An),-(An)",                   lines_addx_predec,       bytes_addx_predec,       sizeof(bytes_addx_predec),       0 },
+    { "MULU",                               lines_mulu,              bytes_mulu,              sizeof(bytes_mulu),              0 },
+    { "DIVS with no size suffix",           lines_divs_no_suffix,    bytes_divs_no_suffix,    sizeof(bytes_divs_no_suffix),    0 },
+    { "CMP",                                lines_cmp,               bytes_cmp,               sizeof(bytes_cmp),               0 },
+    { "CMPA",                               lines_cmpa,              bytes_cmpa,              sizeof(bytes_cmpa),              0 },
+    { "CMPI",                               lines_cmpi,              bytes_cmpi,              sizeof(bytes_cmpi),              0 },
+    { "CMPM",                               lines_cmpm,              bytes_cmpm,              sizeof(bytes_cmpm),              0 },
+    { "TST",                                lines_tst,               bytes_tst,               sizeof(bytes_tst),               0 },
+    { "CLR",                                lines_clr,               bytes_clr,               sizeof(bytes_clr),               0 },
+    { "NEG",                                lines_neg,               bytes_neg,               sizeof(bytes_neg),               0 },
+    { "NEGX",                               lines_negx,              bytes_negx,              sizeof(bytes_negx),              0 },
+    { "NOT",                                lines_not,               bytes_not,               sizeof(bytes_not),               0 },
+    { "CHK",                                lines_chk,               bytes_chk,               sizeof(bytes_chk),               0 },
+    { "ABCD",                               lines_abcd,              bytes_abcd,              sizeof(bytes_abcd),              0 },
+    { "SBCD",                               lines_sbcd,              bytes_sbcd,              sizeof(bytes_sbcd),              0 },
+    { "NBCD",                               lines_nbcd,              bytes_nbcd,              sizeof(bytes_nbcd),              0 },
+
+    { "AND ea+Dn->Dn",                      lines_and_ea_dn,         bytes_and_ea_dn,         sizeof(bytes_and_ea_dn),         0 },
+    { "AND Dn+ea->ea (reverse)",            lines_and_reverse,       bytes_and_reverse,       sizeof(bytes_and_reverse),       0 },
+    { "OR ea+Dn->Dn",                       lines_or_ea_dn,          bytes_or_ea_dn,          sizeof(bytes_or_ea_dn),          0 },
+    { "EOR Dn,ea",                          lines_eor,               bytes_eor,               sizeof(bytes_eor),               0 },
+    { "ANDI",                               lines_andi,              bytes_andi,              sizeof(bytes_andi),              0 },
+    { "ORI",                                lines_ori,               bytes_ori,               sizeof(bytes_ori),               0 },
+    { "EORI",                               lines_eori,              bytes_eori,              sizeof(bytes_eori),              0 },
+    { "ANDI #imm,CCR",                      lines_andi_ccr,          bytes_andi_ccr,          sizeof(bytes_andi_ccr),          0 },
+    { "ORI #imm,SR",                        lines_ori_sr,            bytes_ori_sr,            sizeof(bytes_ori_sr),            0 },
+    { "EORI #imm,CCR",                      lines_eori_ccr,          bytes_eori_ccr,          sizeof(bytes_eori_ccr),          0 },
+    { "tokenised AND",                      lines_and_token,         bytes_and_token,         sizeof(bytes_and_token),         0 },
+    { "tokenised EOR",                      lines_eor_token,         bytes_eor_token,         sizeof(bytes_eor_token),         0 },
+    { "tokenised OR",                       lines_or_token,          bytes_or_token,          sizeof(bytes_or_token),          0 },
+    { "tokenised NOT",                      lines_not_token,         bytes_not_token,         sizeof(bytes_not_token),         0 },
+    { "tokenised AND, ANDI continuation",   lines_andi_token,        bytes_andi_token,        sizeof(bytes_andi_token),        0 },
+    { "tokenised DIV, DIVU continuation",   lines_divu_token,        bytes_divu_token,        sizeof(bytes_divu_token),        0 },
+    { "tokenised MOVE",                     lines_move_token,        bytes_move_token,        sizeof(bytes_move_token),        0 },
+    { "tokenised MOVE, MOVEQ continuation", lines_moveq_token,       bytes_moveq_token,       sizeof(bytes_moveq_token),       0 },
+    { "tokenised MOVE, MOVEA continuation", lines_movea_token,       bytes_movea_token,       sizeof(bytes_movea_token),       0 },
+    { "tokenised MOVE, MOVEM continuation", lines_movem_token,       bytes_movem_token,       sizeof(bytes_movem_token),       0 },
+    { "tokenised MOVE, MOVEP continuation", lines_movep_token,       bytes_movep_token,       sizeof(bytes_movep_token),       0 },
+    { "tokenised EXT",                      lines_ext_token,         bytes_ext_token,         sizeof(bytes_ext_token),         0 },
+    { "tokenised STOP",                     lines_stop_token,        bytes_stop_token,        sizeof(bytes_stop_token),        0 },
+    { "tokenised SWAP (two-byte token)",    lines_swap_token,        bytes_swap_token,        sizeof(bytes_swap_token),        0 },
+
+    { "BTST dynamic (register bit number)", lines_btst_dyn,          bytes_btst_dyn,          sizeof(bytes_btst_dyn),          0 },
+    { "BTST static (immediate bit number)", lines_btst_static,       bytes_btst_static,       sizeof(bytes_btst_static),       0 },
+    { "BSET static, memory destination",    lines_bset_static,       bytes_bset_static,       sizeof(bytes_bset_static),       0 },
+    { "BCLR dynamic",                       lines_bclr_dyn,          bytes_bclr_dyn,          sizeof(bytes_bclr_dyn),          0 },
+    { "BCHG static",                        lines_bchg_static,       bytes_bchg_static,       sizeof(bytes_bchg_static),       0 },
+    { "ASL immediate count",                lines_asl_imm,           bytes_asl_imm,           sizeof(bytes_asl_imm),           0 },
+    { "ASR register count",                 lines_asr_reg,           bytes_asr_reg,           sizeof(bytes_asr_reg),           0 },
+    { "LSL count 8 (ddd field wraps to 0)", lines_lsl_eight,         bytes_lsl_eight,         sizeof(bytes_lsl_eight),         0 },
+    { "LSR memory form",                    lines_lsr_mem,           bytes_lsr_mem,           sizeof(bytes_lsr_mem),           0 },
+    { "ROXL register count",                lines_roxl_reg,          bytes_roxl_reg,          sizeof(bytes_roxl_reg),          0 },
+    { "ROR immediate count",                lines_ror_imm,           bytes_ror_imm,           sizeof(bytes_ror_imm),           0 },
+    { "ROXR memory form",                   lines_roxr_mem,          bytes_roxr_mem,          sizeof(bytes_roxr_mem),          0 },
+
+    { "BRA.S",                              lines_bra_s,             bytes_bra_s,             sizeof(bytes_bra_s),             0 },
+    { "BEQ.S (structural Bcc)",             lines_beq_s,             bytes_beq_s,             sizeof(bytes_beq_s),             0 },
+    { "BSR.W",                              lines_bsr_w,             bytes_bsr_w,             sizeof(bytes_bsr_w),             0 },
+    { "DBRA",                               lines_dbra,              bytes_dbra,              sizeof(bytes_dbra),              0 },
+    { "DBEQ (structural DBcc)",             lines_dbeq,              bytes_dbeq,              sizeof(bytes_dbeq),              0 },
+    { "SEQ (structural Scc), Dn dest",      lines_seq,               bytes_seq,               sizeof(bytes_seq),               0 },
+    { "SLE, memory destination",            lines_sle,               bytes_sle,               sizeof(bytes_sle),               0 },
+    { "JMP",                                lines_jmp,               bytes_jmp,               sizeof(bytes_jmp),               0 },
+    { "JSR absolute long",                  lines_jsr,               bytes_jsr,               sizeof(bytes_jsr),               0 },
+    { "TRAP #1",                            lines_trap1,             bytes_trap1,             sizeof(bytes_trap1),             0 },
+    { "TRAP #15",                           lines_trap15,            bytes_trap15,            sizeof(bytes_trap15),            0 },
+    { "STOP",                               lines_stop,              bytes_stop,              sizeof(bytes_stop),              0 },
+    { "LINK",                               lines_link,              bytes_link,              sizeof(bytes_link),              0 },
+    { "UNLK",                               lines_unlk,              bytes_unlk,              sizeof(bytes_unlk),              0 },
+    { "RTR",                                lines_rtr,               bytes_rtr,               sizeof(bytes_rtr),               0 },
+    { "RTE",                                lines_rte,               bytes_rte,               sizeof(bytes_rte),               0 },
+    { "RESET",                              lines_reset,             bytes_reset,             sizeof(bytes_reset),             0 },
+    { "ILLEGAL",                            lines_illegal,           bytes_illegal,           sizeof(bytes_illegal),           0 },
+    { "TRAPV",                              lines_trapv,             bytes_trapv,             sizeof(bytes_trapv),             0 },
+
+    { "MOVE <ea>,SR",                       lines_move_to_sr,        bytes_move_to_sr,        sizeof(bytes_move_to_sr),        0 },
+    { "MOVE SR,<ea>",                       lines_move_from_sr,      bytes_move_from_sr,      sizeof(bytes_move_from_sr),      0 },
+    { "MOVE <ea>,CCR",                      lines_move_to_ccr,       bytes_move_to_ccr,       sizeof(bytes_move_to_ccr),       0 },
+    { "MOVE An,USP",                        lines_move_an_usp,       bytes_move_an_usp,       sizeof(bytes_move_an_usp),       0 },
+    { "MOVE USP,An",                        lines_move_usp_an,       bytes_move_usp_an,       sizeof(bytes_move_usp_an),       0 },
+    { "LEA PC-relative",                    lines_lea_pc,            bytes_lea_pc,            sizeof(bytes_lea_pc),            0 },
+    { "LEA (An),Am",                        lines_lea_ind,           bytes_lea_ind,           sizeof(bytes_lea_ind),           0 },
+    { "PEA",                                lines_pea,               bytes_pea,               sizeof(bytes_pea),               0 },
+    { "EXG Dn,Dn",                          lines_exg_dd,            bytes_exg_dd,            sizeof(bytes_exg_dd),            0 },
+    { "EXG An,An",                          lines_exg_aa,            bytes_exg_aa,            sizeof(bytes_exg_aa),            0 },
+    { "EXG Dn,An",                          lines_exg_da,            bytes_exg_da,            sizeof(bytes_exg_da),            0 },
+    { "SWAP",                               lines_swap,              bytes_swap,              sizeof(bytes_swap),              0 },
+    { "EXT.W",                              lines_ext_w,             bytes_ext_w,             sizeof(bytes_ext_w),             0 },
+    { "EXT.L",                              lines_ext_l,             bytes_ext_l,             sizeof(bytes_ext_l),             0 },
+    { "TAS",                                lines_tas,               bytes_tas,               sizeof(bytes_tas),               0 },
+    { "MOVEM store, predecrement (reversed mask)", lines_movem_store, bytes_movem_store, sizeof(bytes_movem_store), 0 },
+    { "MOVEM load",                         lines_movem_load,        bytes_movem_load,        sizeof(bytes_movem_load),        0 },
+    { "MOVEP store",                        lines_movep_store,       bytes_movep_store,       sizeof(bytes_movep_store),       0 },
+    { "MOVEP load",                         lines_movep_load,        bytes_movep_load,        sizeof(bytes_movep_load),        0 },
+
+    { "DC.B (native dialect)",  lines_dcb_native, bytes_dcb_native, sizeof(bytes_dcb_native), 0, ASSEMBLE_M68K_OPT_NATIVE_DIRECTIVES },
+    { "DC.W (native dialect)",  lines_dcw_native, bytes_dcw_native, sizeof(bytes_dcw_native), 0, ASSEMBLE_M68K_OPT_NATIVE_DIRECTIVES },
+    { "DC.L (native dialect)",  lines_dcd_native, bytes_dcd_native, sizeof(bytes_dcd_native), 0, ASSEMBLE_M68K_OPT_NATIVE_DIRECTIVES },
+    { "DS.B (native dialect)",  lines_dsb_native, bytes_dsb_native, sizeof(bytes_dsb_native), 0, ASSEMBLE_M68K_OPT_NATIVE_DIRECTIVES },
+    { "DS.W (native dialect)",  lines_dsw_native, bytes_dsw_native, sizeof(bytes_dsw_native), 0, ASSEMBLE_M68K_OPT_NATIVE_DIRECTIVES },
+    { "DS.L (native dialect)",  lines_dsl_native, bytes_dsl_native, sizeof(bytes_dsl_native), 0, ASSEMBLE_M68K_OPT_NATIVE_DIRECTIVES },
+    { "EQU unaffected by native dialect", lines_equ_native, bytes_equ_native, sizeof(bytes_equ_native), 0, ASSEMBLE_M68K_OPT_NATIVE_DIRECTIVES },
+    { "OPT unaffected by native dialect", lines_opt_native, bytes_opt_native, sizeof(bytes_opt_native), 0, ASSEMBLE_M68K_OPT_NATIVE_DIRECTIVES },
+
+    { "error: bad mnemonic",                lines_err_bad_mnemonic,  NULL, 0, 1 },
+    { "error: MOVE requires a size suffix", lines_err_move_no_size,  NULL, 0, 1 },
+    { "error: MOVE bad size suffix",        lines_err_move_bad_size, NULL, 0, 1 },
+    { "error: MOVEA does not support .B",   lines_err_movea_byte,    NULL, 0, 1 },
+    { "error: MOVEQ immediate out of range",lines_err_moveq_range,   NULL, 0, 1 },
+    { "error: MOVEQ destination must be Dn",lines_err_moveq_dst,     NULL, 0, 1 },
+    { "error: MOVE destination immediate",  lines_err_move_dst_imm,  NULL, 0, 1 },
+    { "error: MOVE missing destination",    lines_err_move_missing,  NULL, 0, 1 },
+    { "error: EQU without a label",         lines_err_equ_no_label,  NULL, 0, 1 },
+    { "error: bad addressing mode syntax",  lines_err_bad_ea,        NULL, 0, 1 },
+    { "error: ADDA does not support .B",    lines_err_adda_byte,     NULL, 0, 1 },
+    { "error: ADDQ immediate out of range", lines_err_addq_range,    NULL, 0, 1 },
+    { "error: ADDQ.B cannot target An",     lines_err_addq_an_byte,  NULL, 0, 1 },
+    { "error: ADDX operand shape mismatch", lines_err_addx_mismatch, NULL, 0, 1 },
+    { "error: CMP memory destination",      lines_err_cmp_mem_dst,   NULL, 0, 1 },
+    { "error: CMPM requires postincrement", lines_err_cmpm_not_inc,  NULL, 0, 1 },
+    { "error: CHK does not support .L",     lines_err_chk_size,      NULL, 0, 1 },
+    { "error: EOR memory source",           lines_err_eor_mem_src,   NULL, 0, 1 },
+    { "error: ORI to SR must be .W",        lines_err_ori_sr_size,   NULL, 0, 1 },
+    { "error: AND with An destination",     lines_err_and_an_dst,    NULL, 0, 1 },
+    { "error: BTST bit number out of range (Dn)", lines_err_btst_range_dn,  NULL, 0, 1 },
+    { "error: BSET bit number out of range (mem)",lines_err_bset_range_mem, NULL, 0, 1 },
+    { "error: shift count out of range",    lines_err_shift_range,    NULL, 0, 1 },
+    { "error: shift with bare Dn operand",  lines_err_shift_dn_alone, NULL, 0, 1 },
+    { "error: memory shift with .B suffix", lines_err_shift_mem_size, NULL, 0, 1 },
+    { "error: BTST memory source",          lines_err_btst_src,       NULL, 0, 1 },
+    { "error: Bcc requires .S/.W suffix",   lines_err_branch_no_size, NULL, 0, 1 },
+    { "error: BEQ.S target out of range",   lines_err_branch_s_range, NULL, 0, 1 },
+    { "error: DBcc missing target",         lines_err_dbcc_missing,   NULL, 0, 1 },
+    { "error: TRAP vector out of range",    lines_err_trap_range,     NULL, 0, 1 },
+    { "error: Scc does not support .B",     lines_err_scc_size,       NULL, 0, 1 },
+    { "error: JMP to a data register",      lines_err_jmp_dn,         NULL, 0, 1 },
+    { "error: LINK with a data register",   lines_err_link_dn,        NULL, 0, 1 },
+    { "error: MOVE from CCR rejected (68010+ only)", lines_err_move_from_ccr, NULL, 0, 1 },
+    { "error: MOVEM does not support .B",   lines_err_movem_size,     NULL, 0, 1 },
+    { "error: MOVEM cross-group range",     lines_err_movem_range,    NULL, 0, 1 },
+    { "error: MOVEP destination not d(An)", lines_err_movep_dst,      NULL, 0, 1 },
+    { "error: LEA with a data register",    lines_err_lea_dn,         NULL, 0, 1 },
+    { "error: PEA with a data register",    lines_err_pea_dn,         NULL, 0, 1 },
+    { "error: EXG with an immediate",       lines_err_exg_imm,        NULL, 0, 1 },
+    { "error: SWAP with an address register", lines_err_swap_an,      NULL, 0, 1 },
+    { "error: EXT requires a size suffix",  lines_err_ext_no_size,    NULL, 0, 1 },
+    { "error: TAS with an address register",lines_err_tas_an,         NULL, 0, 1 },
+    { "error: MOVE An,USP source not An",   lines_err_move_usp_src,   NULL, 0, 1 },
+    { "error: DC.B not recognised with dialect bit clear", lines_err_dc_native_off, NULL, 0, 1, 0 },
+    { "error: DCB not recognised with dialect bit set", lines_err_dcb_native_on, NULL, 0, 1,
+      ASSEMBLE_M68K_OPT_NATIVE_DIRECTIVES }
+};
+
+int run_tests_m68k(void)
+{
+    size_t i;
+    int passed = 0;
+    int failed = 0;
+
+    for (i = 0; i < sizeof(tests) / sizeof(tests[0]); i++)
+    {
+        if (run_case(&tests[i]))
+        {
+            passed += 1;
+        }
+        else
+        {
+            failed += 1;
+        }
+    }
+
+    printf("assemble_m68k: %d passed, %d failed (of %d)\n", passed, failed, passed + failed);
+
+    return failed;
+}

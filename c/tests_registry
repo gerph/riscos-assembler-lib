@@ -73,7 +73,7 @@ int run_tests_registry(void)
     failed = 0;
 
     interfaces = assemble_get_interfaces(&count);
-    check(interfaces != NULL && count == 6, "assemble_get_interfaces returns all six backends");
+    check(interfaces != NULL && count == 7, "assemble_get_interfaces returns all seven backends");
 
     check_class(ASSEMBLE_CPU_6502,   "6502");
     check_class(ASSEMBLE_CPU_6809,   "6809");
@@ -81,6 +81,7 @@ int run_tests_registry(void)
     check_class(ASSEMBLE_CPU_Z80,    "z80");
     check_class(ASSEMBLE_CPU_ARM32,  "arm32");
     check_class(ASSEMBLE_CPU_RISCV,  "riscv");
+    check_class(ASSEMBLE_CPU_M68K,   "m68k");
 
     check(assemble_find_by_class(ASSEMBLE_CPU_GENERIC) == NULL,
           "find_by_class(GENERIC) finds nothing, since it isn't a backend");
@@ -88,6 +89,7 @@ int run_tests_registry(void)
     check_name("6502",   ASSEMBLE_CPU_6502,  0);
     check_name("arm32",  ASSEMBLE_CPU_ARM32, 0);
     check_name("riscv",  ASSEMBLE_CPU_RISCV, 0);
+    check_name("m68k",   ASSEMBLE_CPU_M68K,  0);
     check_name("65c02",       ASSEMBLE_CPU_6502,  0x10u);
     check_name("65c816",      ASSEMBLE_CPU_6502,  0x20u);
     check_name("arm32-fpa",   ASSEMBLE_CPU_ARM32, 0x10u);

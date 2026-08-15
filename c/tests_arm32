@@ -855,6 +855,92 @@ static const char *const lines_thumb_mov_hi_imm[] = { "MOV R8,#5", NULL };
 static const char *const lines_thumb_beq_out_of_range[] = { "BEQ &9000", NULL };
 static const char *const lines_thumb_lsl_without_opt[] = { "LSL R0,R1,#2", NULL };
 
+/* ---- BASIC token collisions (found by tokenising every mnemonic in
+   mnemonic_table/fpa_mnemonic_table/thumb_mnemonic_table through
+   riscos-basictokenise, the same audit that found assemble_m68k's
+   DIV/MOVE/EXT/STOP/SWAP gaps) -- this backend had no token handling
+   at all before. Each pair below assembles the same instruction
+   twice: once from its literal ASCII spelling, once from the raw
+   BASIC token byte plus whatever ASCII continues it, checking both
+   against the same expected bytes. */
+static const char *const lines_and[]  = { "AND R0,R1,R2", NULL };
+static const uint8_t     bytes_and[]  = { 0x02, 0x00, 0x01, 0xE0 };
+static const char lines_and_token_raw[] = { (char) 0x80, ' ', 'R', '0', ',', 'R', '1', ',', 'R', '2', '\0' };
+static const char *const lines_and_token[] = { lines_and_token_raw, NULL };
+
+static const char *const lines_eor[]  = { "EOR R0,R1,R2", NULL };
+static const uint8_t     bytes_eor[]  = { 0x02, 0x00, 0x21, 0xE0 };
+static const char lines_eor_token_raw[] = { (char) 0x82, ' ', 'R', '0', ',', 'R', '1', ',', 'R', '2', '\0' };
+static const char *const lines_eor_token[] = { lines_eor_token_raw, NULL };
+
+/* ORR's own leading "OR" collides just like every other backend's
+   ORxxx-shaped mnemonics -- the OR token (0x84) plus a literal "R"
+   continuation. */
+static const char *const lines_orr[]  = { "ORR R0,R1,R2", NULL };
+static const uint8_t     bytes_orr[]  = { 0x02, 0x00, 0x81, 0xE1 };
+static const char lines_orr_token_raw[] = { (char) 0x84, 'R', ' ', 'R', '0', ',', 'R', '1', ',', 'R', '2', '\0' };
+static const char *const lines_orr_token[] = { lines_orr_token_raw, NULL };
+
+/* FPA_TWOOP mnemonics borrow short maths-function names that are
+   themselves whole BASIC keywords (ABS/ACS/ASN/ATN/COS/EXP/LOG/RND/
+   SIN/TAN); each tokenises to a single byte with the 'S' precision
+   suffix and operands as its literal continuation. */
+static const char *const lines_abs[] = { "ABSS F0,F1", NULL };
+static const uint8_t     bytes_abs[] = { 0x01, 0x81, 0x20, 0xEE };
+static const char lines_abs_token_raw[] = { (char) 0x94, 'S', ' ', 'F', '0', ',', 'F', '1', '\0' };
+static const char *const lines_abs_token[] = { lines_abs_token_raw, NULL };
+
+static const char *const lines_acs[] = { "ACSS F0,F1", NULL };
+static const uint8_t     bytes_acs[] = { 0x01, 0x81, 0xC0, 0xEE };
+static const char lines_acs_token_raw[] = { (char) 0x95, 'S', ' ', 'F', '0', ',', 'F', '1', '\0' };
+static const char *const lines_acs_token[] = { lines_acs_token_raw, NULL };
+
+static const char *const lines_asn[] = { "ASNS F0,F1", NULL };
+static const uint8_t     bytes_asn[] = { 0x01, 0x81, 0xB0, 0xEE };
+static const char lines_asn_token_raw[] = { (char) 0x98, 'S', ' ', 'F', '0', ',', 'F', '1', '\0' };
+static const char *const lines_asn_token[] = { lines_asn_token_raw, NULL };
+
+static const char *const lines_atn[] = { "ATNS F0,F1", NULL };
+static const uint8_t     bytes_atn[] = { 0x01, 0x81, 0xD0, 0xEE };
+static const char lines_atn_token_raw[] = { (char) 0x99, 'S', ' ', 'F', '0', ',', 'F', '1', '\0' };
+static const char *const lines_atn_token[] = { lines_atn_token_raw, NULL };
+
+static const char *const lines_cos[] = { "COSS F0,F1", NULL };
+static const uint8_t     bytes_cos[] = { 0x01, 0x81, 0x90, 0xEE };
+static const char lines_cos_token_raw[] = { (char) 0x9B, 'S', ' ', 'F', '0', ',', 'F', '1', '\0' };
+static const char *const lines_cos_token[] = { lines_cos_token_raw, NULL };
+
+static const char *const lines_exp[] = { "EXPS F0,F1", NULL };
+static const uint8_t     bytes_exp[] = { 0x01, 0x81, 0x70, 0xEE };
+static const char lines_exp_token_raw[] = { (char) 0xA1, 'S', ' ', 'F', '0', ',', 'F', '1', '\0' };
+static const char *const lines_exp_token[] = { lines_exp_token_raw, NULL };
+
+static const char *const lines_log[] = { "LOGS F0,F1", NULL };
+static const uint8_t     bytes_log[] = { 0x01, 0x81, 0x50, 0xEE };
+static const char lines_log_token_raw[] = { (char) 0xAB, 'S', ' ', 'F', '0', ',', 'F', '1', '\0' };
+static const char *const lines_log_token[] = { lines_log_token_raw, NULL };
+
+static const char *const lines_rnd[] = { "RNDS F0,F1", NULL };
+static const uint8_t     bytes_rnd[] = { 0x01, 0x81, 0x30, 0xEE };
+static const char lines_rnd_token_raw[] = { (char) 0xB3, 'S', ' ', 'F', '0', ',', 'F', '1', '\0' };
+static const char *const lines_rnd_token[] = { lines_rnd_token_raw, NULL };
+
+static const char *const lines_sin[] = { "SINS F0,F1", NULL };
+static const uint8_t     bytes_sin[] = { 0x01, 0x81, 0x80, 0xEE };
+static const char lines_sin_token_raw[] = { (char) 0xB5, 'S', ' ', 'F', '0', ',', 'F', '1', '\0' };
+static const char *const lines_sin_token[] = { lines_sin_token_raw, NULL };
+
+static const char *const lines_tan[] = { "TANS F0,F1", NULL };
+static const uint8_t     bytes_tan[] = { 0x01, 0x81, 0xA0, 0xEE };
+static const char lines_tan_token_raw[] = { (char) 0xB7, 'S', ' ', 'F', '0', ',', 'F', '1', '\0' };
+static const char *const lines_tan_token[] = { lines_tan_token_raw, NULL };
+
+/* VDUP (NEON "duplicate to every lane") collides with the VDU
+   statement keyword the same way -- reuses the existing literal
+   VDUP.16 test's expected bytes. */
+static const char lines_vdup_token_raw[] = { (char) 0xEF, 'P', '.', '1', '6', ' ', 'D', '0', ',', 'D', '1', '[', '2', ']', '\0' };
+static const char *const lines_vdup_token[] = { lines_vdup_token_raw, NULL };
+
 static const test_case_t tests[] = {
     { "MOV Rd,#imm",                   lines_mov_imm,          0, bytes_mov_imm,          sizeof(bytes_mov_imm),          0 },
     { "MOVS Rd,Rm",                    lines_mov_reg,          0, bytes_mov_reg,          sizeof(bytes_mov_reg),          0 },
@@ -1065,7 +1151,35 @@ static const test_case_t tests[] = {
     { "Thumb LDRSB has no immediate-offset form", lines_thumb_ldrsb_imm_unsupported, 0, NULL, 0, 1, ASSEMBLE_ARM32_OPT_THUMB },
     { "Thumb MOV Rd,#imm8 requires Rd to be R0-R7", lines_thumb_mov_hi_imm, 0, NULL, 0, 1, ASSEMBLE_ARM32_OPT_THUMB },
     { "Thumb BEQ branch target out of range", lines_thumb_beq_out_of_range, 0, NULL, 0, 1, ASSEMBLE_ARM32_OPT_THUMB },
-    { "Thumb mnemonic rejected without ASSEMBLE_ARM32_OPT_THUMB", lines_thumb_lsl_without_opt, 0, NULL, 0, 1, 0 }
+    { "Thumb mnemonic rejected without ASSEMBLE_ARM32_OPT_THUMB", lines_thumb_lsl_without_opt, 0, NULL, 0, 1, 0 },
+
+    { "AND Rd,Rn,Rm",                lines_and,       0, bytes_and, sizeof(bytes_and), 0, 0 },
+    { "tokenised AND",               lines_and_token, 0, bytes_and, sizeof(bytes_and), 0, 0 },
+    { "EOR Rd,Rn,Rm",                lines_eor,       0, bytes_eor, sizeof(bytes_eor), 0, 0 },
+    { "tokenised EOR",               lines_eor_token, 0, bytes_eor, sizeof(bytes_eor), 0, 0 },
+    { "ORR Rd,Rn,Rm",                lines_orr,       0, bytes_orr, sizeof(bytes_orr), 0, 0 },
+    { "tokenised OR, ORR continuation", lines_orr_token, 0, bytes_orr, sizeof(bytes_orr), 0, 0 },
+    { "ABSS Fd,Fm",                  lines_abs,       0, bytes_abs, sizeof(bytes_abs), 0, ASSEMBLE_ARM32_OPT_FPA },
+    { "tokenised ABS",               lines_abs_token, 0, bytes_abs, sizeof(bytes_abs), 0, ASSEMBLE_ARM32_OPT_FPA },
+    { "ACSS Fd,Fm",                  lines_acs,       0, bytes_acs, sizeof(bytes_acs), 0, ASSEMBLE_ARM32_OPT_FPA },
+    { "tokenised ACS",               lines_acs_token, 0, bytes_acs, sizeof(bytes_acs), 0, ASSEMBLE_ARM32_OPT_FPA },
+    { "ASNS Fd,Fm",                  lines_asn,       0, bytes_asn, sizeof(bytes_asn), 0, ASSEMBLE_ARM32_OPT_FPA },
+    { "tokenised ASN",               lines_asn_token, 0, bytes_asn, sizeof(bytes_asn), 0, ASSEMBLE_ARM32_OPT_FPA },
+    { "ATNS Fd,Fm",                  lines_atn,       0, bytes_atn, sizeof(bytes_atn), 0, ASSEMBLE_ARM32_OPT_FPA },
+    { "tokenised ATN",               lines_atn_token, 0, bytes_atn, sizeof(bytes_atn), 0, ASSEMBLE_ARM32_OPT_FPA },
+    { "COSS Fd,Fm",                  lines_cos,       0, bytes_cos, sizeof(bytes_cos), 0, ASSEMBLE_ARM32_OPT_FPA },
+    { "tokenised COS",               lines_cos_token, 0, bytes_cos, sizeof(bytes_cos), 0, ASSEMBLE_ARM32_OPT_FPA },
+    { "EXPS Fd,Fm",                  lines_exp,       0, bytes_exp, sizeof(bytes_exp), 0, ASSEMBLE_ARM32_OPT_FPA },
+    { "tokenised EXP",               lines_exp_token, 0, bytes_exp, sizeof(bytes_exp), 0, ASSEMBLE_ARM32_OPT_FPA },
+    { "LOGS Fd,Fm",                  lines_log,       0, bytes_log, sizeof(bytes_log), 0, ASSEMBLE_ARM32_OPT_FPA },
+    { "tokenised LOG",               lines_log_token, 0, bytes_log, sizeof(bytes_log), 0, ASSEMBLE_ARM32_OPT_FPA },
+    { "RNDS Fd,Fm",                  lines_rnd,       0, bytes_rnd, sizeof(bytes_rnd), 0, ASSEMBLE_ARM32_OPT_FPA },
+    { "tokenised RND",               lines_rnd_token, 0, bytes_rnd, sizeof(bytes_rnd), 0, ASSEMBLE_ARM32_OPT_FPA },
+    { "SINS Fd,Fm",                  lines_sin,       0, bytes_sin, sizeof(bytes_sin), 0, ASSEMBLE_ARM32_OPT_FPA },
+    { "tokenised SIN",               lines_sin_token, 0, bytes_sin, sizeof(bytes_sin), 0, ASSEMBLE_ARM32_OPT_FPA },
+    { "TANS Fd,Fm",                  lines_tan,       0, bytes_tan, sizeof(bytes_tan), 0, ASSEMBLE_ARM32_OPT_FPA },
+    { "tokenised TAN",               lines_tan_token, 0, bytes_tan, sizeof(bytes_tan), 0, ASSEMBLE_ARM32_OPT_FPA },
+    { "tokenised VDU, VDUP continuation", lines_vdup_token, 0, bytes_neon_vdup_scalar, sizeof(bytes_neon_vdup_scalar), 0, ASSEMBLE_ARM32_OPT_VFP }
 };
 
 int run_tests_arm32(void)
