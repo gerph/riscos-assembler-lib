@@ -1163,22 +1163,29 @@ PRM-in-XML docs (`module/prminxml/Assembler.xml`) and smoke test
 (`module/tests/test-assembler,fd1`) — it is versioned independently of the
 top-level `Assemble` library (currently 0.02 vs the library's 0.05) and gets
 its own `riscos-vmanage inc` when it changes. It wraps the Assemble library's
-line-at-a-time backends in a **stateful** SWI interface (`Assembler_Create`,
+line-at-a-time backends in a **stateful** SWI interface (`Assemble_Create`,
 `Destroy`, `BeginPass`, `AssembleLine`, `Value`, `Evaluate`, `Capabilities`,
 `LastError`) — a context owns a symbol table and pass/address state across
-many `Assembler_AssembleLine` calls, which the library's own `assemble_context_t`
+many `Assemble_AssembleLine` calls, which the library's own `assemble_context_t`
 has no notion of (that's just one call's inputs/outputs).
 
-**RISC OS Open allocation status**: `module/cmhg/modhead`'s SWI chunk
-(`&C0000`) and error base (`&840000`) are still placeholders marked
-`UNALLOCATED` in comments — the registration request
-(`module/allocations/Assembler-allocation.yaml`/`,fb0`/`-email.txt`) was
-sent to `allocate@riscosopen.org` on 2026-08-14 (cc'd to Charles Ferguson)
-but no reply had been received as of that date. Do not release the module
-publicly, or treat the current SWI/error numbers as final, until the real
-allocated values come back and are substituted into `modhead`. See the
-`allocating-resources` skill for the registration process and the
-`sending-email` skill for how the email itself was sent.
+**RISC OS Open allocation status**: the registration request
+(`module/allocations/Assembler-allocation.yaml`/`,fb0`/`-email.txt`, sent to
+`allocate@riscosopen.org` on 2026-08-14, cc'd to Charles Ferguson) has now
+been answered, and `module/cmhg/modhead` carries the real allocated values —
+SWI chunk `&5AD80` (was the placeholder `&C0000`) and error base `&822E00`
+(was `&840000`), both marked `ALLOCATED` in comments in place of the old
+`UNALLOCATED` warnings. One thing to note if you touch this again: the
+allocated SWI prefix is `Assemble`, not `Assembler` as the request itself
+asked for — `swi-decoding-table`'s first field changed along with the
+numbers, so every SWI is `Assemble_Create`/`Assemble_Destroy`/
+`Assemble_BeginPass`/`Assemble_AssembleLine`/`Assemble_Value`/
+`Assemble_Evaluate`/`Assemble_Capabilities`/`Assemble_LastError`
+(`&5AD80`-`&5AD87`) even though the module's own `title-string`/
+`help-string`/`*Command` name is still `Assembler`. The SWI/error numbers
+are now final; there's no longer a reason on this account to withhold public
+release. See the `allocating-resources` skill for the registration process
+and the `sending-email` skill for how the email itself was sent.
 
 Build order matters: `module/Makefile,fe1` has `INCLUDES = C:Assemble.` and
 `LIBS = C:Assemble.o.libAssemble`, so the top-level `MakefileLib,fe1` must be
@@ -1192,7 +1199,7 @@ old behaviour, it doesn't re-export automatically. Build with
 "RMLoad Assembler" --command "Run test-assembler"` dance for you).
 
 `module/c/module` used to hand-maintain its own `cpu_assembler()`
-switch-per-backend and its own `Assembler_Capabilities` CPU/OPT bitmasks,
+switch-per-backend and its own `Assemble_Capabilities` CPU/OPT bitmasks,
 duplicating the backend registry (`h/assemble_registry` — see "Backend
 registry" above) that now exists for exactly this purpose. It has been
 converted to use the registry instead:
@@ -1205,7 +1212,7 @@ converted to use the registry instead:
   value to `assembler_cpu_t` with the *same number*, not just any unused one.
   This is exactly how RISC-V (`ASSEMBLE_CPU_RISCV = 6`) was wired up as
   `ASSEMBLER_CPU_RISCV = 6` — a two-line change, not a new switch case.
-- `Assembler_Capabilities` (SWI `C0006`) builds its CPU bitmask (query 0) and
+- `Assemble_Capabilities` (SWI `&5AD86`) builds its CPU bitmask (query 0) and
   per-CPU OPT-bit mask (query 1) by walking `assemble_get_interfaces()` and
   each entry's `opt_flags`, rather than hard-coding them. This isn't just
   smaller code: the hard-coded version had actually drifted out of date
